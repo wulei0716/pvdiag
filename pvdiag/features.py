@@ -44,6 +44,21 @@ def profile_vector(ts: pd.Series, values: pd.Series, slot_minutes: int = 30) -> 
     return out
 
 
+def stale_run_minutes(values: np.ndarray, zero_a: float, step_min: int = 5, rtol: float = 1e-4) -> int:
+    """日间（9-16 点）电流"钉死不动"的最长连续时长（分钟）：相邻样本相对变化 < rtol 且电流 > 零值阈。
+    与 pvanalytics.quality.gaps.stale_values_diff 的思想一致，但按天聚合成"最长钉死分钟数"，
+    用来抓"半天钉死"（全天 std 很大但其中几小时冻结）这类 daytime_i_std 抓不到的采集故障。"""
+    v = values[~np.isnan(values)]
+    if len(v) < 3:
+        return 0
+    same = (np.abs(np.diff(v)) <= rtol * np.maximum(np.abs(v[1:]), 1e-9)) & (v[1:] > zero_a)
+    best = cur = 0
+    for s in same:
+        cur = cur + 1 if s else 0
+        best = max(best, cur)
+    return int((best + 1) * step_min) if best else 0
+
+
 # ---------------------------------------------------------------------------- 组串
 def compute_string_daily(samples: pd.DataFrame, day: date, cfg: BaselineCfg, th: Thresholds) -> pd.DataFrame:
     """samples: string_id, ts, current_a, voltage_v（单日、单站）"""
@@ -75,6 +90,7 @@ def compute_string_daily(samples: pd.DataFrame, day: date, cfg: BaselineCfg, th:
         energy = float(np.nansum((g["i_clean"] * g["v"].fillna(0)).to_numpy()) * (5 / 60) / 1000.0)
         core_std = float(core["i"].std()) if len(core) >= 20 else np.nan
         core_mean = float(core["i"].mean()) if len(core) >= 20 else np.nan
+        stale_run = stale_run_minutes(core.sort_values("ts")["i"].to_numpy(dtype=float), th.zero_current_a) if len(core) else 0
         rows.append({
             "string_id": sid, "date": day.isoformat(),
             "n_samples": int(len(g)), "n_daytime_expected": int(expected_daytime),
@@ -82,11 +98,13 @@ def compute_string_daily(samples: pd.DataFrame, day: date, cfg: BaselineCfg, th:
             "noon_median_i": float(noon["i_clean"].median()) if len(noon) else np.nan,
             "noon_median_v": float(noon_valid["v"].median()) if len(noon_valid) else np.nan,
             "noon_n": int(len(noon)),
+            "noon_zero_frac": float((noon["i_clean"] <= 0).mean()) if len(noon) else np.nan,
             "day_max_i": day_max_i,
             "day_energy_kwh": round(energy, 4),
             "daytime_i_std": core_std,
             "zero_all_day": int(np.isnan(day_max_i) or day_max_i < th.zero_current_a),
             "stuck": int((not np.isnan(core_std)) and core_std < th.stuck_std_a and core_mean > th.zero_current_a),
+            "stale_run_min": int(stale_run),
             "i_profile_json": json.dumps(profile_vector(g["ts"], g["i_clean"], cfg.slot_minutes)),
             "v_profile_json": json.dumps(profile_vector(g["ts"], g["v"], cfg.slot_minutes)),
         })
@@ -208,6 +226,15 @@ def compute_station_daily(station_id: str, day: date, inv_daily: pd.DataFrame, n
     if not np.isnan(noon_power) and not np.isnan(peak_ref) and noon_power > peak_ref:
         peak_ref = max(peak_ref, noon_power) if (hist.empty or len(hist) < 10) else peak_ref
     tag = tag_weather(noon_power, noon_cv, peak_ref, cfg)
+    # 有气象站辐照时用它校正：日辐照 < 50% 近期晴天参考 → 阴雨；< 75% 且判了 clear → 降为 cloudy（仅在有 ≥10 天辐照历史时启用）
+    if irradiance_kwh_m2 is not None and not np.isnan(irradiance_kwh_m2) and not hist.empty \
+            and "irradiance_kwh_m2" in hist.columns and hist["irradiance_kwh_m2"].notna().sum() >= 10:
+        irr_ref = float(np.nanpercentile(hist["irradiance_kwh_m2"].to_numpy(dtype=float), 95))
+        if irr_ref > 0 and tag != "nodata":
+            if irradiance_kwh_m2 < 0.5 * irr_ref:
+                tag = "overcast"
+            elif irradiance_kwh_m2 < 0.75 * irr_ref and tag == "clear":
+                tag = "cloudy"
     rain = int(tag == "overcast" and (np.isnan(noon_power) or noon_power < 0.2 * peak_ref))
     return {"station_id": station_id, "date": day.isoformat(), "noon_power": noon_power, "peak_ref": peak_ref,
             "noon_cv": noon_cv, "weather_tag": tag, "irradiance_kwh_m2": irradiance_kwh_m2, "rain": rain}

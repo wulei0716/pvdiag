@@ -19,6 +19,14 @@ from .base import Agent, AgentContext, AgentResult
 from .profile import ProfileAgent
 
 
+def _robust_std(x: pd.Series) -> float:
+    """1.4826 × 中位绝对偏差（排除 0 电流串），样本 <3 时返回 NaN"""
+    v = x[x > -0.9].to_numpy(dtype=float)
+    if len(v) < 3:
+        return np.nan
+    return float(1.4826 * np.median(np.abs(v - np.median(v))))
+
+
 class BaselineAgent(Agent):
     name = "baseline"
     stage = "阶段3 基线建模"
@@ -60,7 +68,8 @@ class BaselineAgent(Agent):
         f = feats.merge(strings[["string_id", "inverter_id", "group_key", "azimuth", "tilt", "known_shading"]],
                         on="string_id", how="left")
         f["weather_tag"] = f["date"].map(weather["weather_tag"]) if not weather.empty else "nodata"
-        f["valid"] = (f["noon_median_i"] >= th.zero_current_a) & (f["stuck"] == 0) & (f["zero_all_day"] == 0) & f["noon_median_i"].notna()
+        stale = f["stale_run_min"].fillna(0) >= th.stale_run_min if "stale_run_min" in f.columns else pd.Series(False, index=f.index)
+        f["valid"] = (f["noon_median_i"] >= th.zero_current_a) & (f["stuck"] == 0) & (f["zero_all_day"] == 0) & f["noon_median_i"].notna() & (~stale)
         # 限发标记（逆变器当天限发 → 该日不参与竖向/机间比，互比仍有效）
         lim = inv_daily.set_index(["inverter_id", "date"])["limited_flag"] if not inv_daily.empty else None
         f["limited"] = [int(lim.get((r.inverter_id, r.date), 0)) if lim is not None else 0 for r in f.itertuples()]
@@ -81,6 +90,12 @@ class BaselineAgent(Agent):
         f["ratio"] = f["noon_median_i"] / f["group_median_i"]
         f.loc[~f["valid"], "ratio"] = np.where(f.loc[~f["valid"], "zero_all_day"] == 1, 0.0, np.nan)  # 0 电流串 ratio=0
         f["dev"] = f["ratio"] - 1
+        # ---- 群组当日噪声：有效串偏差的稳健标准差（1.4826×MAD）。云影在大电站各逆变器间不同步，
+        #      "晴好天"也可能噪声 3%~7%；此时 -5% 只是噪声，不是低发（统计显著性门控用）
+        f["group_level_key"] = np.where(use_group, f["group_key"].astype(str), f["inverter_id"].astype(str))
+        vv = f[f["valid"] & f["dev"].notna()]
+        noise = vv.groupby(["date", "group_level_key"])["dev"].agg(_robust_std).rename("group_noise")
+        f = f.merge(noise, left_on=["date", "group_level_key"], right_index=True, how="left")
 
         # ---- 每串滚动统计
         today = d.isoformat()
@@ -103,14 +118,20 @@ class BaselineAgent(Agent):
             ratio_today = cur["ratio"]
             dev_today = cur["dev"]
             dev_vs_own = (ratio_today / baseline_ratio - 1) if (not cold and pd.notna(ratio_today) and baseline_ratio) else np.nan
-            # 晴好天序列（含今天若为晴好天）用于持续度
+            # 晴好天序列（含今天若为晴好天）用于持续度；群组噪声过大的日子跳过（不计也不打断）
             clear_seq = g[(g["weather_tag"] == "clear") & g["dev"].notna()].sort_values("date")
             clear_seq = clear_seq[clear_seq["date"] <= today]
             devs = clear_seq["dev"].to_numpy(dtype=float)
+            noises = clear_seq["group_noise"].to_numpy(dtype=float) if "group_noise" in clear_seq else np.zeros(len(devs))
+            # 中午窗口有整段 0 输出（间歇停机）的日子：偏差被停机拉低，不是"低发"，持续度里跳过（停机有独立签名）
+            if "noon_zero_frac" in clear_seq.columns:
+                nz = clear_seq["noon_zero_frac"].to_numpy(dtype=float)
+                skip_day = (np.nan_to_num(nz) >= th.outage_noon_skip_frac) & (clear_seq["zero_all_day"].to_numpy() == 0)
+                noises = np.where(skip_day, np.inf, noises)
             dates = clear_seq["date"].tolist()
-            p5 = self._streak(devs, th.fault_floor)
-            p3 = self._streak(devs, th.normal_floor)
-            first_breach = dates[len(dates) - p3] if p3 > 0 else None
+            p5, idx5 = self._streak_gated(devs, noises, th.fault_floor, th.noise_k, th.noise_skip)
+            p3, idx3 = self._streak_gated(devs, noises, th.normal_floor, th.noise_k, th.noise_skip)
+            first_breach = dates[idx3] if p3 > 0 and idx3 is not None else None
             roll7 = float(np.median(devs[-7:])) if len(devs) else np.nan
             # 阴天（散射光）偏差：朝向差异在阴天消失 → 用于 C 级"疑朝向"判定；只取纯阴雨天
             oc = g[(g["weather_tag"] == "overcast") & g["dev"].notna() & g["valid"]].tail(5)
@@ -127,6 +148,7 @@ class BaselineAgent(Agent):
                 "v_dev": self._vertical_dev(g, weather, today), "overcast_dev": overcast_dev,
                 "n_clear_recent": n_clear_recent, "cold_start": cold,
                 "weather_tag": cur["weather_tag"], "limited": int(cur["limited"]),
+                "group_noise": None if pd.isna(cur.get("group_noise")) else float(cur["group_noise"]),
             })
         bl = pd.DataFrame(rows)
 
@@ -143,6 +165,28 @@ class BaselineAgent(Agent):
                 break
             n += 1
         return n
+
+    @staticmethod
+    def _streak_gated(devs: np.ndarray, noises: np.ndarray, floor: float, k: float, skip: float) -> Tuple[int, Optional[int]]:
+        """带噪声门控的连续低发天数（从最近一天往前数）：
+        - 群组噪声 > skip：云影日，跳过（既不计入也不打断）
+        - 偏差 ≤ floor 且 偏差 ≤ -k×噪声：计 1 天
+        - 否则打断
+        返回 (天数, 连续段最早一天在序列中的下标)"""
+        n, first = 0, None
+        for i in range(len(devs) - 1, -1, -1):
+            x, s = devs[i], noises[i] if i < len(noises) else np.nan
+            if np.isnan(x):
+                break
+            s = 0.0 if (s is None or np.isnan(s)) else float(s)
+            if s > skip:
+                continue
+            if x <= floor and x <= -k * s:
+                n += 1
+                first = i
+            else:
+                break
+        return n, first
 
     @staticmethod
     def _vertical_dev(g: pd.DataFrame, weather: pd.DataFrame, today: str) -> float:

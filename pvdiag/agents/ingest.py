@@ -115,12 +115,30 @@ class IngestAgent(Agent):
                 # 平台没给逆变器功率 → 用组串 I×V 合成逆变器功率曲线做天气判定
                 i = self._synth_inverter_power(s, ctx.store.strings(station_id))
                 inv_daily = compute_inverter_daily(i, d, cfg, rated)
+            inv_daily = self._unflag_frozen_limited(sf, inv_daily, ctx.store.strings(station_id), th.stale_run_min)
             hist = ctx.store.station_daily(station_id, d - timedelta(days=cfg.peak_lookback_days + 5), d)
             row = compute_station_daily(station_id, d, inv_daily, station_noon_cv(i, d, cfg), hist, capacity, cfg,
                                         (irr_by_day or {}).get(d))
             ctx.store.upsert_df("daily_features", sf)
             ctx.store.upsert_df("inverter_daily", inv_daily)
             ctx.store.upsert_df("station_daily", pd.DataFrame([row]))
+
+    @staticmethod
+    def _unflag_frozen_limited(sf: pd.DataFrame, inv_daily: pd.DataFrame, profiles: pd.DataFrame, stale_min: int = 90) -> pd.DataFrame:
+        """数据冻结 ≠ 限发：功率"平顶"若伴随该机大多数组串电流钉死 ≥90 分钟，是采集冻结（走数据问题），不标限发。
+        （NREL 标注片段 inv_2173 的教训：钉死日全部被误标成限发）"""
+        if sf.empty or inv_daily.empty or "stale_run_min" not in sf.columns or profiles.empty:
+            return inv_daily
+        m = profiles.set_index("string_id")["inverter_id"]
+        x = sf.assign(inverter_id=sf["string_id"].map(m)).dropna(subset=["inverter_id"])
+        frozen = x.groupby("inverter_id")["stale_run_min"].apply(lambda v: float((v.fillna(0) >= stale_min).mean()) >= 0.5)
+        bad = set(frozen[frozen].index)
+        if bad:
+            inv_daily = inv_daily.copy()
+            mask = inv_daily["inverter_id"].isin(bad) & (inv_daily["limited_flag"] == 1)
+            inv_daily.loc[mask, "limited_flag"] = 0
+            inv_daily.loc[mask, "limited_slots_json"] = "[]"
+        return inv_daily
 
     @staticmethod
     def _synth_inverter_power(strings: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:

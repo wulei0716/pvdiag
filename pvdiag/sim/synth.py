@@ -7,7 +7,8 @@
 - 逆变器 pac = Σ I·V·η，受额定交流功率限幅 → "平顶"限发
 
 可注入故障（string 级）：open_circuit / diode_bypass / shading_fixed / orientation / dust_local / stuck /
-                        wrong_profile(串长档案错) / archived_shading(已备案遮挡)
+                        wrong_profile(串长档案错) / archived_shading(已备案遮挡) / degradation_step /
+                        outage_intermittent(间歇停机，Kaggle Plant 2 真实签名) / stale_partial(半天钉死，NREL 标注签名)
 （inverter 级）：mppt_fault（整机低发）/ limit（限发）
 """
 from __future__ import annotations
@@ -65,6 +66,8 @@ def default_faults(cfg: SimConfig) -> List[Fault]:
         Fault("string", s(2, 11), "wrong_profile", 0, {"n_modules": 20}),
         Fault("string", s(3, 4), "archived_shading", 0, {"start": "09:30", "end": "11:00", "depth": 0.3}),
         Fault("string", s(3, 7), "degradation_step", 40, {"factor": 0.955}),   # 全天均匀 -4.5%（D 级边界）
+        Fault("string", s(3, 10), "outage_intermittent", 37, {"prob": 0.6, "hours": 2.0}),
+        Fault("string", s(1, 11), "stale_partial", 39, {"start": "10:30", "hours": 3.0}),
         Fault("inverter", inv(3), "mppt_fault", 42, {"factor": 0.92}),
     ]
 
@@ -207,6 +210,17 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
                         V = v_clamp * (string_nmod[sid] / cfg.n_modules); I = I * 0.985
                     elif f.kind == "degradation_step":
                         I = I * p.get("factor", 0.955)
+                    elif f.kind == "outage_intermittent":
+                        # 间歇停机/掉线：每天以 prob 概率在白天随机时段整段掉到 0（时长 hours），其余时间正常
+                        if rng.random() < p.get("prob", 0.6):
+                            start_h = float(rng.uniform(p.get("earliest_h", 9.0), p.get("latest_h", 14.0)))
+                            band = (minutes >= start_h * 60) & (minutes < (start_h + p.get("hours", 2.0)) * 60)
+                            I = np.where(band, 0.0, I)
+                    elif f.kind == "stale_partial":
+                        # 半天钉死：从 start 时刻起电流冻结在当时值（采集器冻结），hours 小时后恢复
+                        k0 = int(_hhmm(p.get("start", "10:30")) // 5)
+                        k1 = min(n_t, k0 + int(p.get("hours", 3.0) * 12))
+                        I = I.copy(); I[k0:k1] = I[k0]
                 currents[sid] = np.clip(I, 0, None)
                 voltages[sid] = V
             # 逆变器功率 + 限幅（平顶）

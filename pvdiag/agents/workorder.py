@@ -30,6 +30,8 @@ CHECKLIST: Dict[str, List[str]] = {
     Cause.DATA_ISSUE.value: ["检查采集器/通讯链路，核对平台时钟", "重启采集模块后观察电流是否恢复变化", "若现场发电正常则关闭为数据问题"],
     Cause.PROFILE_ERROR.value: ["核对排布图：该串实际串长/MPPT 接线", "更正档案（n_modules/mppt），重算基线"],
     Cause.CURTAILMENT.value: ["核对电网调度/逆变器限功率设置", "确认是否为 EMC 协议允许的限发，不计组件故障"],
+    Cause.OUTAGE.value: ["查逆变器/采集器告警与离线日志，核对停机时段是否与工单一致", "查直流开关/保险丝是否跳脱、通讯链路是否中断",
+                         "若为电网/调度停机或计划检修 → 登记事件并驳回；否则排查设备并回填实际原因"],
     Cause.ORIENTATION.value: ["核对排布图：该串朝向/倾角是否与档案一致", "更正档案后系统自动重分组，不派现场"],
     Cause.UNKNOWN.value: ["现场巡检该串组件、接线、阴影", "拍照回填，记录实际原因"],
 }

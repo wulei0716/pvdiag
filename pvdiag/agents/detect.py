@@ -38,6 +38,11 @@ class DetectAgent(Agent):
         all_susp = self._reconcile_cases(ctx, all_susp)
         if all_susp:
             ctx.store.upsert_df("suspects", pd.DataFrame(all_susp))
+            # 每日快照（审计留痕 + 自调参影子回放的素材：某天某案例当时是什么分级/原因/偏差）
+            snap = pd.DataFrame([{"suspect_id": s["suspect_id"], "date": s["date"], "grade": s["grade"], "rule_cause": s["rule_cause"],
+                                  "dev_today": s.get("dev_today"), "persist_days": s.get("persist_days", 0),
+                                  "low_confidence": s.get("low_confidence", 0)} for s in all_susp])
+            ctx.store.upsert_df("suspect_daily", snap)
         by_grade = pd.Series([s["grade"] for s in all_susp]).value_counts().to_dict() if all_susp else {}
         res.metrics = {"suspects": len(all_susp), "by_grade": by_grade,
                        "new_cases": sum(1 for s in all_susp if s.get("_new"))}
@@ -73,10 +78,17 @@ class DetectAgent(Agent):
                 c["created_at"] = a["created_at"]
                 c["status"] = a["status"]
                 # 分级只升不降；C（朝向/档案解释）是对偏差的"解释"，优先于 B 的"未知低发"
+                escalated = SEVERITY.get(c["grade"], 9) < SEVERITY.get(a["grade"], 9)
                 if c["grade"] != Grade.C.value and SEVERITY.get(a["grade"], 9) < SEVERITY.get(c["grade"], 9):
                     c["grade"] = a["grade"]
                     if c["rule_cause"] == Cause.UNKNOWN.value:
                         c["rule_cause"] = a["rule_cause"]
+                # 原因稳定性："未知"不覆盖已有的具体原因；两个具体原因打架时按案例历史多数票（分级升级时以今天为准）
+                if not escalated and c["rule_cause"] != a["rule_cause"]:
+                    if c["rule_cause"] == Cause.UNKNOWN.value:
+                        c["rule_cause"] = a["rule_cause"]
+                    elif a["rule_cause"] != Cause.UNKNOWN.value:
+                        c["rule_cause"] = self._majority_cause(ctx, a["suspect_id"], c["rule_cause"], a["rule_cause"])
                 c["_new"] = False
                 out.append(c)
                 continue
@@ -112,13 +124,26 @@ class DetectAgent(Agent):
             healthy = recent["dev_today"].notna() & (recent["dev_today"] > th.normal_floor) \
                 & (recent["zero_all_day"] == 0) & (recent["stuck"] == 0) \
                 & (recent["dip_depth"].fillna(0) < 0.1) & (recent["voltage_offset"].fillna(0).abs() <= th.voltage_offset)
-            if healthy.all():
+            # 间歇停机是"来来回回"的：近 7 天内还有停机签名就不算痊愈（否则会关了又开、一串多案例）
+            recent_outage = ctx.store.scalar(
+                "SELECT COALESCE(SUM(CASE WHEN outage_slots>=? THEN 1 ELSE 0 END),0) FROM signatures WHERE string_id=? AND date BETWEEN ? AND ?",
+                (th.outage_min_slots, key, (ctx.run_date - timedelta(days=7)).isoformat(), today)) or 0
+            if healthy.all() and not recent_outage:
                 ctx.store.execute("UPDATE suspects SET status=? WHERE suspect_id=?", (SuspectStatus.CLOSED.value, a["suspect_id"]))
                 ctx.store.execute(
                     "INSERT INTO reviews (suspect_id, reviewer, decision, true_cause, reject_reason, note, reviewed_at) VALUES (?,?,?,?,?,?,?)",
                     (a["suspect_id"], "system", "auto_close", None, None, f"{today} 连续 {n_ok} 个晴好天偏差回到正常带，自愈关闭",
                      pd.Timestamp.now().isoformat()))
         return out
+
+    @staticmethod
+    def _majority_cause(ctx: AgentContext, suspect_id: str, today_cause: str, active_cause: str) -> str:
+        h = ctx.store.query("SELECT rule_cause, COUNT(*) n FROM suspect_daily WHERE suspect_id=? AND rule_cause!=? GROUP BY rule_cause",
+                            (suspect_id, Cause.UNKNOWN.value))
+        votes = dict(zip(h["rule_cause"], h["n"])) if not h.empty else {}
+        votes[today_cause] = votes.get(today_cause, 0) + 1
+        best = max(votes.items(), key=lambda kv: (kv[1], kv[0] == active_cause))
+        return best[0]
 
     # ------------------------------------------------------------------ 单站
     def detect_station(self, ctx: AgentContext, station_id: str, d: date) -> List[Dict]:
@@ -143,7 +168,7 @@ class DetectAgent(Agent):
 
         group_curves = self._group_curves(ft, prof, bl)
         voff = self._voltage_offsets(ft, prof, bl)
-        zero_streak, stuck_streak = self._zero_stuck_streaks(feats, ctx.store, station_id, d)
+        zero_streak, stuck_streak = self._zero_stuck_streaks(feats, ctx.store, station_id, d, th.stale_run_min)
         sig_hist = ctx.store.query(
             "SELECT s.string_id, s.date, s.dip_depth, s.dip_start, s.dip_end, s.outside_dip_ratio, s.voltage_offset, s.weather_tag "
             "FROM signatures s JOIN strings p ON p.string_id=s.string_id WHERE p.station_id=? AND s.date BETWEEN ? AND ?",
@@ -172,14 +197,21 @@ class DetectAgent(Agent):
             if v_off is not None and abs(v_off) > th.voltage_offset and v_days + 1 >= th.voltage_offset_days:
                 sig.voltage_offset = v_off
             dip_days = self._dip_days(sig_hist, sid, sig, th)
+            if sig.outage_hours > 0:
+                sig.outage_days = self._outage_days(ctx.store, sid, d, th) + 1
+            out_slots = int(round(sig.outage_hours * 60 / cfg.slot_minutes)) if sig.outage_hours else 0
             sig_rows.append({"string_id": sid, "date": today, "weather_tag": weather, "ratio_mean": sig.ratio_mean,
                              "ratio_std": sig.ratio_std, "am_pm_skew": skew, "dip_depth": sig.dip_depth,
                              "dip_start": sig.dip_start, "dip_end": sig.dip_end, "outside_dip_ratio": sig.outside_dip_ratio,
-                             "voltage_offset": v_off})
+                             "voltage_offset": v_off, "outage_slots": out_slots})
             grade, cause, notes = self._grade(b, sig, p, zero_streak.get(sid, 0), stuck_streak.get(sid, 0),
                                               weather, dip_days, th)
             if grade is None:
                 continue
+            # 冷启动（该串晴好天基线样本不足）：仅凭互比偏差不下 B 级结论——只做同日互比、进观察带
+            if grade == Grade.B.value and int(b.get("cold_start", 0) or 0) == 1 and not (sig.dip_depth or sig.outage_hours or sig.inverter_level):
+                grade = th.cold_start_cap_grade
+                notes.append(f"冷启动期（晴好天基线样本 {int(b.get('baseline_n', 0))} < {cfg.min_clear_days}），分级上限 {grade}，待基线建立后再升级")
             sig.notes.extend(notes)
             archived = grade == Grade.ARCHIVED.value
             low_conf = bool(rainy_caution and grade in (Grade.B.value, Grade.D.value, Grade.E.value))
@@ -291,7 +323,7 @@ class DetectAgent(Agent):
         return n
 
     @staticmethod
-    def _zero_stuck_streaks(feats: pd.DataFrame, store, station_id: str, d: date) -> Tuple[Dict[str, int], Dict[str, int]]:
+    def _zero_stuck_streaks(feats: pd.DataFrame, store, station_id: str, d: date, stale_min: int = 90) -> Tuple[Dict[str, int], Dict[str, int]]:
         """连续全天 0 电流 / 钉死天数；跳过全站无数据日（缺数据≠零发电）"""
         if feats.empty:
             return {}, {}
@@ -307,12 +339,36 @@ class DetectAgent(Agent):
                 else:
                     break
             for r in g.itertuples():
-                if r.stuck:
+                # 全天钉死，或日间连续 ≥90 分钟钉死不动（半天冻结：pvanalytics 标注数据里常见）
+                if r.stuck or (getattr(r, "stale_run_min", 0) or 0) >= stale_min:
                     s += 1
                 else:
                     break
             zero[sid], stuck[sid] = z, s
         return zero, stuck
+
+    @staticmethod
+    def _runs(mask: np.ndarray, min_len: int) -> List[Tuple[int, int]]:
+        """布尔序列中长度 ≥ min_len 的连续 True 段 [(起, 止)]"""
+        runs, k = [], 0
+        while k < len(mask):
+            if mask[k]:
+                j = k
+                while j + 1 < len(mask) and mask[j + 1]:
+                    j += 1
+                if j - k + 1 >= min_len:
+                    runs.append((k, j))
+                k = j + 1
+            else:
+                k += 1
+        return runs
+
+    @staticmethod
+    def _outage_days(store, sid: str, d: date, th) -> int:
+        """近 7 个有数据日中（不含今天）出现停机签名的天数"""
+        h = store.query("SELECT outage_slots FROM signatures WHERE string_id=? AND date BETWEEN ? AND ? AND outage_slots IS NOT NULL",
+                        (sid, (d - timedelta(days=7)).isoformat(), (d - timedelta(days=1)).isoformat()))
+        return int((h["outage_slots"] >= th.outage_min_slots).sum()) if not h.empty else 0
 
     # ------------------------------------------------------------------ 签名
     def _signature(self, sid: str, f: Optional[pd.Series], p: pd.Series, b: pd.Series,
@@ -323,6 +379,9 @@ class DetectAgent(Agent):
         sig.zero_all_day = bool(f["zero_all_day"])
         sig.stuck = bool(f["stuck"])
         sig.limited = bool(b.get("limited", 0))
+        sig.stale_run_min = int(f.get("stale_run_min") or 0) if "stale_run_min" in f else 0
+        gn = b.get("group_noise")
+        sig.group_noise = None if gn is None or pd.isna(gn) else float(gn)
         oc = b.get("overcast_dev")
         sig.overcast_dev = None if oc is None or pd.isna(oc) else float(oc)
         if sig.zero_all_day or sig.stuck:
@@ -344,6 +403,20 @@ class DetectAgent(Agent):
             return sig, None
         ratio = np.full(len(vec), np.nan)
         ratio[valid] = vec[valid] / gcurve[valid]
+        # ---- 间歇停机/掉线：群组在发电（≥ 当日峰值 30%）而本串整段为 0 → 不是遮挡（遮挡不会到 0），单独成签名
+        # "整段为 0"按相对口径：≤ 群组同时段 3%（15 分钟数据插值到 5 分钟后，停机边沿的半小时槽均值不会精确为 0；遮挡不会低到 3%）
+        zero_run = valid & (vec <= np.maximum(th.zero_current_a, th.outage_rel_zero * gcurve)) & (gcurve >= th.outage_group_ratio * np.nanmax(gcurve))
+        out_slots = self._runs(zero_run, th.outage_min_slots)
+        if out_slots:
+            n_slots = sum(z - a + 1 for a, z in out_slots)
+            sig.outage_hours = round(n_slots * cfg.slot_minutes / 60.0, 2)
+            sig.notes.append("白天整段 0 输出 " + "、".join(f"{slot_label(a, cfg.slot_minutes)}-{slot_label(z + 1, cfg.slot_minutes)}" for a, z in out_slots)
+                             + f"（共 {sig.outage_hours}h，同机其它串正常）")
+            for a, z in out_slots:        # 停机段不参与凹陷/恒定偏差统计
+                valid[a:z + 1] = False
+            ratio[~valid] = np.nan
+            if valid.sum() < 6:
+                return sig, None
         sig.ratio_mean = float(np.nanmean(ratio))
         sig.ratio_std = float(np.nanstd(ratio))
         # 分时段凹陷：比值 < dip_ratio 的连续槽段
@@ -397,6 +470,12 @@ class DetectAgent(Agent):
         if sig.voltage_offset is not None:
             notes.append(f"中午电压偏离同机中位 {sig.voltage_offset:+.1%}，连续 ≥{th.voltage_offset_days} 天（串长/MPPT 配置差异，先核档案）")
             return Grade.A.value, Cause.PROFILE_ERROR.value, notes
+        # ---- 间歇停机/掉线（白天整段 0 输出而同机其它串正常；全天 0 走上面的 A 级断线逻辑）
+        if sig.outage_hours > 0:
+            notes.append(f"白天停机/掉线 {sig.outage_hours}h，近 7 日已出现 {sig.outage_days} 天（逆变器/采集器掉线、直流开关跳脱、通讯中断；不是遮挡——遮挡不会到 0）")
+            if sig.outage_days >= th.fault_persist_days:
+                return Grade.B.value, Cause.OUTAGE.value, notes
+            return Grade.E.value, Cause.OUTAGE.value, notes
         # ---- 非晴好天只沿用已有持续低发判定
         if weather != "clear":
             if p5 >= th.fault_persist_days:
@@ -442,6 +521,8 @@ class DetectAgent(Agent):
     def _b_cause(sig: Signature) -> str:
         if sig.inverter_level:
             return Cause.MPPT.value
+        if sig.outage_hours > 0:
+            return Cause.OUTAGE.value
         if sig.dip_depth is not None and (sig.outside_dip_ratio or 0) >= 0.9:
             return Cause.BYPASS_DIODE.value if 0.25 <= sig.dip_depth <= 0.42 else Cause.SHADING.value
         if sig.constant_offset:

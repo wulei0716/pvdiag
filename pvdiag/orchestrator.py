@@ -83,12 +83,19 @@ class DailyPipeline:
 
     # ------------------------------------------------------------------
     def _maybe_retrain(self, ctx: AgentContext) -> Dict:
-        last = ctx.store.query("SELECT trained_at FROM model_registry WHERE active=1")
-        due = last.empty or (datetime.now() - datetime.fromisoformat(last["trained_at"].iloc[0])).days >= ctx.settings.confidence.retrain_every_days
+        """模型生命周期钩子：按触发条件重训 → 留出集考试 → 达标才上线（不达标继续用现役/规则代理）"""
+        board = ctx.shared.get("board") or {}
+        psi = (board.get("model") or {}).get("dev_psi_7d_vs_prev")
+        due, why = ClassifyAgent.retrain_due(ctx, drift_psi=psi)
         if not due:
-            return {"trained": False, "reason": "未到重训周期"}
+            return {"trained": False, "reason": why}
         try:
-            return ClassifyAgent().train(ctx)
+            res = ClassifyAgent().train(ctx, reason=why)
+            if res.get("trained"):
+                msg = (f"模型 {res['version']} {'已上线' if res.get('promoted') else '未上线（考试不达标）'}：{why}；"
+                       f"考试 {json.dumps(res.get('exam', {}).get('challenger'), ensure_ascii=False)} vs 规则 {json.dumps(res.get('exam', {}).get('rule_proxy'), ensure_ascii=False)}")
+                ctx.store.alert(ctx.run_date, "info", "classify", msg)
+            return res
         except Exception as e:
             ctx.store.alert(ctx.run_date, "warn", "classify", f"重训失败: {e}")
             return {"trained": False, "reason": str(e)}

@@ -24,6 +24,7 @@ class Thresholds(BaseModel):
     zero_current_a: float = 0.5          # <0.5A 视为未接/夜间
     zero_days: int = 2                   # 全天 0 电流连续天数 → A 故障
     stuck_std_a: float = 0.02            # 日间电流标准差低于此值且均值>0.5A → 电流钉死
+    stale_run_min: int = 90              # 日间连续 ≥90 分钟电流一动不动 → 半天钉死（数据问题），该日不参与互比中位数
     voltage_offset: float = 0.08         # 与群组中位电压偏差 > 8% → 电压异位
     voltage_offset_days: int = 2
     dip_ratio: float = 0.85              # 分时段比值 < 0.85 视为凹陷（遮挡/二极管签名）
@@ -33,6 +34,14 @@ class Thresholds(BaseModel):
     orientation_max_drift: float = 0.012    # 近 10 晴好天偏差 std 超过此值 → 在漂移，不判朝向（积灰/衰减）
     archived_shading_extra: float = -0.05   # 已备案遮挡串，比备案偏差再低 5% 才重新报警
     rainy_streak_caution_days: int = 7      # 连续 ≥7 天无晴好天后的首个晴天 → 低置信
+    # ---- 群组噪声门控（来自公开数据 Kaggle 两站的教训：大电站"晴好天"各逆变器互比偏差的稳健标准差可达 2%~7%）
+    noise_k: float = 2.5                    # 当日偏差还要 ≤ -k×群组稳健标准差(MAD) 才算"统计显著"的一次低发
+    noise_skip: float = 0.04                # 群组稳健标准差 > 4% 的"晴好天"视为云影日：不计入持续度、也不打断持续度
+    cold_start_cap_grade: str = "D"         # 冷启动（晴好天样本不足）期间，仅凭互比偏差最高只给到此分级（不给 B）
+    outage_min_slots: int = 2               # 白天 ≥2 个半小时槽（1h）整段 0 输出而同机其它串正常 → 间歇停机/掉线签名
+    outage_group_ratio: float = 0.30        # 判停机时要求群组曲线 ≥ 当日峰值 30%（排除清晨/傍晚）
+    outage_rel_zero: float = 0.10           # 本串 ≤ 群组同时段 10% 即视为"整段为 0"（晴天散射光占比 10%~15%，遮挡不会更低；15 分钟边沿插值也不会）
+    outage_noon_skip_frac: float = 0.20     # 中午窗口 ≥20% 样本为 0 的日子不计入互比持续度（停机已有独立签名，别把它算成"低发"）
 
 
 class BaselineCfg(BaseModel):
@@ -57,6 +66,13 @@ class Confidence(BaseModel):
     mid: float = 0.50                    # ≥ → 转人工复核；否则仅观察
     min_labels_for_ml: int = 60          # 标注数不足 → 规则代理模型（冷启动）
     retrain_every_days: int = 30
+    # ---- 模型生命周期（自训练 / 自评估 / 自切换 / 自回退）
+    retrain_min_new_labels: int = 20     # 距上次训练新增标注 ≥N 条即触发重训（不必等周期）
+    holdout_fraction: float = 0.25       # 按时间顺序留出最近 25%（至少 10 条）做"考试"，不用随机切分（避免未来信息泄漏）
+    promote_tolerance: float = 0.02      # 挑战者准确率 ≥ 现役 − 2% 且 ≥ 规则代理 − 2% 才上线
+    demote_margin: float = 0.10          # 线上：模型与复核结论的一致率比规则代理低 10 个百分点以上 → 自动降级回规则代理
+    demote_min_samples: int = 20         # 降级判断至少 20 条近 30 天复核样本
+    drift_psi_retrain: float = 0.25      # 偏差分布 PSI 超过此值且有新标注 → 触发重训
 
 
 class DispatchCfg(BaseModel):
@@ -84,7 +100,7 @@ class LossCfg(BaseModel):
     expected_fault_days_default: int = 30   # 未修复预计持续天数（优先级公式用）
     repair_cost_by_cause: Dict[str, float] = Field(default_factory=lambda: {
         "断线/未接": 300, "旁路二极管": 500, "遮挡": 400, "朝向差异": 0,
-        "MPPT异常": 1500, "组件衰减/积灰": 200, "数据问题": 50, "限发": 0, "未知": 300,
+        "MPPT异常": 1500, "组件衰减/积灰": 200, "数据问题": 50, "限发": 0, "间歇停机/掉线": 200, "未知": 300,
     })
 
 

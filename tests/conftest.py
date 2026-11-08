@@ -49,6 +49,8 @@ def sim_env(tmp_path):
         Fault("string", s(2, 5), "stuck", 34, {"value": 8.0}),
         Fault("string", s(2, 7), "wrong_profile", 0, {"n_modules": 20}),
         Fault("string", s(2, 8), "archived_shading", 0, {"start": "09:30", "end": "11:00", "depth": 0.3}),
+        Fault("string", s(1, 7), "outage_intermittent", 33, {"prob": 0.7, "hours": 2.0}),
+        Fault("string", s(2, 6), "stale_partial", 35, {"start": "10:30", "hours": 3.0}),
     ]
     cfg = small_sim(days=50, faults=faults)
     return load_sim(tmp_path, cfg) + (cfg,)

@@ -35,8 +35,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE TABLE IF NOT EXISTS daily_features (
     string_id TEXT, date TEXT, n_samples INTEGER, n_daytime_expected INTEGER, n_missing INTEGER,
-    noon_median_i REAL, noon_median_v REAL, noon_n INTEGER, day_max_i REAL, day_energy_kwh REAL,
-    daytime_i_std REAL, zero_all_day INTEGER, stuck INTEGER, i_profile_json TEXT, v_profile_json TEXT,
+    noon_median_i REAL, noon_median_v REAL, noon_n INTEGER, noon_zero_frac REAL, day_max_i REAL, day_energy_kwh REAL,
+    daytime_i_std REAL, zero_all_day INTEGER, stuck INTEGER, stale_run_min INTEGER, i_profile_json TEXT, v_profile_json TEXT,
     PRIMARY KEY (string_id, date)
 );
 CREATE INDEX IF NOT EXISTS idx_df_date ON daily_features(date);
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS baselines (
     group_median_i REAL, ratio_today REAL, baseline_ratio REAL, baseline_n INTEGER,
     dev_today REAL, dev_vs_own REAL, dev_roll7 REAL, persist_days_5 INTEGER, persist_days_3 INTEGER,
     first_breach_date TEXT, v_dev REAL, overcast_dev REAL, n_clear_recent INTEGER, cold_start INTEGER,
-    weather_tag TEXT, limited INTEGER, PRIMARY KEY (string_id, date)
+    weather_tag TEXT, limited INTEGER, group_noise REAL, PRIMARY KEY (string_id, date)
 );
 CREATE INDEX IF NOT EXISTS idx_bl_date ON baselines(date);
 CREATE TABLE IF NOT EXISTS inverter_baselines (
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS inverter_baselines (
 );
 CREATE TABLE IF NOT EXISTS signatures (
     string_id TEXT, date TEXT, weather_tag TEXT, ratio_mean REAL, ratio_std REAL, am_pm_skew REAL,
-    dip_depth REAL, dip_start TEXT, dip_end TEXT, outside_dip_ratio REAL, voltage_offset REAL,
+    dip_depth REAL, dip_start TEXT, dip_end TEXT, outside_dip_ratio REAL, voltage_offset REAL, outage_slots INTEGER,
     PRIMARY KEY (string_id, date)
 );
 CREATE TABLE IF NOT EXISTS suspects (
@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS suspects (
 );
 CREATE INDEX IF NOT EXISTS idx_susp_date ON suspects(date);
 CREATE INDEX IF NOT EXISTS idx_susp_string ON suspects(string_id);
+CREATE TABLE IF NOT EXISTS suspect_daily (
+    suspect_id TEXT, date TEXT, grade TEXT, rule_cause TEXT, dev_today REAL, persist_days INTEGER, low_confidence INTEGER,
+    PRIMARY KEY (suspect_id, date)
+);
 CREATE TABLE IF NOT EXISTS verdicts (
     suspect_id TEXT PRIMARY KEY, model_version TEXT, cause TEXT, confidence REAL, action TEXT,
     explanation TEXT, proba_json TEXT, novelty_score REAL, created_at TEXT
@@ -107,7 +111,26 @@ CREATE TABLE IF NOT EXISTS model_registry (
 CREATE TABLE IF NOT EXISTS platform_state (
     key TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS param_changes (
+    change_id INTEGER PRIMARY KEY AUTOINCREMENT, run_date TEXT, param TEXT, old_value TEXT, new_value TEXT,
+    reason TEXT, metrics_json TEXT, status TEXT, created_at TEXT, rolled_back_at TEXT
+);
+CREATE TABLE IF NOT EXISTS param_overrides (
+    param TEXT PRIMARY KEY, value_json TEXT, updated_at TEXT, source TEXT
+);
+CREATE TABLE IF NOT EXISTS health_checks (
+    check_id INTEGER PRIMARY KEY AUTOINCREMENT, run_date TEXT, name TEXT, status TEXT, detail TEXT, created_at TEXT
+);
 """
+
+# 老库升级：按表逐列补齐（SQLite 的 CREATE TABLE IF NOT EXISTS 不会加新列）
+_MIGRATIONS = {
+    "daily_features": {"stale_run_min": "INTEGER", "noon_zero_frac": "REAL"},
+    "baselines": {"group_noise": "REAL"},
+    "signatures": {"outage_slots": "INTEGER"},
+    "model_registry": {"status": "TEXT", "holdout_json": "TEXT"},
+    "pipeline_runs": {"attempt": "INTEGER"},
+}
 
 
 def _d(x) -> str:
@@ -128,6 +151,23 @@ class Store:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """自愈：老数据库自动补齐新列，不需要人工迁移脚本"""
+        for table, cols in _MIGRATIONS.items():
+            have = set(self.table_columns(table))
+            for col, typ in cols.items():
+                if col not in have:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        self._conn.commit()
+
+    def quick_check(self) -> str:
+        """SQLite 完整性快速检查：返回 'ok' 或错误描述"""
+        try:
+            return str(self._conn.execute("PRAGMA quick_check").fetchone()[0])
+        except Exception as e:  # pragma: no cover
+            return f"error: {e}"
 
     # ------------------------------------------------------------ 基础 SQL
     @contextmanager
