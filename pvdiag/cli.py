@@ -238,8 +238,8 @@ def cmd_tune(args):
             table = agent.evaluate_grid(ctx, cases, TuningAgent.current_params(s))
             print(pd.DataFrame(table)[["params", "precision", "recall", "f1", "is_current"]].to_string(index=False))
     elif args.action == "apply":
-        if args.param not in TUNABLE:
-            sys.exit(f"可调参数：{list(TUNABLE)}")
+        if args.param not in TUNABLE or args.value is None:
+            sys.exit(f"用法：pvdiag tune apply <param> <value>；可调参数：{list(TUNABLE)}")
         val = TUNABLE[args.param](args.value)
         old = json.dumps(TuningAgent.current_params(s)[args.param])
         store.execute("INSERT OR REPLACE INTO param_overrides (param, value_json, updated_at, source) VALUES (?,?,?,?)",
@@ -255,10 +255,12 @@ def cmd_tune(args):
         store.execute("INSERT OR REPLACE INTO param_overrides (param, value_json, updated_at, source) VALUES (?,?,?,?)",
                       (c["param"], c["old_value"], datetime.now().isoformat(), "rollback"))
         store.execute("UPDATE param_changes SET status='rolled_back', rolled_back_at=? WHERE change_id=?", (datetime.now().isoformat(), int(c["change_id"])))
-        print(f"已回滚 {c['param']} → {c['old_value']}")
+        store.set_state("tuning:last_change", {"at": date.today().isoformat(), "rollback": c["param"], "by": "manual"})
+        print(f"已回滚 {c['param']} → {c['old_value']}（该值 90 天内不会再自动生效）")
     elif args.action == "clear":
         store.execute("DELETE FROM param_overrides")
         store.execute("UPDATE param_changes SET status='rolled_back', rolled_back_at=? WHERE status='applied'", (datetime.now().isoformat(),))
+        store.set_state("tuning:last_change", {"at": date.today().isoformat(), "rollback": "all", "by": "manual"})
         print("覆盖层已清空，回到 config.yaml 口径")
 
 
@@ -289,6 +291,8 @@ def cmd_model(args):
         print(df.drop(columns=["metrics_json"]).to_string(index=False))
         print("线上一致率：", store.get_state("model:live_agreement"))
     elif args.action == "promote":
+        if not args.version or store.scalar("SELECT COUNT(*) FROM model_registry WHERE model_version=?", (args.version,)) == 0:
+            sys.exit("用法：pvdiag model promote <model_version>（见 pvdiag model list）")
         store.execute("UPDATE model_registry SET active=0, status=CASE WHEN status='active' THEN 'retired' ELSE status END")
         store.execute("UPDATE model_registry SET active=1, status='active' WHERE model_version=?", (args.version,))
         print(f"已上线 {args.version}")

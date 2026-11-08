@@ -54,11 +54,13 @@ class DailyPipeline:
     def run(self, run_date: Optional[date] = None, station_ids: Optional[List[str]] = None, write_report: bool = True) -> Dict:
         run_date = run_date or date.today()
         ctx = AgentContext(settings=self.settings, store=self.store, run_date=run_date, station_ids=station_ids)
+        ctx.shared["pipeline_started_at"] = datetime.now().isoformat()
         results: List[AgentResult] = []
+        retrain: Dict = {}
         for agent in self.agents(with_ingest=self.ingest):
+            if isinstance(agent, MonitorAgent):
+                retrain = self._maybe_retrain(ctx)          # 先重训再监控，监控才能把"上线/未过考"当天推送出去
             results.append(agent(ctx))
-        # 月度重训钩子
-        retrain = self._maybe_retrain(ctx)
         report = self.build_report(ctx, results, retrain)
         if write_report:
             self.write_report(report, run_date)
@@ -73,11 +75,15 @@ class DailyPipeline:
         d = start
         while d <= end:
             ctx = AgentContext(settings=self.settings, store=self.store, run_date=d, station_ids=station_ids)
+            ctx.shared["pipeline_started_at"] = datetime.now().isoformat()
             light = d < end
+            retrain: Dict = {}
             for agent in self.agents(with_ingest=False, light=light):
+                if isinstance(agent, MonitorAgent):
+                    retrain = self._maybe_retrain(ctx)
                 agent(ctx)
             if not light:
-                rep = self.build_report(ctx, list(ctx.shared.values()), self._maybe_retrain(ctx))
+                rep = self.build_report(ctx, [v for v in ctx.shared.values() if isinstance(v, AgentResult)], retrain)
                 self.write_report(rep, d)
                 out.append(rep)
             d += timedelta(days=1)
@@ -86,8 +92,7 @@ class DailyPipeline:
     # ------------------------------------------------------------------
     def _maybe_retrain(self, ctx: AgentContext) -> Dict:
         """模型生命周期钩子：按触发条件重训 → 留出集考试 → 达标才上线（不达标继续用现役/规则代理）"""
-        board = ctx.shared.get("board") or {}
-        psi = (board.get("model") or {}).get("dev_psi_7d_vs_prev")
+        psi = (ctx.store.get_state("monitor:psi") or {}).get("value")      # 上一次监控算出的偏差分布漂移
         due, why = ClassifyAgent.retrain_due(ctx, drift_psi=psi)
         if not due:
             return {"trained": False, "reason": why}

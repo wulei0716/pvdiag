@@ -102,7 +102,7 @@ class TuningAgent(Agent):
         table = self.evaluate_grid(ctx, cases, cur)
         out["evaluation"] = table
         cur_row = next(r for r in table if r["is_current"])
-        best = self.pick(table, cur_row, cfg)
+        best = self.pick(table, cur_row, cfg, ctx)
         out["best"] = best
         # ④ 决定
         last = ctx.store.get_state("tuning:last_change") or {}
@@ -199,7 +199,7 @@ class TuningAgent(Agent):
     def evaluate_grid(self, ctx: AgentContext, cases: List[Dict], cur: Dict[str, Any]) -> List[Dict]:
         cfg, th = ctx.settings.autotune, ctx.settings.thresholds
         f0, p0, k0 = cur["thresholds.fault_floor"], cur["thresholds.fault_persist_days"], cur["thresholds.noise_k"]
-        floors = sorted({round(x, 3) for x in (f0 - cfg.step_floor, f0, f0 + cfg.step_floor) if cfg.fault_floor_bounds[0] - 1e-9 <= x <= cfg.fault_floor_bounds[1] + 1e-9})
+        floors = sorted({round(x, 3) for x in (f0 - cfg.step_floor, f0, f0 + cfg.step_floor) if cfg.fault_floor_bounds[0] - 1e-9 <= x <= cfg.fault_floor_bounds[1] + 1e-9} | {round(f0, 3)})
         persists = sorted({p for p in (p0, p0 + 1) if cfg.persist_bounds[0] <= p <= cfg.persist_bounds[1]} | {p0})
         ks = sorted({round(x, 2) for x in (k0, k0 + 0.5) if cfg.noise_k_bounds[0] - 1e-9 <= x <= cfg.noise_k_bounds[1] + 1e-9} | {k0})
         table = []
@@ -212,13 +212,23 @@ class TuningAgent(Agent):
         return table
 
     @staticmethod
-    def pick(table: List[Dict], cur: Dict, cfg) -> Optional[Dict]:
-        """只走一步（只改一个参数）、F1 提升够大、召回不塌 → 取 F1 最高者"""
+    def pick(table: List[Dict], cur: Dict, cfg, ctx: Optional[AgentContext] = None) -> Optional[Dict]:
+        """只走一步（只改一个参数）、F1 提升够大、召回不塌、且不是近 90 天内被回滚过的值 → 取 F1 最高者"""
         cands = [r for r in table if r["n_changes"] == 1 and r["f1"] >= cur["f1"] + cfg.min_f1_gain
                  and r["recall"] >= cur["recall"] * cfg.min_recall_keep]
+        if ctx is not None:
+            cands = [r for r in cands if not TuningAgent._recently_rolled_back(ctx, r, cur)]
         if not cands:
             return None
         return max(cands, key=lambda r: (r["f1"], r["precision"]))
+
+    @staticmethod
+    def _recently_rolled_back(ctx: AgentContext, cand: Dict, cur: Dict, days: int = 90) -> bool:
+        """影子回放看 F1，回滚看确认率——两个口径可能打架，被回滚过的值 90 天内不再自动生效（防止来回翻）"""
+        for k, v in cand["params"].items():
+            if cur["params"][k] != v and TuningAgent._recent_logged(ctx, k, v, "rolled_back", days):
+                return True
+        return False
 
     # ------------------------------------------------------------------ 生效 / 留痕 / 回滚
     @staticmethod

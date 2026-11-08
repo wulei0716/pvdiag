@@ -293,7 +293,8 @@ class ClassifyAgent(Agent):
             rows.append(feats)
             ys.append(Cause.NORMAL.value if s["decision"] == "reject" else (s["label_cause"] or s["rule_cause"]))
             # 时间留出按案例"首次报警日"排序（suspects.date 是案例最近更新日，在办案例都等于今天，不能用）
-            meta.append({"suspect_id": s["suspect_id"], "date": s.get("first_date") or s["date"], "rule_cause": s["rule_cause"], "grade": s["grade"]})
+            meta.append({"suspect_id": s["suspect_id"], "date": s.get("first_date") or s["date"], "rule_cause": s["rule_cause"], "grade": s["grade"],
+                         "decision": s["decision"]})
         X = pd.DataFrame(rows)[FEATURES]
         y = pd.Series(ys)
         if with_meta:
@@ -329,6 +330,12 @@ class ClassifyAgent(Agent):
             pred = [ch.predict(r)[0] for r in X.iloc[ho].to_dict("records")]
             out["challenger"] = self._metrics(y.iloc[ho], pred)
             out["rule_proxy"] = self._metrics(y.iloc[ho], meta.iloc[ho]["rule_cause"])
+            # 注意偏置：直接"确认"的标注 = 规则原因本身，规则代理在这些行上天然 100% 对；
+            # 只在"修改原因 / 驳回"的行上比一比才公平，一并给出
+            hard = meta.iloc[ho]["decision"].isin(["modify", "reject"]).to_numpy()
+            if hard.sum() >= 3:
+                out["challenger_on_corrected"] = self._metrics(y.iloc[ho][hard], np.array(pred)[hard])
+                out["rule_proxy_on_corrected"] = self._metrics(y.iloc[ho][hard], meta.iloc[ho]["rule_cause"][hard])
             if incumbent is not None:
                 try:
                     ipred = [incumbent.predict(r)[0] for r in X.iloc[ho].to_dict("records")]

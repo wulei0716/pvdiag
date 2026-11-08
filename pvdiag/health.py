@@ -69,7 +69,9 @@ def run_health_checks(settings: Settings, store: Store, run_date: date) -> List[
         add("每日巡检调度", "ok" if gap <= 1 else ("warn" if gap <= 3 else "fail"), f"最近一次完整巡检 {last_d}" + (f"，已 {gap} 天未跑：检查 launchd/cron" if gap > 1 else ""))
     else:
         add("每日巡检调度", "warn", "尚未跑过完整巡检")
-    failed = store.query("SELECT agent, message FROM pipeline_runs WHERE run_date=? AND status='fail'", (run_date.isoformat(),))
+    # 只看当天最近一轮（以最后一次 profile/ingest 开跑为界），早上失败、修好重跑成功不算
+    first = store.scalar("SELECT MAX(started_at) FROM pipeline_runs WHERE run_date=? AND agent IN ('ingest','profile')", (run_date.isoformat(),)) or "0000"
+    failed = store.query("SELECT agent, message FROM pipeline_runs WHERE run_date=? AND status='fail' AND started_at>=?", (run_date.isoformat(), first))
     add("今日智能体", "ok" if failed.empty else "fail", "全部正常" if failed.empty else "失败：" + "；".join(f"{r.agent}: {r.message[:80]}" for r in failed.itertuples()))
 
     # 模型

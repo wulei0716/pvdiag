@@ -96,6 +96,7 @@ class MonitorAgent(Agent):
                               ((ctx.run_date - timedelta(days=45)).isoformat(), (ctx.run_date - timedelta(days=8)).isoformat()))["dev_today"].to_numpy(dtype=float)
         drift = psi(ref, recent)
         model_info["dev_psi_7d_vs_prev"] = None if np.isnan(drift) else round(drift, 3)
+        ctx.store.set_state("monitor:psi", {"value": None if np.isnan(drift) else float(drift), "date": today})
         if not np.isnan(drift) and drift > 0.25:
             res.alerts.append(f"互比偏差分布显著漂移 PSI={drift:.2f}（设备更换/季节/集体衰减？），建议检查基线分段与模型重训")
         board["model"] = model_info

@@ -67,11 +67,11 @@ class IngestAgent(Agent):
             if not missing and not gaps:
                 self._refresh_features(ctx, sid, [ctx.run_date])
                 continue
-            ok_any = False
+            ok_any, failed_ranges = False, []
             for lo, hi in self._ranges(sorted(set(missing) | set(gaps))):
                 fr, err = self._fetch_with_retry(ctx, adapter, lo, hi, pconf)
                 if fr is None:
-                    self._record_failure(ctx, sid, f"拉取 {lo}~{hi} 失败: {err}", res)
+                    failed_ranges.append(f"{lo}~{hi}: {err}")
                     continue
                 ok_any = True
                 for n in fr.notes:
@@ -80,9 +80,12 @@ class IngestAgent(Agent):
                 n_days = (hi - lo).days + 1
                 fetched_days += n_days
                 healed_days += sum(1 for g in gaps if lo <= g <= hi)
+            if failed_ranges:                 # 一次运行只计一次失败（不按区间数累加）
+                self._record_failure(ctx, sid, "拉取失败 " + "；".join(failed_ranges)[:300], res)
             if ok_any:
                 ctx.store.set_state(f"ingest:{sid}:last_ok", {"date": ctx.run_date.isoformat(), "at": datetime.now().isoformat()})
-                ctx.store.set_state(f"ingest:{sid}:failures", 0)
+                if not failed_ranges:
+                    ctx.store.set_state(f"ingest:{sid}:failures", 0)
         res.metrics = {"rows_written": total_rows, "days": fetched_days, "healed_gap_days": healed_days}
         res.summary = f"写入 {total_rows} 行明细，覆盖 {fetched_days} 站·日" + (f"，补齐历史缺口 {healed_days} 天" if healed_days else "")
         return res
@@ -132,8 +135,11 @@ class IngestAgent(Agent):
         ctx.store.set_state(f"ingest:{station_id}:failures", n)
         level = "error" if n >= ctx.settings.ingest.escalate_after_failures else "warn"
         text = f"{station_id} {msg}（连续第 {n} 次）" + ("，已升级告警：检查授权/配额/网络" if level == "error" else "")
-        res.alerts.append(text)
-        ctx.store.alert(ctx.run_date, level, self.name, text)
+        if level == "error":
+            ctx.store.alert(ctx.run_date, "error", self.name, text)   # error 直接落库（基类只会把 res.alerts 记成 warn）
+            res.summary = (res.summary + "；" if res.summary else "") + text
+        else:
+            res.alerts.append(text)
 
     # ------------------------------------------------------------------ 直接灌入 DataFrame（模拟/测试/旧文件）
     def ingest_frames(self, ctx: AgentContext, station_id: str, strings: pd.DataFrame,

@@ -382,7 +382,8 @@ class DetectAgent(Agent):
         sig.zero_all_day = bool(f["zero_all_day"])
         sig.stuck = bool(f["stuck"])
         sig.limited = bool(b.get("limited", 0))
-        sig.stale_run_min = int(f.get("stale_run_min") or 0) if "stale_run_min" in f else 0
+        _sr = f.get("stale_run_min") if "stale_run_min" in f else None
+        sig.stale_run_min = 0 if _sr is None or pd.isna(_sr) else int(_sr)        # v0.1 老库补列后为 NULL
         gn = b.get("group_noise")
         sig.group_noise = None if gn is None or pd.isna(gn) else float(gn)
         oc = b.get("overcast_dev")

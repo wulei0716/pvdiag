@@ -123,17 +123,19 @@ def test_gate_opens_after_streak_and_closes_on_failure(sim_env):
     end = cfg.start + timedelta(days=cfg.days - 1)
     settings.dispatch.mode = "gated"
     settings.dispatch.gate_open_streak_days = 3
+    settings.ingest.stale_data_alert_days = 10          # 测试里日期往后推几天，别被"数据时延"门控挡住
     agent = WorkOrderAgent()
     # 门控条件不满足（无复核）→ draft
     eff, st = agent.effective_mode(_ctx(settings, store, end))
     assert eff == "draft" and st["streak"] == 0
     # 40 条复核、误报 5% → 门控通过；连续 3 个运行日后放开
     _seed_reviews(store, 40, 0.05, datetime.now() - timedelta(days=1))
-    for k in range(3):
+    for k in range(1, 4):
         eff, st = agent.effective_mode(_ctx(settings, store, end + timedelta(days=k)))
+        eff, st = agent.effective_mode(_ctx(settings, store, end + timedelta(days=k)))   # 同一天重跑不重复累计
     assert eff == "auto" and st["streak"] == 3 and any("放开" in h["event"] for h in st["history"])
     # 当天某智能体失败 → 立即收回
-    d = end + timedelta(days=3)
+    d = end + timedelta(days=4)
     store.log_run(d, "detect", "fail", datetime.now(), {}, "boom")
     eff, st = agent.effective_mode(_ctx(settings, store, d))
     assert eff == "draft" and st["streak"] == 0 and any("收回" in h["event"] for h in st["history"])

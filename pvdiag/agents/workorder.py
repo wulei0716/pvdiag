@@ -116,7 +116,8 @@ class WorkOrderAgent(Agent):
         else:  # gated
             prev = state.get("effective", "draft")
             if gate_ok and healthy:
-                state["streak"] = int(state.get("streak", 0)) + 1
+                if state.get("date") != ctx.run_date.isoformat():          # 同一天重跑不重复累计
+                    state["streak"] = int(state.get("streak", 0)) + 1
                 if prev != "auto" and state["streak"] >= d.gate_open_streak_days:
                     state.update({"effective": "auto", "since": ctx.run_date.isoformat()})
                     transitions.append(f"派单门控放开：连续 {state['streak']} 个运行日误报率达标（{why}），自动派单开启")
@@ -142,7 +143,8 @@ class WorkOrderAgent(Agent):
         d = ctx.settings.dispatch
         today = ctx.run_date.isoformat()
         if d.gate_close_on_pipeline_fail:
-            failed = ctx.store.query("SELECT DISTINCT agent FROM pipeline_runs WHERE run_date=? AND status='fail'", (today,))
+            since = ctx.shared.get("pipeline_started_at") or "0000"
+            failed = ctx.store.query("SELECT DISTINCT agent FROM pipeline_runs WHERE run_date=? AND status='fail' AND started_at>=?", (today, since))
             if not failed.empty:
                 return False, f"今日智能体失败：{failed['agent'].tolist()}"
             for st in ctx.stations():

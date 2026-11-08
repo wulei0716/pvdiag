@@ -250,7 +250,10 @@ def bench_train(workdir: Path, settings: Optional[Settings] = None, public_root=
                 ReviewAgent.reject(store, r["suspect_id"], "云影", "reference"); n_reject += 1
         elif with_synth and (key in truth_kind or key.startswith("SYN1")):
             if key in truth_kind:
-                ReviewAgent.confirm(store, r["suspect_id"], kind_cause[truth_kind[key]].value, "truth"); n_confirm += 1
+                cause = kind_cause.get(truth_kind[key])
+                if cause is None:          # archived_shading / limit 等没有"应报原因"的注入，不当标注
+                    continue
+                ReviewAgent.confirm(store, r["suspect_id"], cause.value, "truth"); n_confirm += 1
             else:
                 ReviewAgent.reject(store, r["suspect_id"], "云影", "truth"); n_reject += 1
     # ---- 训练 + 考试
