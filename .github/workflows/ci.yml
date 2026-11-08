@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: pip install -e ".[web,dev]"
+      - name: Unit + end-to-end tests（合成故障召回/误报、闭环、训练）
+        run: python -m pytest -q
+      - name: Demo smoke（simulate → backfill → report）
+        run: |
+          pvdiag init --data-dir ./data
+          pvdiag simulate --out ./demo --days 45 --load
+          pvdiag backfill --start 2026-10-01 --end 2026-10-15 --no-ingest
+          test -f data/reports/2026-10-15/report.md && head -40 data/reports/2026-10-15/report.md
+      - name: Upload demo report
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-report
+          path: data/reports/
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t pvdiag:ci .
+      - name: Container tests
+        run: docker run --rm pvdiag:ci test

@@ -1,0 +1,67 @@
+# pvdiag 配置示例 —— 复制为 config.yaml 后按站点实际调整
+# 所有口径均来自《组串发电量异常诊断系统 · 开发流程表》；阈值为起步值，上线后按复核确认率调优
+
+data_dir: ./data
+timezone: Asia/Shanghai
+
+thresholds:
+  normal_floor: -0.03        # > -3% 正常（正常串自然波动 ±1~2%）
+  fault_floor: -0.05         # ≤ -5% 持续低发候选（≈ 噪声带 2~3 倍）
+  fault_persist_days: 2      # 连续 ≥2 个晴好天才判 B（单日不算数：云影/采样抖动）
+  observe_persist_days: 3    # -5%~-3% 连续 3 天 → D
+  zero_current_a: 0.5        # <0.5A 按未接/夜间剔除
+  zero_days: 2               # 全天 0 电流连续天数 → A
+  voltage_offset: 0.08       # 中午电压偏离同机中位 >8% → 电压异位（串长/MPPT 配置）
+  rainy_streak_caution_days: 7   # 连续阴雨后首个晴天 → 低置信
+
+baseline:
+  noon_start: "11:30"
+  noon_end: "13:30"
+  rolling_clear_days: 30
+  min_clear_days: 5          # 冬季连续阴雨凑不够样本 → 降级为仅同日互比
+  clear_day_ratio: 0.35      # 全站中午功率 ≥ 晴天峰值 35%
+  clear_cv_max: 0.15
+  min_group_size: 3          # 互比群组 <3 串 → 回退整机互比
+
+confidence:
+  high: 0.85                 # ≥ 直接派单（draft 模式下为草稿）
+  mid: 0.50                  # ≥ 转人工复核，否则仅观察
+  min_labels_for_ml: 60      # 标注不足用规则代理模型
+  retrain_every_days: 30
+
+dispatch:
+  mode: draft                # draft: 生成草稿+人工一键确认；auto: 误报率连续1个月<10% 后放开
+  channel: dryrun            # dryrun（写 outbox/*.md）| wecom（企业微信群机器人）
+  wecom_webhook: null        # https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx
+  auto_gate_fa_rate_max: 0.10
+  recheck_clear_days: 3      # 处理后 N 个晴好天复查归零
+  site_visit_cost_yuan: 300
+  merge_same_roof: true      # 同屋面多串合并区域工单
+
+loss:
+  default_price_yuan_per_kwh: 0.60
+  tou:                       # 峰谷平时段（小时，含起不含止）
+    peak: [[10, 12], [14, 17]]
+    flat: [[7, 10], [12, 14], [17, 19]]
+    valley: [[0, 7], [19, 24]]
+  tou_price: { peak: 0.90, flat: 0.60, valley: 0.30 }
+  expected_fault_days_default: 30
+  repair_cost_by_cause:
+    断线/未接: 300
+    旁路二极管: 500
+    遮挡: 400
+    组件衰减/积灰: 200
+    MPPT异常: 1500
+    数据问题: 50
+
+platforms:
+  huawei: { base_quota: 24, devices_per_unit: 100, batch_days: 4, token_ttl_minutes: 30 }
+  ginlong_pac_unit_divisor: 1000     # 锦浪 pac 单位 W → kW
+  sungrow_token_ttl_hours: 48
+  sungrow_same_day_available: false  # 阳光不返回当天数据 → 每日拉 T-1
+
+# 电站级平台凭证放在 stations 表的 extra_json.platform_config 中（建议由 DPAPI/EFS/钥匙串解密后注入，不落明文）：
+#   huawei:  { user_name, system_code, station_code, base_url }
+#   ginlong: { key_id, key_secret, plant_id }
+#   sungrow: { appkey, access_key, user_account, user_password, ps_id, points_map: { pac: "p24", strings: { 1: {i: "p5", u: "p6"} } } }
+#   csv:     { root: ./import }     # 对接 F:\Hermes 已有拉数脚本的落地文件

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.pvdiag.web</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>cd "__ROOT__" &amp;&amp; source .venv/bin/activate &amp;&amp; exec pvdiag serve --host 127.0.0.1 --port __PORT__ &gt;&gt; data/logs/web.log 2&gt;&amp;1</string>
+  </array>
+  <key>WorkingDirectory</key><string>__ROOT__</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string><key>LANG</key><string>zh_CN.UTF-8</string></dict>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>__ROOT__/data/logs/web.launchd.log</string>
+  <key>StandardErrorPath</key><string>__ROOT__/data/logs/web.launchd.log</string>
+</dict>
+</plist>

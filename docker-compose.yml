@@ -1,0 +1,20 @@
+# docker compose up -d  →  http://127.0.0.1:8080
+# 首次启动自动生成合成电站并回放 30 天（PVDIAG_DEMO=0 可关闭）；数据持久化在 pvdiag_data 卷
+services:
+  pvdiag:
+    build: .
+    image: pvdiag:0.1
+    container_name: pvdiag
+    ports:
+      - "8080:8080"
+    environment:
+      PVDIAG_DEMO: "1"
+      TZ: Asia/Shanghai
+    volumes:
+      - pvdiag_data:/app/data
+      # 接真实数据时把拉数脚本的落地目录挂进来，并在 stations.extra_json.platform_config.root 指向 /import
+      # - ./import:/import:ro
+    restart: unless-stopped
+
+volumes:
+  pvdiag_data:

@@ -1,0 +1,10 @@
+data/
+demo/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+config.yaml
+.git/
+docs/*.png

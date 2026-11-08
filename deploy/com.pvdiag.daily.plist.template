@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.pvdiag.daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>cd "__ROOT__" &amp;&amp; source .venv/bin/activate &amp;&amp; pvdiag run --backfill-days 2 &gt;&gt; data/logs/daily.log 2&gt;&amp;1</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>__HOUR__</integer><key>Minute</key><integer>__MINUTE__</integer></dict>
+  <key>WorkingDirectory</key><string>__ROOT__</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string><key>LANG</key><string>zh_CN.UTF-8</string></dict>
+  <key>StandardOutPath</key><string>__ROOT__/data/logs/daily.launchd.log</string>
+  <key>StandardErrorPath</key><string>__ROOT__/data/logs/daily.launchd.log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
