@@ -405,7 +405,8 @@ def md_to_html(md: str) -> str:
                 close()
                 out.append("<ol>")
                 in_ol = True
-            out.append(f"<li>{inline(re.sub(r'^\d+\. ', '', s))}</li>")
+            item = re.sub(r"^\d+\. ", "", s)          # Python 3.11 的 f-string 表达式里不能带反斜杠
+            out.append(f"<li>{inline(item)}</li>")
         else:
             close()
             out.append(f"<p>{inline(s)}</p>")
