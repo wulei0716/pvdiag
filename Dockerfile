@@ -7,7 +7,7 @@ WORKDIR /app
 
 COPY pyproject.toml README.md requirements.txt ./
 COPY pvdiag ./pvdiag
-RUN pip install --upgrade pip && pip install -e ".[web,dev]"
+RUN pip install --upgrade pip && pip install -e ".[web,dev,bench]"
 
 COPY tests ./tests
 COPY config.example.yaml ./

@@ -12,7 +12,7 @@
   pvdiag train                                           用标注训练/重训分类模型（考试达标才上线；--force 强制上线）
   pvdiag report --date 2026-10-30                        打印当日 Markdown 报告
   pvdiag serve --port 8080                               人工复核 Web 界面
-  pvdiag doctor [--vacuum]                               健康自检（数据库/磁盘/数据新鲜度/调度/模型/配置）
+  pvdiag doctor [--date D] [--vacuum]                    健康自检（数据库/磁盘/数据新鲜度/调度/模型/配置），有 fail 退出码 1
   pvdiag tune show|apply|rollback|clear                  自调参：查看评估与变更留痕 / 手动生效某参数 / 回滚 / 清空覆盖层
   pvdiag gate status|open|close                          派单门控：状态 / 手动放开 / 手动收回
   pvdiag model list|promote|demote                       模型注册表：列出 / 指定版本上线 / 降级回规则代理
@@ -203,7 +203,7 @@ def cmd_doctor(args):
     from .health import run_health_checks, summarize, vacuum
     s = _settings(args)
     store = Store(s.db_path, s.samples_dir)
-    checks = run_health_checks(s, store, date.today())
+    checks = run_health_checks(s, store, _date(args.date))     # --date 可按某个巡检日评估（回放演示数据时用）
     icon = {"ok": "✅", "warn": "⚠️ ", "fail": "❌"}
     for c in checks:
         print(f"{icon[c['status']]} {c['name']}: {c['detail']}")
@@ -337,6 +337,10 @@ def cmd_bench(args):
             print("NREL:", json.dumps(rep["nrel"]["summary"], ensure_ascii=False))
         except ImportError as e:
             print("NREL 跳过：", e)
+    if args.dataset in ("train", "all"):
+        from .public.bench import bench_train
+        rep["train"] = bench_train(work, s, public_root=args.public_dir)
+        print("Train:", json.dumps({k: rep["train"][k] for k in ("n_labels", "promoted", "exam")}, ensure_ascii=False, default=str))
     p = write_report(rep, out)
     print("报告：", p)
 
@@ -374,14 +378,14 @@ def main(argv=None):
     p = add("train"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_train)
     p = add("report"); p.add_argument("--date"); p.set_defaults(fn=cmd_report)
     p = add("serve"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8080); p.set_defaults(fn=cmd_serve)
-    p = add("doctor"); p.add_argument("--vacuum", action="store_true"); p.set_defaults(fn=cmd_doctor)
+    p = add("doctor"); p.add_argument("--vacuum", action="store_true"); p.add_argument("--date"); p.set_defaults(fn=cmd_doctor)
     p = add("tune"); p.add_argument("action", choices=["show", "apply", "rollback", "clear"]); p.add_argument("param", nargs="?")
     p.add_argument("value", nargs="?"); p.add_argument("--note"); p.set_defaults(fn=cmd_tune)
     p = add("gate"); p.add_argument("action", choices=["status", "open", "close"]); p.set_defaults(fn=cmd_gate)
     p = add("model"); p.add_argument("action", choices=["list", "promote", "demote"]); p.add_argument("version", nargs="?"); p.set_defaults(fn=cmd_model)
     p = add("public"); p.add_argument("action", choices=["list", "fetch", "load"]); p.add_argument("name", nargs="?")
     p.add_argument("--plant", type=int); p.add_argument("--public-dir"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_public)
-    p = add("bench"); p.add_argument("--dataset", choices=["kaggle", "nrel", "all"], default="all"); p.add_argument("--out")
+    p = add("bench"); p.add_argument("--dataset", choices=["kaggle", "nrel", "train", "all"], default="all"); p.add_argument("--out")
     p.add_argument("--public-dir"); p.set_defaults(fn=cmd_bench)
 
     args = ap.parse_args(argv)

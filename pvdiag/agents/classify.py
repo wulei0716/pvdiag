@@ -292,7 +292,8 @@ class ClassifyAgent(Agent):
             feats = build_features(s, bl, sig, prof, date.fromisoformat(s["date"]))
             rows.append(feats)
             ys.append(Cause.NORMAL.value if s["decision"] == "reject" else (s["label_cause"] or s["rule_cause"]))
-            meta.append({"suspect_id": s["suspect_id"], "date": s["date"], "rule_cause": s["rule_cause"], "grade": s["grade"]})
+            # 时间留出按案例"首次报警日"排序（suspects.date 是案例最近更新日，在办案例都等于今天，不能用）
+            meta.append({"suspect_id": s["suspect_id"], "date": s.get("first_date") or s["date"], "rule_cause": s["rule_cause"], "grade": s["grade"]})
         X = pd.DataFrame(rows)[FEATURES]
         y = pd.Series(ys)
         if with_meta:

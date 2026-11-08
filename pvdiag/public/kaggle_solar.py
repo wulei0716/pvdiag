@@ -68,7 +68,6 @@ def reference_labels(g: pd.DataFrame, w: pd.DataFrame, string_ids: Dict[str, str
     mins = g["ts"].dt.hour * 60 + g["ts"].dt.minute
     day = g[(mins >= 8 * 60) & (mins < 17 * 60)]
     energy = g.groupby(["d", "SOURCE_KEY"])["dc_kw"].sum().unstack() * 0.25
-    ratio = energy.div(energy.median(axis=1), axis=0)
     zero_frac = day.assign(z=day["dc_kw"] <= 0).groupby(["d", "SOURCE_KEY"])["z"].mean().unstack()
     n_day = day.groupby(["d", "SOURCE_KEY"]).size().unstack()
     expected = n_day.max().max()

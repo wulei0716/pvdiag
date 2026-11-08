@@ -8,10 +8,12 @@ pvdiag · 组串发电量异常诊断智能体系统
 - config      阈值 / 窗口 / 派单 / 电价 等全部可调参数（YAML）
 - storage     SQLite（特征、基线、嫌疑、标注、工单…）+ Parquet（5分钟明细）
 - adapters    华为北向 / 锦浪 / 阳光 / CSV 四种数据源适配器，统一数据模型
-- agents      10 个阶段对应的智能体（接入、档案、基线、诊断、AI判定、复核、工单、损失、区域、监控）
+- agents      10 个阶段对应的智能体（接入、档案、基线、诊断、AI判定、复核、自调参、工单、损失、区域、监控）
 - orchestrator 每日闭环流水线
 - sim         合成电站与故障注入（验证召回率/误报率）
-- web         人工复核 Web 界面（FastAPI）
+- public      公开数据（Kaggle 两站 / NREL 标注片段）下载、转换、基准评测、弱标注训练
+- health / notify  健康自检（pvdiag doctor）与关键事件推送
+- web         人工复核 Web 界面（FastAPI），含「自主运行」页
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

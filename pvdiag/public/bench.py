@@ -187,6 +187,87 @@ def _nrel_summary(series: Dict) -> Dict:
     return out
 
 
+# ---------------------------------------------------------------------------- 用公开数据训练 AI 判定模型
+def bench_train(workdir: Path, settings: Optional[Settings] = None, public_root=None, fetch: bool = True, with_synth: bool = True) -> Dict:
+    """把 Kaggle 两站（+ 一座合成电站）灌进同一个库，用参考标签/注入真值自动"复核"，训练分类模型并按时间留出集考试。
+    标注口径：
+    - Kaggle underperform 串的案例 → 确认（原因取规则原因，未知则记 组件衰减/积灰）
+    - Kaggle 间歇掉线串的案例 → 确认 间歇停机/掉线
+    - Kaggle 从未掉线的正常串的案例 → 驳回（云影）
+    - 合成电站：按注入真值确认（kind → Cause），健康串案例驳回
+    这是"弱标注"（由统计参考而非现场确认得出），用途是验证训练/考试/上线链路在真实数据上能跑通，
+    以及模型相对规则代理的增益，不等同于现场标注。"""
+    from .kaggle_solar import load_kaggle_plant
+    from ..agents.review import ReviewAgent
+    from ..agents.classify import ClassifyAgent
+    if not is_cached("kaggle_solar", public_root):
+        if not fetch:
+            raise FileNotFoundError("kaggle_solar 未下载")
+        fetch_dataset("kaggle_solar", public_root)
+    root = dataset_dir("kaggle_solar", public_root)
+    s = _fresh_settings(workdir, "train", settings)
+    store = Store(s.db_path, s.samples_dir)
+    refs: Dict[str, Dict] = {}
+    spans = []
+    for plant in (1, 2):
+        b = load_kaggle_plant(root, plant)
+        ProfileAgent.import_stations(store, b["stations"]); ProfileAgent.import_inverters(store, b["inverters"]); ProfileAgent.import_strings(store, b["strings"])
+        ts = pd.to_datetime(b["samples_strings"]["ts"])
+        ctx = AgentContext(settings=s, store=store, run_date=ts.max().date())
+        IngestAgent().ingest_frames(ctx, b["stations"]["station_id"].iloc[0], b["samples_strings"], b["samples_inverters"], b["irradiance"])
+        spans.append((ts.min().date(), ts.max().date()))
+        for r in b["reference"].to_dict("records"):
+            refs[r["string_id"]] = {"kind": "outage" if r["intermittent_outage"] else r["label"], "dropout_days": r["dropout_days"]}
+    truth_kind: Dict[str, str] = {}
+    if with_synth:
+        from ..sim import SimConfig, simulate
+        # 合成站提前 30 天开始（给基线留样本），默认故障在第 34~42 天注入 → 正好落在 Kaggle 的 34 天窗口里
+        cfg = SimConfig(station_id="SYN1", station_name="合成电站（训练用）", days=64, seed=21, start=spans[0][0] - timedelta(days=30))
+        data = simulate(cfg)
+        ProfileAgent.import_stations(store, data["stations"]); ProfileAgent.import_inverters(store, data["inverters"]); ProfileAgent.import_strings(store, data["strings"])
+        ctx = AgentContext(settings=s, store=store, run_date=spans[0][1])
+        IngestAgent().ingest_frames(ctx, "SYN1", data["samples_strings"], data["samples_inverters"])
+        for t in data["truth"].to_dict("records"):
+            truth_kind[t["target"]] = t["kind"]
+    start, end = min(a for a, _ in spans), max(b_ for _, b_ in spans)
+    DailyPipeline(s, store=store, ingest=False).backfill(start, end)
+    # ---- 自动"复核"
+    kind_cause = {"open_circuit": Cause.OPEN_CIRCUIT, "diode_bypass": Cause.BYPASS_DIODE, "shading_fixed": Cause.SHADING,
+                  "orientation": Cause.ORIENTATION, "dust_local": Cause.DEGRADATION_DUST, "stuck": Cause.DATA_ISSUE,
+                  "wrong_profile": Cause.PROFILE_ERROR, "degradation_step": Cause.DEGRADATION_DUST,
+                  "outage_intermittent": Cause.OUTAGE, "stale_partial": Cause.DATA_ISSUE, "mppt_fault": Cause.MPPT}
+    susp = store.query("SELECT suspect_id, string_id, inverter_id, scope, grade, rule_cause FROM suspects WHERE grade!='已备案'")
+    n_confirm = n_reject = 0
+    for r in susp.to_dict("records"):
+        key = r["string_id"] if r["scope"] == "string" else r["inverter_id"]
+        if key in refs:
+            k = refs[key]["kind"]
+            if k == "underperform":
+                ReviewAgent.confirm(store, r["suspect_id"], Cause.DEGRADATION_DUST.value if r["rule_cause"] == Cause.UNKNOWN.value else None, "reference"); n_confirm += 1
+            elif k == "outage":
+                ReviewAgent.confirm(store, r["suspect_id"], Cause.OUTAGE.value, "reference"); n_confirm += 1
+            elif k == "normal" and refs[key]["dropout_days"] == 0:
+                ReviewAgent.reject(store, r["suspect_id"], "云影", "reference"); n_reject += 1
+        elif with_synth and (key in truth_kind or key.startswith("SYN1")):
+            if key in truth_kind:
+                ReviewAgent.confirm(store, r["suspect_id"], kind_cause[truth_kind[key]].value, "truth"); n_confirm += 1
+            else:
+                ReviewAgent.reject(store, r["suspect_id"], "云影", "truth"); n_reject += 1
+    # ---- 训练 + 考试
+    ctx = AgentContext(settings=s, store=store, run_date=end)
+    s.confidence.min_labels_for_ml = min(s.confidence.min_labels_for_ml, 30)
+    res = ClassifyAgent().train(ctx, reason="公开数据弱标注训练")
+    out = {"n_confirm": n_confirm, "n_reject": n_reject, "n_labels": res.get("n_labels"), "trained": res.get("trained"),
+           "promoted": res.get("promoted"), "version": res.get("version"), "exam": res.get("exam"),
+           "classes": res.get("classes"), "feature_importance": res.get("feature_importance"), "rejected_because": res.get("rejected_because")}
+    # 上线后再判一遍：模型版本应为 ML
+    if res.get("promoted"):
+        r2 = ClassifyAgent()(ctx)
+        out["verdict_model"] = r2.metrics.get("model")
+    store.close()
+    return out
+
+
 # ---------------------------------------------------------------------------- 报告
 def write_report(report: Dict, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -219,6 +300,14 @@ def render_markdown(rep: Dict) -> str:
         for k, v in n["summary"].items():
             L.append(f"| {k} | {v['precision']} | {v['recall']} | {v['accuracy']} | {v['n_positive_days']} |")
         L.append("")
+    if "train" in rep:
+        t = rep["train"]
+        ex = t.get("exam") or {}
+        L += ["## 用公开数据训练 AI 判定模型（弱标注：参考标签 / 注入真值）", "",
+              f"- 自动复核：确认 {t['n_confirm']} 条、驳回 {t['n_reject']} 条 → 标注 {t['n_labels']} 条，类别 {t.get('classes')}",
+              f"- 考试方式 {ex.get('method')}：挑战者 {ex.get('challenger')} · 规则代理 {ex.get('rule_proxy')}",
+              f"- 结果：{'已上线 ' + str(t.get('version')) if t.get('promoted') else '未上线（' + '；'.join(t.get('rejected_because') or ['标注不足']) + '）'}",
+              f"- 特征重要性 Top：{t.get('feature_importance')}", ""]
     if "synth" in rep:
         s = rep["synth"]
         L += ["## 合成电站（10 种注入故障）", "", f"- 召回 {s['recall']}，健康串 A/B 误报 {s['false_alarm_ab']}，原因分型正确 {s['cause_correct']}", ""]

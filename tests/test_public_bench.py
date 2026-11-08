@@ -48,3 +48,19 @@ def test_nrel_labeled_fragments(tmp_path):
     assert st["recall"] == 1.0 and st["precision"] >= 0.75, st
     cl = rep["summary"]["inv7539_clip.clipping"]
     assert cl["recall"] >= 0.75 and cl["precision"] >= 0.6, cl
+
+
+@pytest.mark.skipif(not _kaggle_available(), reason="Kaggle 镜像数据不可用（无网/未下载）")
+def test_train_on_public_data(tmp_path):
+    """Kaggle 两站参考标签 + 合成电站注入真值 → 弱标注 → 训练 → 时间留出集考试 → 达标才上线"""
+    from pvdiag.public.bench import bench_train
+    rep = bench_train(tmp_path / "work", fetch=False)
+    assert rep["trained"] and rep["n_labels"] >= 30
+    ex = rep["exam"]
+    assert ex["method"] == "time_holdout" and ex["challenger"]["n"] >= 10
+    # 上线与否由考试决定；上线了就必须真的在用（判定模型版本 = ML）
+    if rep["promoted"]:
+        assert rep["verdict_model"].split("-")[0] in ("rf", "hgb")
+        assert ex["challenger"]["accuracy"] >= ex["rule_proxy"]["accuracy"] - 0.02
+    else:
+        assert rep["rejected_because"]
