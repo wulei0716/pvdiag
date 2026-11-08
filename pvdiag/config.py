@@ -30,6 +30,7 @@ class Thresholds(BaseModel):
     dip_min_slots: int = 2               # 凹陷至少持续 2 个半小时槽 (1h)
     dip_normal_outside: float = 0.95     # 凹陷之外比值 ≥0.95 才算"分时段"签名
     orientation_overcast_abs: float = 0.02  # 阴天偏差绝对值 < 2% → 朝向差异候选
+    orientation_max_drift: float = 0.012    # 近 10 晴好天偏差 std 超过此值 → 在漂移，不判朝向（积灰/衰减）
     archived_shading_extra: float = -0.05   # 已备案遮挡串，比备案偏差再低 5% 才重新报警
     rainy_streak_caution_days: int = 7      # 连续 ≥7 天无晴好天后的首个晴天 → 低置信
 

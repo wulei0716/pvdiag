@@ -20,7 +20,7 @@ EXPECTED_CAUSE = {
     "diode_bypass": {Cause.BYPASS_DIODE.value},
     "shading_fixed": {Cause.SHADING.value},
     "orientation": {Cause.ORIENTATION.value},
-    "dust_local": {Cause.DEGRADATION_DUST.value},
+    "dust_local": {Cause.DEGRADATION_DUST.value, Cause.UNKNOWN.value},   # 规则层可能只到 D/E；积灰由区域智能体的签名识别
     "stuck": {Cause.DATA_ISSUE.value},
     "wrong_profile": {Cause.PROFILE_ERROR.value},
     "archived_shading": {Cause.SHADING.value},
@@ -66,9 +66,15 @@ def test_recall_and_false_alarms(sim_env):
     # 案例连续性：每个故障串只有一个案例
     counts = susp[susp["scope"] == "string"].groupby("string_id").size()
     assert (counts <= 1).all(), counts[counts > 1]
-    # 报告落盘
+    # 报告落盘 + 区域智能体识别出积灰签名（慢渐变 + 雨后恢复）
     rep_dir = settings.reports_dir / end.isoformat()
     assert (rep_dir / "report.md").exists() and (rep_dir / "report.json").exists()
+    import json
+    rep = json.loads((rep_dir / "report.json").read_text(encoding="utf-8"))
+    dust_target = truth[truth["kind"] == "dust_local"]["target"].iloc[0]
+    dust_hits = [c for c in rep["region"]["dust_candidates"] if c["string_id"] == dust_target]
+    assert dust_hits, f"区域智能体未识别积灰串 {dust_target}: {rep['region']['dust_candidates']}"
+    assert "积灰" in dust_hits[0]["pattern"]
 
 
 def test_loss_positive_for_open_circuit(sim_env):

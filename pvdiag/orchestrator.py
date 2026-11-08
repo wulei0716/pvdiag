@@ -106,18 +106,19 @@ class DailyPipeline:
         wos = ctx.store.query("SELECT wo_id, station_id, roof_area, cause, priority, loss_kwh_per_day, loss_yuan_total, status FROM workorders "
                               "WHERE status IN ('draft','sent','reopened') ORDER BY priority DESC")
         alerts = ctx.store.query("SELECT level, source, message FROM alerts WHERE run_date=? ORDER BY alert_id", (today,))
+        clean = lambda df: df.astype(object).where(pd.notna(df), None).to_dict("records") if not df.empty else []
         return {
             "date": today,
-            "weather": weather.to_dict("records"),
+            "weather": clean(weather),
             "agents": {k: {"status": v.status, "summary": v.summary, "metrics": v.metrics} for k, v in res_by.items()},
-            "suspects": suspects.to_dict("records"),
-            "workorders": wos.to_dict("records"),
+            "suspects": clean(suspects),
+            "workorders": clean(wos),
             "loss": ctx.shared.get("loss_summary", {}),
             "review": {"stats": ctx.shared.get("review_stats", {}), "advice": (res_by.get("review").artifacts.get("advice") if res_by.get("review") else "")},
             "region": ctx.shared.get("region_artifacts", {}),
             "board": ctx.shared.get("board", {}),
             "retrain": retrain,
-            "alerts": alerts.to_dict("records"),
+            "alerts": clean(alerts),
         }
 
     def write_report(self, report: Dict, run_date: date) -> Path:

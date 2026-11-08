@@ -149,6 +149,12 @@ class DetectAgent(Agent):
             "FROM signatures s JOIN strings p ON p.string_id=s.string_id WHERE p.station_id=? AND s.date BETWEEN ? AND ?",
             (station_id, (d - timedelta(days=15)).isoformat(), (d - timedelta(days=1)).isoformat()))
         rainy_caution = weather == "clear" and ("n_clear_recent" in bl and bl["n_clear_recent"].max() <= 1)
+        # 近 10 个晴好天偏差的离散度：朝向差异是恒定的（std 很小），积灰/衰减会漂移
+        dev_hist = ctx.store.query(
+            "SELECT b.string_id, b.dev_today FROM baselines b JOIN strings p ON p.string_id=b.string_id "
+            "WHERE p.station_id=? AND b.weather_tag='clear' AND b.dev_today IS NOT NULL AND b.date BETWEEN ? AND ? ORDER BY b.date",
+            (station_id, (d - timedelta(days=30)).isoformat(), today))
+        dev_std = dev_hist.groupby("string_id")["dev_today"].apply(lambda x: float(x.tail(10).std()) if len(x) >= 4 else np.nan).to_dict() if not dev_hist.empty else {}
 
         out: List[Dict] = []
         sig_rows: List[Dict] = []
@@ -158,6 +164,9 @@ class DetectAgent(Agent):
             p = prof.loc[sid]
             f = ft.loc[sid] if sid in ft.index else None
             sig, skew = self._signature(sid, f, p, b, group_curves, inv_daily, th, cfg)
+            if sig.orientation_like and not np.isnan(dev_std.get(sid, np.nan)) and dev_std[sid] > th.orientation_max_drift:
+                sig.orientation_like = False      # 偏差在漂移 → 不是恒定的朝向差异（更像积灰/衰减）
+                sig.notes.append(f"晴好天偏差离散度 {dev_std[sid]:.1%} 偏大，不按朝向差异处理")
             v_off = voff.get(sid)
             v_days = self._voltage_days(sig_hist, sid, v_off, th) if v_off is not None else 0
             if v_off is not None and abs(v_off) > th.voltage_offset and v_days + 1 >= th.voltage_offset_days:

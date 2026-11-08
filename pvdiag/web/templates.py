@@ -1,137 +1,343 @@
-"""复核界面模板（Jinja2，内嵌字符串，无需静态目录）"""
+"""控制台模板（Jinja2，内嵌字符串，无静态目录、无外网依赖）"""
 
 BASE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{% block title %}pvdiag{% endblock %} · 组串异常复核</title>
+<title>{% block title %}pvdiag{% endblock %} · 组串诊断控制台</title>
 <style>
-:root{--bg:#f6f7f9;--card:#fff;--ink:#1d2433;--muted:#6b7280;--line:#e5e7eb;--a:#0f766e;--b:#b45309;--c:#6d28d9;--d:#2563eb;--e:#6b7280;--ok:#15803d;--bad:#b91c1c}
-*{box-sizing:border-box}body{margin:0;font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink)}
-header{background:#111827;color:#fff;padding:10px 20px;display:flex;gap:18px;align-items:center}header a{color:#d1d5db;text-decoration:none}header a:hover{color:#fff}
-header .brand{font-weight:700;color:#fff}main{max-width:1280px;margin:0 auto;padding:18px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
-.grid{display:grid;gap:14px}.g3{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.g2{grid-template-columns:1fr 1fr}
-.kpi .v{font-size:26px;font-weight:700}.kpi .l{color:var(--muted);font-size:12px}
-table{width:100%;border-collapse:collapse}th,td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;font-size:13px}th{color:var(--muted);font-weight:600;background:#fafafa}
-.badge{display:inline-block;padding:1px 8px;border-radius:999px;color:#fff;font-size:12px;font-weight:600}
-.gA{background:var(--bad)}.gB{background:var(--b)}.gC{background:var(--c)}.gD{background:var(--d)}.gE{background:var(--e)}.g已备案{background:#9ca3af}
-.muted{color:var(--muted)}.neg{color:var(--bad);font-weight:600}.pos{color:var(--ok)}
-button,.btn{border:1px solid var(--line);background:#fff;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:13px}
-button.ok{background:var(--ok);color:#fff;border-color:var(--ok)}button.no{background:#fff;color:var(--bad);border-color:var(--bad)}button.pri{background:#111827;color:#fff;border-color:#111827}
-select,input[type=text],input[type=date],textarea{border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:13px}
+:root{
+  --bg:#eef1f5;--panel:#ffffff;--panel2:#f5f7fa;--line:#d9dfe8;--ink:#17202b;--muted:#5f6b7a;--dim:#a9b3c0;
+  --acc:#b85c1f;--acc-ink:#ffffff;--focus:#2d6cdf;
+  --c-fault:#c0392b;--c-low:#d7860f;--c-orient:#6a4fcf;--c-ok:#1e8a5a;--c-clear:#1f8a8a;--c-cloudy:#e0a526;--c-sky:#2d6cdf;--c-ink:#17202b;--c-muted:#5f6b7a;--c-dim:#b6bfca;
+  --c-cell-ok:#d2e7db;--c-cell-watch:#ffe3a3;--c-cell-low:#f7b267;--c-cell-bad:#e8734a;--c-cell-dead:#9b2226;--c-cell-na:#e3e8ee;
+  --shadow:0 1px 2px rgba(23,32,43,.06);
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0f141a;--panel:#161c25;--panel2:#1c242e;--line:#2a3441;--ink:#e6ebf2;--muted:#9aa5b5;--dim:#5a6678;
+  --acc:#e08a4a;--acc-ink:#1a1208;--focus:#6ea0ff;
+  --c-fault:#ef6b5c;--c-low:#f0a640;--c-orient:#a68cff;--c-ok:#3fb27f;--c-clear:#3fb0b0;--c-cloudy:#e9bd4e;--c-sky:#6ea0ff;--c-ink:#e6ebf2;--c-muted:#9aa5b5;--c-dim:#4a5566;
+  --c-cell-ok:#234b3a;--c-cell-watch:#6b5416;--c-cell-low:#9a5a1a;--c-cell-bad:#a8402a;--c-cell-dead:#8a1e24;--c-cell-na:#262f3b;
+  --shadow:none;
+}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,"PingFang SC","Hiragino Sans GB","Noto Sans SC","Microsoft YaHei",system-ui,sans-serif}
+a{color:inherit;text-decoration:none}a:hover{text-decoration:underline}
+.layout{display:grid;grid-template-columns:216px 1fr;min-height:100vh}
+nav.side{background:var(--panel);border-right:1px solid var(--line);padding:18px 14px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:6px}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 8px 14px;font-weight:700;font-size:15px;letter-spacing:.2px}
+.brand .logo{width:28px;height:28px;border-radius:7px;background:linear-gradient(135deg,var(--c-low),var(--acc));display:grid;place-items:center;color:#fff;font-size:15px}
+nav.side a.item{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-radius:8px;color:var(--muted);font-weight:500}
+nav.side a.item:hover{background:var(--panel2);text-decoration:none;color:var(--ink)}
+nav.side a.item.on{background:var(--panel2);color:var(--ink);box-shadow:inset 3px 0 0 var(--acc)}
+nav.side .cnt{font-size:12px;background:var(--line);border-radius:999px;padding:0 7px;font-variant-numeric:tabular-nums}
+nav.side .cnt.hot{background:var(--c-fault);color:#fff}
+nav.side .foot{margin-top:auto;color:var(--dim);font-size:12px;padding:8px 10px;line-height:1.5}
+main{padding:22px 28px 48px;min-width:0}
+.top{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+.top h1{font-size:20px;margin:0;font-weight:700}
+.top .sub{color:var(--muted)}
+.top .right{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;box-shadow:var(--shadow);min-width:0}
+.panel h2{font-size:14px;margin:0 0 12px;font-weight:600;color:var(--ink);display:flex;align-items:baseline;gap:10px}
+.panel h2 .hint{color:var(--muted);font-weight:400;font-size:12px}
+.grid{display:grid;gap:16px}
+.cols-2{grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start}.cols-3-1{grid-template-columns:minmax(0,2fr) minmax(280px,1fr);align-items:start}
+@media (max-width:1100px){.cols-2,.cols-3-1{grid-template-columns:1fr}}
+@media (max-width:860px){.layout{grid-template-columns:1fr}nav.side{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;border-right:0;border-bottom:1px solid var(--line)}nav.side .foot,nav.side .brand{display:none}main{padding:16px}}
+/* KPI 条 */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.kpi .v{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
+.kpi .v small{font-size:13px;font-weight:500;color:var(--muted);margin-left:2px}
+.kpi .l{color:var(--muted);font-size:12px;margin-top:4px}
+.kpi.fault .v{color:var(--c-fault)}.kpi.low .v{color:var(--c-low)}.kpi.ok .v{color:var(--c-ok)}
+/* 表格 */
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:12px;padding:8px 10px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0}
+td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}tbody tr:hover td{background:var(--panel2)}
+td.id,.id{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+.neg{color:var(--c-fault);font-weight:600}.num{font-variant-numeric:tabular-nums;text-align:right}
+.muted{color:var(--muted)}.small{font-size:12px}.dim{color:var(--dim)}
+.empty{color:var(--muted);padding:18px 0;text-align:center}
+/* 分级 / 状态 */
+.grade{display:inline-grid;place-items:center;min-width:24px;height:24px;padding:0 7px;border-radius:6px;font-weight:700;font-size:12.5px;color:#fff;letter-spacing:.3px;white-space:nowrap}
+.gA{background:var(--c-fault)}.gB{background:var(--c-low)}.gC{background:var(--c-orient)}.gD{background:var(--c-sky)}.gE{background:var(--c-muted)}.g已备案{background:var(--c-dim);color:var(--ink)}
+.chip{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;border:1px solid var(--line);color:var(--muted);background:var(--panel2);white-space:nowrap}
+.chip.ok{color:var(--c-ok);border-color:color-mix(in srgb,var(--c-ok) 40%,transparent)}
+.chip.warn{color:var(--c-low);border-color:color-mix(in srgb,var(--c-low) 40%,transparent)}
+.chip.bad{color:var(--c-fault);border-color:color-mix(in srgb,var(--c-fault) 40%,transparent)}
+.chip.info{color:var(--c-sky);border-color:color-mix(in srgb,var(--c-sky) 40%,transparent)}
+tr.sev-A td:first-child{box-shadow:inset 3px 0 0 var(--c-fault)}tr.sev-B td:first-child{box-shadow:inset 3px 0 0 var(--c-low)}
+tr.sev-C td:first-child{box-shadow:inset 3px 0 0 var(--c-orient)}tr.sev-D td:first-child,tr.sev-E td:first-child{box-shadow:inset 3px 0 0 var(--c-dim)}
+/* 控件 */
+.btn,button{appearance:none;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:7px;padding:6px 12px;font:inherit;font-size:13px;cursor:pointer;line-height:1.3}
+.btn:hover,button:hover{background:var(--panel2);text-decoration:none}
+.btn.primary,button.primary{background:var(--acc);border-color:var(--acc);color:var(--acc-ink);font-weight:600}
+.btn.ok,button.ok{background:var(--c-ok);border-color:var(--c-ok);color:#fff;font-weight:600}
+.btn.danger,button.danger{color:var(--c-fault);border-color:color-mix(in srgb,var(--c-fault) 50%,transparent);background:var(--panel)}
+.btn.sm,button.sm{padding:4px 9px;font-size:12px}
+select,input[type=text],input[type=date],textarea{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:7px;padding:6px 9px;font:inherit;font-size:13px}
+textarea{width:100%;resize:vertical}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 form.inline{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}
-pre{white-space:pre-wrap;background:#f9fafb;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:13px}
-.expl{background:#f0fdf4;border-left:4px solid var(--ok);padding:8px 12px;border-radius:6px}
-.small{font-size:12px}h2{font-size:17px;margin:0 0 10px}h3{font-size:15px;margin:0 0 8px}
-@media (max-width:800px){.g2{grid-template-columns:1fr}}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel)}
+.seg a{padding:5px 11px;color:var(--muted);font-size:13px;border-right:1px solid var(--line)}.seg a:last-child{border-right:0}
+.seg a.on{background:var(--panel2);color:var(--ink);font-weight:600}.seg a:hover{text-decoration:none;color:var(--ink)}
+/* 图 */
+svg.chart .t{font-size:12px;font-weight:600;fill:var(--ink)}svg.chart .ax{font-size:10.5px;fill:var(--muted)}svg.chart .lb{font-size:11.5px;fill:var(--ink)}
+svg.chart .lg{font-size:11px;fill:var(--muted)}svg.chart .grid{stroke:var(--line)}svg.chart .axis{stroke:var(--dim)}
+svg.heat .ax{font-size:10px;fill:var(--muted)}svg.heat .lb{font-size:11.5px;fill:var(--ink)}svg.heat .cell-void{fill:none;stroke:var(--line);stroke-dasharray:2 2}
+svg.heat a rect:hover{stroke:var(--focus);stroke-width:2.5}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);align-items:center}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-2px;margin-right:5px}
+.legend i.ring{background:none;border:2px solid var(--c-fault)}.legend i.ringb{background:none;border:2px solid var(--c-low)}
+/* 解释块 */
+.why{background:color-mix(in srgb,var(--c-ok) 9%,var(--panel));border-left:3px solid var(--c-ok);padding:10px 14px;border-radius:0 8px 8px 0;line-height:1.65}
+dl.kv{display:grid;grid-template-columns:max-content 1fr;gap:6px 14px;margin:0}dl.kv dt{color:var(--muted)}dl.kv dd{margin:0;min-width:0}
+.sticky-actions{background:var(--panel2);border-top:1px solid var(--line);padding:12px 18px;margin:16px -18px -16px;border-radius:0 0 10px 10px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.wo-body h3{font-size:14px;margin:14px 0 6px}.wo-body ul,.wo-body ol{margin:4px 0 8px 20px}.wo-body p{margin:4px 0}
+.station-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin:0 0 8px}.station-head h3{margin:0;font-size:15px}
+.alert{padding:8px 10px;border-radius:7px;background:var(--panel2);margin-bottom:6px;font-size:13px}.alert b{color:var(--c-low)}
+@media (prefers-reduced-motion:no-preference){.btn,button{transition:background .12s}}
 </style></head><body>
-<header><span class="brand">⚡ pvdiag</span><a href="/">看板</a><a href="/review">复核队列</a><a href="/workorders">工单</a>
-<span style="margin-left:auto" class="small muted">{{ now }}</span></header>
+<div class="layout">
+<nav class="side">
+  <div class="brand"><span class="logo">☀</span><span>pvdiag<br><span class="small muted" style="font-weight:500">组串诊断控制台</span></span></div>
+  <a class="item {% if active=='index' %}on{% endif %}" href="/">看板</a>
+  <a class="item {% if active=='strings' %}on{% endif %}" href="/strings">组串热力图</a>
+  <a class="item {% if active=='review' %}on{% endif %}" href="/review">复核队列 <span class="cnt {% if pending_n %}hot{% endif %}">{{ pending_n }}</span></a>
+  <a class="item {% if active=='wo' %}on{% endif %}" href="/workorders">工单 <span class="cnt">{{ draft_n }}</span></a>
+  <a class="item {% if active=='report' %}on{% endif %}" href="/reports">每日报告</a>
+  <div class="foot">最近巡检日 {{ latest or '—' }}<br>{{ now }}</div>
+</nav>
 <main>{% block body %}{% endblock %}</main>
+</div>
 </body></html>"""
 
-INDEX = r"""{% extends "base.html" %}{% block title %}看板{% endblock %}{% block body %}
-<h2>运营看板 <span class="muted small">最近巡检日 {{ date or '-' }}</span></h2>
-<div class="grid g3">
- <div class="card kpi"><div class="v">{{ pending }}</div><div class="l">待复核（{% for g,n in by_grade.items() %}{{g}}={{n}} {% endfor %}）</div></div>
- <div class="card kpi"><div class="v">{{ wos.get('draft',0) }}</div><div class="l">工单草稿待确认 · 已发 {{ wos.get('sent',0) }} · 待复查 {{ wos.get('done',0) }} · 重开 {{ wos.get('reopened',0) }}</div></div>
- <div class="card kpi"><div class="v">{{ loss.totals.lost_kwh|num(0) }} kWh</div><div class="l">累计未修复损失 ≈ {{ loss.totals.lost_yuan|num(0) }} 元（钱在漏）</div></div>
- <div class="card kpi"><div class="v">{{ stats.false_alarm_rate if stats.false_alarm_rate is not none else '-' }}</div><div class="l">近 30 天误报率（复核 {{ stats.n_reviewed }} 条）</div></div>
- <div class="card kpi"><div class="v">{{ board.get('kpi',{}).get('detection_latency_days','-') }} 天</div><div class="l">平均发现时延（起算日→首次报警）</div></div>
- <div class="card kpi"><div class="v">{{ board.get('model',{}).get('active','rule-proxy-v1') }}</div><div class="l">当前判定模型 · 标注 {{ board.get('model',{}).get('n_labels',0) }} 条 · 自动派单门控 {{ '通过' if board.get('auto_dispatch_gate',{}).get('passed') else '未通过' }}</div></div>
+INDEX = r"""{% extends "base.html" %}{% set active='index' %}{% block title %}看板{% endblock %}{% block body %}
+<div class="top"><h1>看板</h1><span class="sub">巡检日 {{ date or '—' }}</span>
+ <div class="right"><div class="seg"><a href="/" class="{% if not station %}on{% endif %}">全部电站</a>{% for s in stations %}<a href="/?station={{s.station_id}}" class="{% if station==s.station_id %}on{% endif %}">{{ s.name or s.station_id }}</a>{% endfor %}</div></div></div>
+
+<div class="kpis">
+ <div class="kpi {% if by_grade.get('A') %}fault{% endif %}"><div class="v">{{ by_grade.get('A',0) }}<small>A 故障</small></div><div class="l">待处理，直接派单</div></div>
+ <div class="kpi {% if by_grade.get('B') %}low{% endif %}"><div class="v">{{ by_grade.get('B',0) }}<small>B 持续低发</small></div><div class="l">≤-5% 连续 ≥2 晴好天</div></div>
+ <div class="kpi"><div class="v">{{ (by_grade.get('C',0)+by_grade.get('D',0)+by_grade.get('E',0)) }}<small>C/D/E</small></div><div class="l">档案核对 / 观察</div></div>
+ <div class="kpi low"><div class="v">{{ loss.totals.lost_yuan|num(0) }}<small>元</small></div><div class="l">累计未修复损失 ≈ {{ loss.totals.lost_kwh|num(0) }} kWh</div></div>
+ <div class="kpi {% if stats.false_alarm_rate is not none and stats.false_alarm_rate <= 0.1 %}ok{% endif %}"><div class="v">{% if stats.false_alarm_rate is not none %}{{ (stats.false_alarm_rate*100)|num(0) }}<small>%</small>{% else %}—{% endif %}</div><div class="l">近 30 天误报率（复核 {{ stats.n_reviewed }} 条）</div></div>
+ <div class="kpi"><div class="v">{{ board.get('kpi',{}).get('detection_latency_days') if board.get('kpi',{}).get('detection_latency_days') is not none else '—' }}<small>天</small></div><div class="l">平均发现时延</div></div>
 </div>
-<div class="grid g2">
-<div class="card"><h3>各站损失台账</h3><table><tr><th>电站</th><th>损失电量</th><th>损失电费</th></tr>
-{% for st,v in loss.by_station.items() %}<tr><td>{{st}}</td><td>{{v.lost_kwh|num(0)}} kWh</td><td>{{v.lost_yuan|num(0)}} 元</td></tr>{% else %}<tr><td colspan=3 class="muted">无</td></tr>{% endfor %}</table></div>
-<div class="card"><h3>告警</h3><table>{% for a in alerts %}<tr><td class="small muted">{{a.run_date}}</td><td><b>{{a.source}}</b></td><td>{{a.message}}</td></tr>{% else %}<tr><td class="muted">无</td></tr>{% endfor %}</table></div>
+
+<div class="grid cols-3-1" style="align-items:start">
+<div class="grid" style="gap:16px;align-content:start">
+ {% for h in heat %}
+ <section class="panel">
+  <div class="station-head"><h3>{{ h.name }}</h3>
+   <span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}{% if h.weather.get('noon_power') %} · 中午 {{ h.weather.noon_power|num(0) }} kW / 峰值参考 {{ h.weather.peak_ref|num(0) }} kW{% endif %}</span>
+   <span class="muted small">{{ h.n_strings }} 串 · 在办案例 {{ h.n_cases }}{% if h.n_dead %} · 0 电流 {{ h.n_dead }}{% endif %}</span>
+   <a class="small" style="margin-left:auto" href="/strings?station={{h.station_id}}">放大 →</a></div>
+  {{ h.svg|safe }}
+ </section>
+ {% else %}<section class="panel"><p class="empty">还没有巡检数据。导入档案并运行 <code>pvdiag run</code> 后这里会显示每个电站的组串热力图。</p></section>{% endfor %}
+ <div class="legend"><span><i style="background:var(--c-cell-ok)"></i>正常 &gt;-3%</span><span><i style="background:var(--c-cell-watch)"></i>-3%~-5%</span><span><i style="background:var(--c-cell-low)"></i>-5%~-15%</span><span><i style="background:var(--c-cell-bad)"></i>&lt;-15%</span><span><i style="background:var(--c-cell-dead)"></i>0 电流</span><span><i style="background:var(--c-cell-na)"></i>无数据</span><span><i class="ring"></i>A 级在办</span><span><i class="ringb"></i>B 级在办</span><span>点格子看单串详情</span></div>
+
+ <section class="panel"><h2>损失台账 <span class="hint">未修复案例累计电费，驱动派单优先级</span></h2>
+  <div class="grid cols-2"><div><div class="small muted" style="margin-bottom:6px">按电站</div>{{ loss_svg|safe }}</div><div><div class="small muted" style="margin-bottom:6px">按案例（前 8）</div>{{ case_svg|safe }}</div></div>
+ </section>
 </div>
-{% if report.agents %}<div class="card"><h3>最近一次流水线 {{ report.date }}</h3><table>
-{% for k,v in report.agents.items() %}<tr><td>{{ '✅' if v.status=='ok' else '⚠️' }}</td><td><code>{{k}}</code></td><td>{{v.summary}}</td></tr>{% endfor %}</table>
-<p class="small muted">Markdown 报告：data/reports/{{ report.date }}/report.md</p></div>{% endif %}
+
+<div class="grid" style="gap:16px;align-content:start">
+ <section class="panel"><h2>待复核 <span class="hint">按严重度排序</span></h2>
+  {% if todo %}<table><tbody>{% for r in todo %}<tr class="sev-{{r.grade}}"><td><span class="grade g{{r.grade}}">{{r.grade}}</span></td>
+  <td><a class="id" href="/suspect/{{r.suspect_id}}">{{ r.string_id or r.inverter_id ~ '（整机）' }}</a><div class="small muted">{{ r.ai_cause or r.rule_cause }}</div></td>
+  <td class="num {% if r.dev_today is not none and r.dev_today < -0.05 %}neg{% endif %}">{{ r.dev_today|pct }}</td></tr>{% endfor %}</tbody></table>
+  <p style="margin:10px 0 0"><a class="btn sm" href="/review">进入复核队列</a></p>
+  {% else %}<p class="empty">队列为空</p>{% endif %}
+ </section>
+ <section class="panel"><h2>工单 <span class="hint">草稿需人工确认发送</span></h2>
+  {% if wos %}<table><tbody>{% for w in wos %}<tr><td><a class="id" href="/workorder/{{w.wo_id}}">{{w.wo_id}}</a><div class="small muted">{{w.station_id}} · {{w.roof_area}} · {{w.cause}}</div></td>
+  <td class="num"><span class="chip {% if w.status=='draft' %}warn{% elif w.status=='sent' %}info{% endif %}">{{ w.status|cn }}</span></td></tr>{% endfor %}</tbody></table>
+  {% else %}<p class="empty">无待办工单</p>{% endif %}
+ </section>
+ <section class="panel"><h2>系统状态</h2>
+  {% if report.agents %}<table><tbody>{% for k,v in report.agents.items() %}<tr><td class="id">{{k}}</td><td><span class="chip {% if v.status=='ok' %}ok{% elif v.status=='fail' %}bad{% else %}warn{% endif %}">{{v.status}}</span></td><td class="small muted">{{v.summary}}</td></tr>{% endfor %}</tbody></table>{% endif %}
+  {% if board.get('model') %}<p class="small muted" style="margin:10px 0 0">判定模型 {{ board.model.active }} · 标注 {{ board.model.n_labels }}/{{ board.model.min_labels_for_ml }} 条 · 自动派单门控 {{ '已通过' if board.get('auto_dispatch_gate',{}).get('passed') else '未通过（' ~ board.get('auto_dispatch_gate',{}).get('reason','') ~ '）' }}</p>{% endif %}
+  {% for a in alerts %}<div class="alert"><b>{{a.source}}</b> {{a.message}}</div>{% endfor %}
+ </section>
+</div>
+</div>
 {% endblock %}"""
 
-REVIEW = r"""{% extends "base.html" %}{% block title %}复核队列{% endblock %}{% block body %}
-<h2>复核队列 <span class="muted small">{{ rows|length }} 条 · 清单式批量复核，一人一天几百串</span></h2>
-<form class="inline card" method="get">电站 <select name="station"><option value="">全部</option>{% for s in stations %}<option {% if s==station %}selected{% endif %}>{{s}}</option>{% endfor %}</select>
-分级 <select name="grade"><option value="">全部</option>{% for g in ['A','B','C','D','E'] %}<option {% if g==grade %}selected{% endif %}>{{g}}</option>{% endfor %}</select><button>筛选</button></form>
-<div class="card"><table><tr><th>分级</th><th>对象</th><th>偏差</th><th>持续</th><th>规则原因 → AI 原因（置信）</th><th>首报</th><th>动作</th><th>复核</th></tr>
-{% for r in rows %}<tr>
-<td><span class="badge g{{r.grade}}">{{r.grade}}</span></td>
-<td><a href="/suspect/{{r.suspect_id}}">{{ r.string_id if r.string_id else r.inverter_id ~ '(整机)' }}</a>{% if r.low_confidence %} <span class="small muted">低置信</span>{% endif %}</td>
-<td class="{{ 'neg' if r.dev_today is not none and r.dev_today < -0.05 else '' }}">{{ r.dev_today|pct }}</td><td>{{r.persist_days}}d</td>
-<td>{{r.rule_cause}} → <b>{{r.ai_cause or '-'}}</b> ({{ (r.confidence*100)|num(0) if r.confidence is not none else '-' }}%)</td>
-<td class="small">{{r.first_date}}</td><td class="small">{{r.action or '-'}}</td>
+STRINGS = r"""{% extends "base.html" %}{% set active='strings' %}{% block title %}组串热力图{% endblock %}{% block body %}
+<div class="top"><h1>组串热力图</h1><span class="sub">每格一串，颜色 = 当日中午窗口互比偏差，描边 = 在办案例</span>
+ <div class="right">
+  <div class="seg"><a href="/strings?d={{date}}" class="{% if not station %}on{% endif %}">全部</a>{% for s in stations %}<a href="/strings?station={{s.station_id}}&d={{date}}" class="{% if station==s.station_id %}on{% endif %}">{{ s.name or s.station_id }}</a>{% endfor %}</div>
+  <form class="inline" method="get"><input type="hidden" name="station" value="{{station}}"><select name="d" onchange="this.form.submit()">{% for x in dates %}<option {% if x==date %}selected{% endif %}>{{x}}</option>{% endfor %}</select></form>
+ </div></div>
+{% for h in heat %}<section class="panel" style="margin-bottom:16px">
+ <div class="station-head"><h3>{{ h.name }}</h3><span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}</span><span class="muted small">{{ h.n_strings }} 串 · {{ h.inverters|length }} 台逆变器 · 在办案例 {{ h.n_cases }}</span></div>
+ {{ h.svg|safe }}
+</section>{% else %}<section class="panel"><p class="empty">无数据</p></section>{% endfor %}
+<div class="legend"><span><i style="background:var(--c-cell-ok)"></i>正常</span><span><i style="background:var(--c-cell-watch)"></i>-3%~-5%</span><span><i style="background:var(--c-cell-low)"></i>-5%~-15%</span><span><i style="background:var(--c-cell-bad)"></i>&lt;-15%</span><span><i style="background:var(--c-cell-dead)"></i>0 电流</span><span><i style="background:var(--c-cell-na)"></i>无数据</span><span><i class="ring"></i>A 级</span><span><i class="ringb"></i>B 级</span><span>虚线框 = C/D/E 观察</span></div>
+{% endblock %}"""
+
+STRING = r"""{% extends "base.html" %}{% set active='strings' %}{% block title %}{{ prof.string_id }}{% endblock %}{% block body %}
+<div class="top"><h1 class="id">{{ prof.string_id }}</h1><span class="sub">{{ prof.station_id }} · {{ prof.inverter_id }} · pv{{ prof.pv_index }} · {{ prof.roof_area or '位置待补' }}</span>
+ <div class="right">{% if bl %}<span class="chip {% if bl.dev_today is not none and bl.dev_today <= -0.05 %}bad{% elif bl.dev_today is not none and bl.dev_today <= -0.03 %}warn{% else %}ok{% endif %}">{{ date }} 偏差 {{ bl.dev_today|pct }} · {{ bl.weather_tag|wcn }}</span>{% endif %}
+ <a class="btn sm" href="/strings?station={{prof.station_id}}">← 热力图</a></div></div>
+<div class="grid cols-2">
+ <section class="panel"><h2>当日电流曲线 <span class="hint">实线 = 该串，虚线 = 同群组中位</span></h2>{{ chart_svg|safe }}</section>
+ <section class="panel"><h2>互比偏差趋势 <span class="hint">近 45 天，仅晴好天参与判定</span></h2>{{ trend_svg|safe }}</section>
+</div>
+<div class="grid cols-2" style="margin-top:16px">
+ <section class="panel"><h2>档案</h2>
+  <dl class="kv"><dt>串长 / 组件</dt><dd>{{ prof.n_modules }} 块 × {{ prof.module_model or '—' }} {{ prof.module_wp|num(0) }} W（Vmp {{ prof.module_vmp|num(1) }} V · Imp {{ prof.module_imp|num(2) }} A）</dd>
+  <dt>朝向 / 倾角</dt><dd>{{ prof.azimuth|num(0) }}° / {{ prof.tilt|num(0) }}°</dd><dt>MPPT</dt><dd>{{ prof.mppt }}</dd>
+  <dt>已知遮挡</dt><dd>{% if prof.known_shading %}是 — {{ prof.shading_note }}（预期偏差 {{ prof.shading_expected_dev|pct }}）{% else %}否{% endif %}</dd>
+  <dt>互比群组</dt><dd class="id small">{{ prof.group_key }}</dd>
+  {% if bl %}<dt>基线</dt><dd>自身基线比 {{ bl.baseline_ratio|num(3) }}（{{ bl.baseline_n }} 个晴好天{% if bl.cold_start %}，冷启动{% endif %}）· 群组 {{ bl.group_n }} 串 · 相对自身 {{ bl.dev_vs_own|pct }}</dd>
+  <dt>持续度</dt><dd>≤-5% 连续 {{ bl.persist_days_5 }} 天 · ≤-3% 连续 {{ bl.persist_days_3 }} 天{% if bl.first_breach_date %} · 首次跌破 {{ bl.first_breach_date }}{% endif %}</dd>{% endif %}
+  <dt>备注</dt><dd>{{ prof.notes or '—' }}</dd></dl>
+  {% if events %}<h2 style="margin-top:14px">事件 <span class="hint">基线自事件日分段重置</span></h2><table><tbody>{% for e in events %}<tr><td>{{e.event_date}}</td><td>{{e.event_type}}</td><td class="small muted">{{e.notes}}</td></tr>{% endfor %}</tbody></table>{% endif %}
+ </section>
+ <section class="panel"><h2>案例</h2>
+  {% if cases %}<table><thead><tr><th>分级</th><th>案例</th><th>原因</th><th>状态</th></tr></thead><tbody>{% for c in cases %}<tr class="sev-{{c.grade}}"><td><span class="grade g{{c.grade}}">{{c.grade}}</span></td><td><a class="id" href="/suspect/{{c.suspect_id}}">{{c.suspect_id}}</a><div class="small muted">{{c.first_date}} → {{c.date}} · 持续 {{c.persist_days}} 天</div></td><td>{{ c.ai_cause or c.rule_cause }}</td><td><span class="chip">{{ c.status|cn }}</span></td></tr>{% endfor %}</tbody></table>
+  {% else %}<p class="empty">该串没有过嫌疑案例</p>{% endif %}
+  {% if sigs %}<h2 style="margin-top:14px">近 10 日签名</h2><table><thead><tr><th>日期</th><th>天气</th><th class="num">比值均值</th><th class="num">标准差</th><th>凹陷</th><th class="num">电压偏差</th></tr></thead><tbody>
+  {% for g in sigs %}<tr><td>{{g.date}}</td><td>{{g.weather_tag|wcn}}</td><td class="num">{{g.ratio_mean|num(3)}}</td><td class="num">{{g.ratio_std|num(3)}}</td><td>{% if g.dip_depth %}{{g.dip_start}}–{{g.dip_end}} 深 {{(g.dip_depth*100)|num(0)}}%{% else %}—{% endif %}</td><td class="num">{{g.voltage_offset|pct}}</td></tr>{% endfor %}</tbody></table>{% endif %}
+ </section>
+</div>
+{% endblock %}"""
+
+REVIEW = r"""{% extends "base.html" %}{% set active='review' %}{% block title %}复核队列{% endblock %}{% block body %}
+<div class="top"><h1>复核队列</h1><span class="sub">{{ rows|length }} 条 · 一屏看全，清单式批量复核</span>
+ <div class="right">
+  <div class="seg"><a href="/review?station={{station}}" class="{% if not grade %}on{% endif %}">全部 {{ counts.values()|sum }}</a>{% for g in ['A','B','C','D','E'] %}<a href="/review?station={{station}}&grade={{g}}" class="{% if g==grade %}on{% endif %}">{{g}} {{ counts.get(g,0) }}</a>{% endfor %}</div>
+  <div class="seg"><a href="/review?grade={{grade}}" class="{% if not station %}on{% endif %}">全部电站</a>{% for s in stations %}<a href="/review?station={{s.station_id}}&grade={{grade}}" class="{% if s.station_id==station %}on{% endif %}">{{ s.name or s.station_id }}</a>{% endfor %}</div>
+ </div></div>
+<section class="panel" style="padding:0;overflow:auto">
+<table><thead><tr><th>分级</th><th>对象</th><th class="num">偏差</th><th class="num">持续</th><th>规则 → AI 判定</th><th>首报</th><th>动作</th><th style="min-width:330px">复核</th></tr></thead><tbody>
+{% for r in rows %}<tr class="sev-{{r.grade}}">
+<td><span class="grade g{{r.grade}}">{{r.grade}}</span></td>
+<td><a class="id" href="/suspect/{{r.suspect_id}}">{{ r.string_id if r.string_id else r.inverter_id ~ '（整机）' }}</a><div class="small muted">{{r.station_id}}{% if r.low_confidence %} · <span class="chip warn">低置信</span>{% endif %}</div></td>
+<td class="num {% if r.dev_today is not none and r.dev_today <= -0.05 %}neg{% endif %}">{{ r.dev_today|pct }}</td><td class="num">{{r.persist_days}} 天</td>
+<td>{{r.rule_cause}}<div class="small muted">AI：<b style="color:var(--ink)">{{r.ai_cause or '—'}}</b> {{ (r.confidence*100)|num(0) ~ '%' if r.confidence is not none else '' }}</div></td>
+<td class="small">{{r.first_date}}</td><td class="small">{{r.action or '—'}}</td>
 <td><form class="inline" method="post" action="/review/{{r.suspect_id}}/confirm"><input type="hidden" name="back" value="/review?station={{station}}&grade={{grade}}">
-<select name="true_cause"><option value="">按 AI/规则原因</option>{% for c in causes %}<option>{{c}}</option>{% endfor %}</select><button class="ok">确认</button></form>
-<form class="inline" method="post" action="/review/{{r.suspect_id}}/reject"><input type="hidden" name="back" value="/review?station={{station}}&grade={{grade}}">
-<select name="reason">{% for x in reasons %}<option>{{x}}</option>{% endfor %}</select><button class="no">驳回</button></form></td>
-</tr>{% else %}<tr><td colspan=8 class="muted">队列为空</td></tr>{% endfor %}</table></div>
+<select name="true_cause" aria-label="真实原因"><option value="">原因同判定</option>{% for c in causes %}<option>{{c}}</option>{% endfor %}</select><button class="ok sm">确认异常</button></form>
+<form class="inline" method="post" action="/review/{{r.suspect_id}}/reject" style="margin-top:4px"><input type="hidden" name="back" value="/review?station={{station}}&grade={{grade}}">
+<select name="reason" aria-label="驳回原因">{% for x in reasons %}<option>{{x}}</option>{% endfor %}</select><button class="danger sm">驳回</button></form></td>
+</tr>{% else %}<tr><td colspan="8" class="empty">队列为空。下一次巡检后新的嫌疑会出现在这里。</td></tr>{% endfor %}</tbody></table>
+</section>
+<p class="small muted" style="margin-top:10px">确认 = 真实异常（可改原因）；驳回 = 误报（选原因）。两者都写入标注库，是 AI 模型的训练数据。近 30 天已复核 {{ stats.n_reviewed }} 条{% if stats.confirm_rate is not none %}，确认率 {{ (stats.confirm_rate*100)|num(0) }}%{% endif %}。</p>
 {% endblock %}"""
 
-SUSPECT = r"""{% extends "base.html" %}{% block title %}{{ s.string_id or s.inverter_id }}{% endblock %}{% block body %}
-<h2><span class="badge g{{s.grade}}">{{s.grade}}</span> {{ s.string_id or (s.inverter_id ~ '（整机）') }} <span class="muted small">{{ s.suspect_id }} · 状态 {{ s.status }}</span></h2>
-<div class="grid g2">
- <div class="card"><h3>全天电流曲线 vs 群组中位</h3>{{ chart_svg|safe }}</div>
- <div class="card"><h3>互比偏差趋势（近 45 天，仅晴好天参与判定）</h3>{{ trend_svg|safe }}</div>
+SUSPECT = r"""{% extends "base.html" %}{% set active='review' %}{% block title %}{{ s.string_id or s.inverter_id }}{% endblock %}{% block body %}
+<div class="top"><span class="grade g{{s.grade}}" style="height:28px;min-width:28px;font-size:14px">{{s.grade}}</span><h1 class="id">{{ s.string_id or s.inverter_id ~ '（整机）' }}</h1>
+ <span class="sub">{{ s.station_id }} · 案例 {{ s.suspect_id }}</span>
+ <div class="right"><span class="chip {% if s.status in ['confirmed','dispatched'] %}info{% elif s.status=='rejected' %}bad{% elif s.status=='closed' %}ok{% else %}warn{% endif %}">{{ s.status|cn }}</span>
+ {% if s.string_id %}<a class="btn sm" href="/string/{{s.string_id}}">单串详情</a>{% endif %}<a class="btn sm" href="/review">← 队列</a>{% if next_id %}<a class="btn sm" href="/suspect/{{next_id}}">下一条 →</a>{% endif %}</div></div>
+
+<div class="grid cols-2">
+ <section class="panel"><h2>当日电流曲线 <span class="hint">{% if s.scope=='inverter' %}该逆变器各串{% else %}实线 = 该串，虚线 = 同群组中位{% endif %}</span></h2>{{ chart_svg|safe }}</section>
+ <section class="panel"><h2>互比偏差趋势 <span class="hint">近 45 天，仅晴好天参与判定</span></h2>{{ trend_svg|safe }}</section>
 </div>
-<div class="grid g2">
-<div class="card"><h3>判定</h3>
-<p class="expl">{{ s.explanation or '（尚无 AI 判定）' }}</p>
-<table><tr><th>规则原因</th><td>{{s.rule_cause}}</td></tr><tr><th>AI 原因</th><td><b>{{s.ai_cause or '-'}}</b> 置信度 {{ (s.confidence*100)|num(0) if s.confidence is not none else '-' }}%（{{ s.model_version or '-' }}）</td></tr>
-<tr><th>动作</th><td>{{ s.action or '-' }}</td></tr><tr><th>偏差 / 持续</th><td>{{ s.dev_today|pct }} / {{ s.persist_days }} 天（首报 {{ s.first_date }}，最近 {{ s.date }}）</td></tr>
-<tr><th>概率分布</th><td class="small">{% for k,v in proba.items() %}{{k}} {{ (v*100)|num(0) }}%　{% endfor %}</td></tr>
-<tr><th>签名</th><td class="small">{% for n in sig.get('notes',[]) %}• {{n}}<br>{% endfor %}
-{% if sig.dip_depth %}凹陷 {{ sig.dip_start }}-{{ sig.dip_end }} 深度 {{ (sig.dip_depth*100)|num(0) }}%，其余时段比值 {{ sig.outside_dip_ratio|num(2) }}<br>{% endif %}
-{% if sig.overcast_dev is not none %}阴天偏差 {{ sig.overcast_dev|pct }}<br>{% endif %}</td></tr>
-<tr><th>损失</th><td>累计 {{ loss.lost_kwh|num(0) }} kWh ≈ {{ loss.lost_yuan|num(0) }} 元（{{ loss.days }} 个晴好天，约 {{ loss.per_day_kwh|num(1) }} kWh/天）</td></tr>
-{% if wo %}<tr><th>工单</th><td>{% for w in wo %}<a href="/workorder/{{w.wo_id}}">{{w.wo_id}}</a>（{{w.status}}） {% endfor %}</td></tr>{% endif %}</table>
+<div class="grid cols-2" style="margin-top:16px">
+<section class="panel"><h2>判定</h2>
+ <p class="why" style="margin:0 0 12px">{{ s.explanation or '尚无 AI 判定（等待下一次巡检）' }}</p>
+ <dl class="kv">
+  <dt>规则原因</dt><dd>{{ s.rule_cause }}</dd>
+  <dt>AI 原因</dt><dd><b>{{ s.ai_cause or '—' }}</b>{% if s.confidence is not none %} · 置信度 {{ (s.confidence*100)|num(0) }}%{% endif %} <span class="small muted">{{ s.model_version or '' }}</span></dd>
+  <dt>建议动作</dt><dd>{{ s.action or '—' }}</dd>
+  <dt>偏差 / 持续</dt><dd>{{ s.dev_today|pct }} · {{ s.persist_days }} 天 · 首报 {{ s.first_date }} · 最近 {{ s.date }}</dd>
+  {% if proba %}<dt>概率</dt><dd class="small">{% for k,v in proba.items() %}{{k}} {{ (v*100)|num(0) }}%　{% endfor %}</dd>{% endif %}
+  <dt>签名</dt><dd class="small">{% for n in sig.get('notes',[]) %}{{n}}<br>{% endfor %}{% if sig.dip_depth %}凹陷 {{ sig.dip_start }}–{{ sig.dip_end }}，深度 {{ (sig.dip_depth*100)|num(0) }}%，其余时段比值 {{ sig.outside_dip_ratio|num(2) }}<br>{% endif %}{% if sig.overcast_dev is not none %}阴天偏差 {{ sig.overcast_dev|pct }}{% endif %}</dd>
+  <dt>损失</dt><dd>累计 {{ loss.lost_kwh|num(0) }} kWh ≈ <b>{{ loss.lost_yuan|num(0) }} 元</b>（{{ loss.days }} 个晴好天，约 {{ loss.per_day_kwh|num(1) }} kWh/天）</dd>
+  {% if wo %}<dt>工单</dt><dd>{% for w in wo %}<a class="id" href="/workorder/{{w.wo_id}}">{{w.wo_id}}</a> <span class="chip">{{ w.status|cn }}</span> {% endfor %}</dd>{% endif %}
+ </dl>
+ {% if s.status in ['open','reviewing','confirmed','dispatched'] %}
+ <div class="sticky-actions">
+  <form class="inline" method="post" action="/review/{{s.suspect_id}}/confirm"><input type="hidden" name="back" value="{% if next_id %}/suspect/{{next_id}}{% else %}/review{% endif %}">
+   <select name="true_cause"><option value="">原因同判定（{{ s.ai_cause or s.rule_cause }}）</option>{% for c in causes %}<option>{{c}}</option>{% endfor %}</select>
+   <input type="text" name="note" placeholder="备注（可选）" size="18"><button class="ok">确认异常</button></form>
+  <form class="inline" method="post" action="/review/{{s.suspect_id}}/reject"><input type="hidden" name="back" value="{% if next_id %}/suspect/{{next_id}}{% else %}/review{% endif %}">
+   <select name="reason">{% for x in reasons %}<option>{{x}}</option>{% endfor %}</select><button class="danger">驳回（误报）</button></form>
+ </div>{% endif %}
+</section>
+<section class="panel"><h2>{% if prof %}组串档案{% else %}整机级嫌疑{% endif %}</h2>
+ {% if prof %}<dl class="kv">
+  <dt>逆变器 / MPPT / pv</dt><dd>{{prof.inverter_id}} / {{prof.mppt}} / pv{{prof.pv_index}}</dd>
+  <dt>串长 / 组件</dt><dd>{{prof.n_modules}} 块 × {{prof.module_model or '—'}} {{prof.module_wp|num(0)}} W（Vmp {{prof.module_vmp|num(1)}} V · Imp {{prof.module_imp|num(2)}} A）</dd>
+  <dt>朝向 / 倾角</dt><dd>{{prof.azimuth|num(0)}}° / {{prof.tilt|num(0)}}°</dd><dt>屋面位置</dt><dd>{{prof.roof_area or '待补'}}</dd>
+  <dt>已知遮挡</dt><dd>{% if prof.known_shading %}是 — {{ prof.shading_note or '' }}{% else %}否{% endif %}</dd>
+  <dt>互比群组</dt><dd class="id small">{{prof.group_key}}</dd><dt>备注</dt><dd>{{prof.notes or '—'}}</dd></dl>
+ {% else %}<p class="muted">机间互比发现整机参照偏低：各串中位电流 / 组件 Imp 低于站内其它逆变器。优先查 MPPT 告警与限功率设置。</p>{% endif %}
+ {% if reviews %}<h2 style="margin-top:14px">复核记录</h2><table><tbody>{% for r in reviews %}<tr><td class="small muted">{{r.reviewed_at[:16]}}</td><td>{{r.reviewer}}</td><td><b>{{ {'confirm':'确认','modify':'确认并改原因','reject':'驳回','auto_close':'自愈关闭'}.get(r.decision, r.decision) }}</b></td><td>{{r.true_cause or ''}} {{r.reject_reason or ''}}</td><td class="small muted">{{r.note or ''}}</td></tr>{% endfor %}</tbody></table>{% endif %}
+</section>
 </div>
-<div class="card"><h3>组串档案</h3>
-{% if prof %}<table>
-<tr><th>逆变器 / MPPT / pv</th><td>{{prof.inverter_id}} / {{prof.mppt}} / pv{{prof.pv_index}}</td></tr>
-<tr><th>串长 / 组件</th><td>{{prof.n_modules}} 块 × {{prof.module_model}} {{prof.module_wp}}W（Vmp {{prof.module_vmp}} V，Imp {{prof.module_imp}} A）</td></tr>
-<tr><th>朝向 / 倾角</th><td>{{prof.azimuth}}° / {{prof.tilt}}°</td></tr><tr><th>屋面位置</th><td>{{prof.roof_area or '待补'}}</td></tr>
-<tr><th>已知遮挡</th><td>{{ '是：' ~ (prof.shading_note or '') if prof.known_shading else '否' }}</td></tr>
-<tr><th>互比群组</th><td class="small">{{prof.group_key}}</td></tr><tr><th>备注</th><td>{{prof.notes or ''}}</td></tr></table>
-{% else %}<p class="muted">整机级嫌疑（机间互比）</p>{% endif %}
-<h3 style="margin-top:14px">人工复核</h3>
-{% if s.status in ['open','reviewing','confirmed','dispatched'] %}
-<form class="inline" method="post" action="/review/{{s.suspect_id}}/confirm"><input type="hidden" name="back" value="/suspect/{{s.suspect_id}}">
-真实原因 <select name="true_cause"><option value="">同 {{ s.ai_cause or s.rule_cause }}</option>{% for c in causes %}<option>{{c}}</option>{% endfor %}</select>
-<input type="text" name="note" placeholder="备注"><button class="ok">确认异常</button></form>
-<form class="inline" method="post" action="/review/{{s.suspect_id}}/reject" style="margin-top:8px"><input type="hidden" name="back" value="/suspect/{{s.suspect_id}}">
-驳回原因 <select name="reason">{% for x in reasons %}<option>{{x}}</option>{% endfor %}</select><input type="text" name="note" placeholder="备注"><button class="no">驳回（误报）</button></form>
-{% else %}<p class="muted">该案例已 {{ s.status }}</p>{% endif %}
-{% if reviews %}<h3 style="margin-top:14px">复核记录</h3><table>{% for r in reviews %}<tr><td class="small">{{r.reviewed_at[:16]}}</td><td>{{r.reviewer}}</td><td><b>{{r.decision}}</b></td><td>{{r.true_cause or ''}} {{r.reject_reason or ''}}</td><td class="small">{{r.note or ''}}</td></tr>{% endfor %}</table>{% endif %}
-</div></div>
 {% endblock %}"""
 
-WORKORDERS = r"""{% extends "base.html" %}{% block title %}工单{% endblock %}{% block body %}
-<h2>工单 <span class="muted small">draft=草稿待确认发送 · sent=已派 · done=现场已回填待复查 · verified=复查归零 · reopened=未归零重开</span></h2>
-<form class="inline card" method="get">状态 <select name="status"><option value="">全部</option>{% for x in ['draft','sent','done','verified','reopened'] %}<option {% if x==status %}selected{% endif %}>{{x}}</option>{% endfor %}</select><button>筛选</button></form>
-<div class="card"><table><tr><th>工单</th><th>电站/区域</th><th>原因</th><th>优先级</th><th>损失/天</th><th>累计损失</th><th>状态</th><th>操作</th></tr>
-{% for w in rows %}<tr><td><a href="/workorder/{{w.wo_id}}">{{w.wo_id}}</a></td><td>{{w.station_id}} / {{w.roof_area}}</td><td>{{w.cause}}</td><td>{{w.priority|num(1)}}</td>
-<td>{{w.loss_kwh_per_day|num(1)}} kWh</td><td>{{w.loss_yuan_total|num(0)}} 元</td><td><b>{{w.status}}</b></td>
-<td>{% if w.status in ['draft','reopened'] %}<form class="inline" method="post" action="/workorder/{{w.wo_id}}/send"><button class="pri">确认发送</button></form>{% endif %}</td></tr>
-{% else %}<tr><td colspan=8 class="muted">无工单</td></tr>{% endfor %}</table></div>
+WORKORDERS = r"""{% extends "base.html" %}{% set active='wo' %}{% block title %}工单{% endblock %}{% block body %}
+<div class="top"><h1>工单</h1><span class="sub">草稿 → 已派发 → 待复查 → 复查归零 / 重开</span>
+ <div class="right"><div class="seg"><a href="/workorders" class="{% if not status %}on{% endif %}">全部</a>{% for x in ['draft','sent','done','verified','reopened'] %}<a href="/workorders?status={{x}}" class="{% if x==status %}on{% endif %}">{{ x|cn }} {{ counts.get(x,0) }}</a>{% endfor %}</div></div></div>
+<section class="panel" style="padding:0;overflow:auto">
+<table><thead><tr><th>工单</th><th>电站 / 区域</th><th>原因</th><th class="num">优先级</th><th class="num">损失/天</th><th class="num">累计损失</th><th>状态</th><th>操作</th></tr></thead><tbody>
+{% for w in rows %}<tr><td><a class="id" href="/workorder/{{w.wo_id}}">{{w.wo_id}}</a><div class="small muted">{{ w.created_at[:10] }}</div></td><td>{{w.station_id}}<div class="small muted">{{w.roof_area}}</div></td><td>{{w.cause}}</td>
+<td class="num">{{w.priority|num(1)}}</td><td class="num">{{w.loss_kwh_per_day|num(1)}} kWh</td><td class="num">{{w.loss_yuan_total|num(0)}} 元</td>
+<td><span class="chip {% if w.status=='draft' %}warn{% elif w.status=='verified' %}ok{% elif w.status=='reopened' %}bad{% elif w.status=='sent' %}info{% endif %}">{{ w.status|cn }}</span></td>
+<td>{% if w.status in ['draft','reopened'] %}<form class="inline" method="post" action="/workorder/{{w.wo_id}}/send"><button class="primary sm">确认发送</button></form>{% else %}<a class="btn sm" href="/workorder/{{w.wo_id}}">查看</a>{% endif %}</td></tr>
+{% else %}<tr><td colspan="8" class="empty">还没有工单。复核确认的异常和高置信 A/B 级会自动生成草稿。</td></tr>{% endfor %}</tbody></table>
+</section>
+<p class="small muted" style="margin-top:10px">优先级 = 日损失电量 × 电价 × 预计持续天数 ÷ 修复成本；同屋面多串合并为一张区域工单。</p>
 {% endblock %}"""
 
-WORKORDER = r"""{% extends "base.html" %}{% block title %}{{ wo.wo_id }}{% endblock %}{% block body %}
-<h2>{{ wo.wo_id }} <span class="muted small">状态 {{ wo.status }} · 渠道 {{ wo.channel }} · {{ wo.dispatch_result or '' }}</span></h2>
-<div class="grid g2"><div class="card"><pre>{{ text }}</pre>
-<p class="small">涉及嫌疑：{% for s in suspect_ids %}<a href="/suspect/{{s}}">{{s}}</a> {% endfor %}</p></div>
-<div class="card">
-{% if wo.status in ['draft','reopened'] %}<h3>派发</h3><form method="post" action="/workorder/{{wo.wo_id}}/send"><button class="pri">确认发送（{{ wo.channel }}）</button></form><hr>{% endif %}
-{% if wo.status in ['sent','reopened','draft'] %}<h3>现场结果回填</h3>
-<form method="post" action="/workorder/{{wo.wo_id}}/close" class="grid" style="gap:8px">
-<label>实际原因 <input type="text" name="field_cause" required placeholder="如：MC4 接头烧蚀"></label>
-<label>处理动作 <select name="field_action">{% for a in ['维修','清洗','更换','重接线','换逆变器','无需处理'] %}<option>{{a}}</option>{% endfor %}</select></label>
-<label>处理日期 <input type="date" name="done_date"></label>
-<label>备注 <textarea name="note" rows="3" placeholder="若为巡检发现但系统未报，请写明“漏报”以统计漏报率"></textarea></label>
-<button class="ok">回填并登记事件（基线自该日重置，{{ 3 }} 个晴好天后自动复查）</button></form>
-{% elif wo.status=='done' %}<p>已回填：{{ wo.field_cause }} / {{ wo.field_action }} / {{ wo.field_note }}；复查到期 {{ wo.recheck_due }}</p>
-{% else %}<p>{{ wo.recheck_result }}</p>{% endif %}
-</div></div>
+WORKORDER = r"""{% extends "base.html" %}{% set active='wo' %}{% block title %}{{ wo.wo_id }}{% endblock %}{% block body %}
+<div class="top"><h1 class="id">{{ wo.wo_id }}</h1><span class="sub">{{ wo.station_id }} · {{ wo.roof_area }} · 优先级 {{ wo.priority|num(1) }}</span>
+ <div class="right"><span class="chip {% if wo.status=='draft' %}warn{% elif wo.status=='verified' %}ok{% elif wo.status=='reopened' %}bad{% elif wo.status=='sent' %}info{% endif %}">{{ wo.status|cn }}</span><span class="small muted">{{ wo.channel }} {{ wo.dispatch_result or '' }}</span><a class="btn sm" href="/workorders">← 工单</a></div></div>
+<div class="grid cols-2">
+ <section class="panel wo-body">{{ body_html|safe }}
+  <p class="small muted" style="margin-top:12px">涉及案例：{% for s in suspect_ids %}<a class="id" href="/suspect/{{s}}">{{s}}</a> {% endfor %}</p></section>
+ <section class="panel">
+  {% if wo.status in ['draft','reopened'] %}<h2>派发</h2><p class="muted small">渠道 {{ wo.channel }}（dryrun 写入 data/outbox/；配置企业微信 webhook 后直接推送到群）。</p>
+  <form method="post" action="/workorder/{{wo.wo_id}}/send"><button class="primary">确认发送工单</button></form><hr style="border:0;border-top:1px solid var(--line);margin:16px 0">{% endif %}
+  {% if wo.status in ['sent','reopened','draft'] %}<h2>现场结果回填</h2>
+  <form method="post" action="/workorder/{{wo.wo_id}}/close" class="grid" style="gap:10px">
+   <label>实际原因<br><input type="text" name="field_cause" required placeholder="如：MC4 接头烧蚀" style="width:100%"></label>
+   <div class="grid cols-2" style="gap:10px"><label>处理动作<br><select name="field_action" style="width:100%">{% for a in ['维修','清洗','更换','重接线','换逆变器','无需处理'] %}<option>{{a}}</option>{% endfor %}</select></label>
+   <label>处理日期<br><input type="date" name="done_date" style="width:100%"></label></div>
+   <label>备注<br><textarea name="note" rows="3" placeholder="若为巡检发现而系统未报，请写明“漏报”，用于统计漏报率"></textarea></label>
+   <button class="ok">回填并登记事件</button>
+   <p class="small muted" style="margin:0">回填后基线自处理日重置，{{ recheck_days }} 个晴好天后自动复查：归零 → 复查归零；未归零 → 自动重开。</p></form>
+  {% elif wo.status=='done' %}<h2>已回填，等待复查</h2><dl class="kv"><dt>实际原因</dt><dd>{{ wo.field_cause }}</dd><dt>处理动作</dt><dd>{{ wo.field_action }}</dd><dt>备注</dt><dd>{{ wo.field_note or '—' }}</dd><dt>复查到期</dt><dd>{{ wo.recheck_due }}</dd></dl>
+  {% else %}<h2>复查结果</h2><p>{{ wo.recheck_result }}</p><dl class="kv"><dt>实际原因</dt><dd>{{ wo.field_cause }}</dd><dt>处理动作</dt><dd>{{ wo.field_action }}</dd></dl>{% endif %}
+ </section>
+</div>
 {% endblock %}"""
 
-TEMPLATES = {"base.html": BASE, "index.html": INDEX, "review.html": REVIEW, "suspect.html": SUSPECT,
-             "workorders.html": WORKORDERS, "workorder.html": WORKORDER}
+REPORT = r"""{% extends "base.html" %}{% set active='report' %}{% block title %}每日报告{% endblock %}{% block body %}
+<div class="top"><h1>每日巡检报告</h1><span class="sub">{{ date or '—' }}</span>
+ <div class="right"><form class="inline" method="get" action="/reports" onsubmit="location.href='/report/'+this.d.value;return false"><select name="d" onchange="location.href='/report/'+this.value">{% for x in dates %}<option {% if x==date %}selected{% endif %}>{{x}}</option>{% endfor %}</select></form></div></div>
+{% if not r %}<section class="panel"><p class="empty">还没有报告。运行 <code>pvdiag run</code> 后生成。</p></section>{% else %}
+<div class="grid cols-3-1">
+<div class="grid" style="gap:16px">
+ <section class="panel"><h2>嫌疑清单 <span class="hint">{{ r.suspects|length }} 条</span></h2>
+  <table><thead><tr><th>分级</th><th>对象</th><th class="num">偏差</th><th class="num">持续</th><th>规则 → AI</th><th>动作</th><th>状态</th></tr></thead><tbody>
+  {% for s in r.suspects %}<tr class="sev-{{s.grade}}"><td><span class="grade g{{s.grade}}">{{s.grade}}</span></td><td><a class="id" href="/suspect/{{s.suspect_id}}">{{ s.string_id if s.string_id else s.inverter_id ~ '（整机）' }}</a></td>
+  <td class="num">{{ s.dev_today|pct }}</td><td class="num">{{s.persist_days}} 天</td><td>{{s.rule_cause}} → {{ s.ai_cause or '—' }} {{ (s.confidence*100)|num(0) ~ '%' if s.confidence is not none else '' }}</td><td class="small">{{s.action or '—'}}</td><td><span class="chip">{{ s.status|cn }}</span></td></tr>
+  {% else %}<tr><td colspan="7" class="empty">当日无嫌疑</td></tr>{% endfor %}</tbody></table>
+  {% if r.suspects %}<details style="margin-top:10px"><summary class="small muted" style="cursor:pointer">判定依据（为什么）</summary><ul class="small" style="margin:8px 0 0 18px;line-height:1.7">{% for s in r.suspects if s.explanation %}<li><b class="id">{{ s.string_id or s.inverter_id }}</b>：{{ s.explanation }}</li>{% endfor %}</ul></details>{% endif %}
+ </section>
+ {% if r.region and r.region.packages %}<section class="panel"><h2>区域任务包 <span class="hint">该去哪修什么</span></h2><table><thead><tr><th>电站 / 区域</th><th class="num">串数</th><th>原因</th><th class="num">损失/天</th><th class="num">优先级</th></tr></thead><tbody>
+  {% for p in r.region.packages %}<tr><td>{{p.station_id}} · {{p.roof_area}}</td><td class="num">{{p.n_strings}}</td><td class="small">{% for k,v in p.causes.items() %}{{k}} {{v}}{% if not loop.last %} · {% endif %}{% endfor %}</td><td class="num">{{p.loss_kwh_per_day|num(1)}} kWh</td><td class="num">{{p.priority}}</td></tr>{% endfor %}</tbody></table></section>{% endif %}
+ {% if r.region and r.region.dust_candidates %}<section class="panel"><h2>清洗建议 <span class="hint">积灰签名：慢渐变 + 雨后恢复</span></h2><table><tbody>{% for d in r.region.dust_candidates %}<tr><td class="id">{{d.string_id}}</td><td>{{d.pattern}}</td><td class="num">{{ d.dev_now|pct }}</td><td class="small muted">{{d.advice}}</td></tr>{% endfor %}</tbody></table></section>{% endif %}
+</div>
+<div class="grid" style="gap:16px;align-content:start">
+ <section class="panel"><h2>天气 / 晴好天判定</h2>{% for w in r.weather %}<div style="margin-bottom:6px"><b>{{w.station_id}}</b> <span class="chip {% if w.weather_tag=='clear' %}ok{% elif w.weather_tag=='cloudy' %}warn{% endif %}">{{ w.weather_tag|wcn }}</span> <span class="small muted">中午 {{ w.noon_power|num(0) }} kW / 峰值参考 {{ w.peak_ref|num(0) }} kW</span></div>{% endfor %}</section>
+ <section class="panel"><h2>智能体运行</h2><table><tbody>{% for k,v in r.agents.items() %}<tr><td class="id">{{k}}</td><td><span class="chip {% if v.status=='ok' %}ok{% elif v.status=='fail' %}bad{% else %}warn{% endif %}">{{v.status}}</span></td><td class="small muted">{{v.summary}}</td></tr>{% endfor %}</tbody></table></section>
+ {% if r.loss and r.loss.totals %}<section class="panel"><h2>损失台账</h2><div class="kpi low" style="border:0;padding:0"><div class="v">{{ r.loss.totals.lost_yuan|num(0) }}<small>元</small></div><div class="l">累计未修复 ≈ {{ r.loss.totals.lost_kwh|num(0) }} kWh</div></div></section>{% endif %}
+ {% if r.review and r.review.advice %}<section class="panel"><h2>阈值调优建议</h2><p class="small">{{ r.review.advice }}</p></section>{% endif %}
+ {% if r.alerts %}<section class="panel"><h2>告警</h2>{% for a in r.alerts %}<div class="alert"><b>{{a.source}}</b> {{a.message}}</div>{% endfor %}</section>{% endif %}
+</div></div>{% endif %}
+{% endblock %}"""
+
+TEMPLATES = {"base.html": BASE, "index.html": INDEX, "strings.html": STRINGS, "string.html": STRING, "review.html": REVIEW,
+             "suspect.html": SUSPECT, "workorders.html": WORKORDERS, "workorder.html": WORKORDER, "report.html": REPORT}

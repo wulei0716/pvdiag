@@ -45,7 +45,7 @@ def sim_env(tmp_path):
         Fault("string", s(1, 4), "diode_bypass", 31, {"start": "10:00", "end": "13:00", "depth": 0.33}),
         Fault("string", s(1, 6), "shading_fixed", 30, {"start": "14:30", "end": "17:30", "depth": 0.5}),
         Fault("string", s(2, 1), "orientation", 0, {"clear_factor": 0.94}),
-        Fault("string", s(2, 3), "dust_local", 15, {"rate_per_day": 0.004, "floor": 0.85, "rain_recover": 0.7}),
+        Fault("string", s(2, 3), "dust_local", 15, {"rate_per_day": 0.006, "floor": 0.80, "rain_recover": 0.5}),
         Fault("string", s(2, 5), "stuck", 34, {"value": 8.0}),
         Fault("string", s(2, 7), "wrong_profile", 0, {"n_modules": 20}),
         Fault("string", s(2, 8), "archived_shading", 0, {"start": "09:30", "end": "11:00", "depth": 0.3}),

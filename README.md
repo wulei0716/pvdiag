@@ -110,8 +110,20 @@ pvdiag run --backfill-days 3           # 断点续拉近 3 天
 ```
 macOS launchd / Windows 计划任务 / cron 任选其一每天 20:00 后执行（需要全天数据）。
 
-### 3.3 复核与派单（阶段6/7）
-- `pvdiag serve` 打开复核界面：队列 → 详情页（当日曲线 vs 群组中位、45 天偏差趋势、档案、AI 假设）→ 确认/驳回/修改原因，结果回写 `reviews` 表成为训练标注
+### 3.3 控制台（阶段6/7）
+`pvdiag serve` 打开控制台（服务端渲染 + 内联 SVG，无任何外网依赖，内网/私有化可用，自动适配深色模式）：
+
+| 页面 | 作用 |
+|---|---|
+| 看板 `/` | **组串热力图**（行 = 逆变器，列 = pv 编号，颜色 = 当日互比偏差，描边 = 在办案例）+ 待复核 + 工单 + 损失台账 + 流水线状态 |
+| 组串热力图 `/strings` | 全站/按站、按日切换；点格子进单串详情 |
+| 单串详情 `/string/{id}` | 当日电流曲线 vs 群组中位、45 天偏差趋势、档案、案例、近 10 日签名、事件 |
+| 复核队列 `/review` | 按分级/电站筛选，行内确认 / 驳回；详情页"下一条"连续复核 |
+| 工单 `/workorders` | 草稿一键发送、现场回填、复查结果 |
+| 每日报告 `/reports` | report.json 的结构化渲染，可按日切换 |
+| API `/api/queue` `/api/report/{d}` `/api/heatmap/{station}` | 供自有工单系统/下游消费 |
+
+- 复核确认 / 驳回 / 修改原因 → 回写 `reviews` 表成为训练标注
 - 工单默认 `draft` 模式：系统生成草稿，人工在界面"确认发送"；`channel: wecom` 配企业微信机器人 webhook 即可推送
 - 现场回填实际原因/动作后自动登记事件（基线分段重置），3 个晴好天后自动复查：归零 → `verified`，未归零 → 自动重开
 - 误报率连续 1 个月 <10% 且复核样本 ≥30 后，可把 `dispatch.mode` 改为 `auto`（门控在 MonitorAgent 看板里实时显示）
@@ -146,7 +158,7 @@ deploy/            macOS 一键安装（launchd 每日巡检 + 常驻复核界�
 docker/ Dockerfile docker-compose.yml   容器化体验/部署
 .devcontainer/     GitHub Codespaces 一键环境
 .github/workflows/ CI：pytest + 演示回放 + Docker 构建
-docs/              示例日报、复核界面截图、示例档案 CSV
+docs/              示例日报、控制台截图（看板/热力图/嫌疑详情/深色）、示例档案 CSV
 ```
 
 ### 部署到 Mac（本机常驻）

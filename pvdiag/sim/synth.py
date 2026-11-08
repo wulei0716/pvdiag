@@ -60,7 +60,7 @@ def default_faults(cfg: SimConfig) -> List[Fault]:
         Fault("string", s(1, 5), "diode_bypass", 35, {"start": "10:00", "end": "13:00", "depth": 0.33}),
         Fault("string", s(1, 8), "shading_fixed", 34, {"start": "14:30", "end": "17:30", "depth": 0.5}),
         Fault("string", s(2, 2), "orientation", 0, {"clear_factor": 0.94}),
-        Fault("string", s(2, 6), "dust_local", 20, {"rate_per_day": 0.004, "floor": 0.85, "rain_recover": 0.7}),
+        Fault("string", s(2, 6), "dust_local", 20, {"rate_per_day": 0.006, "floor": 0.80, "rain_recover": 0.5}),
         Fault("string", s(2, 9), "stuck", 38, {"value": 8.0}),
         Fault("string", s(2, 11), "wrong_profile", 0, {"n_modules": 20}),
         Fault("string", s(3, 4), "archived_shading", 0, {"start": "09:30", "end": "11:00", "depth": 0.3}),
@@ -148,6 +148,7 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
 
     s_frames, i_frames, w_rows, truth = [], [], [], []
     days_since_rain = 0
+    soil: Dict[Tuple[str, str], float] = {}
     for di in range(cfg.days):
         d = cfg.start + timedelta(days=di)
         ts = pd.to_datetime([datetime.combine(d, datetime.min.time()) + timedelta(minutes=int(m)) for m in minutes])
@@ -189,10 +190,16 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
                         fac = {"clear": p.get("clear_factor", 0.94), "cloudy": 0.97, "overcast": 1.0}[weathers[di]]
                         I = I * fac
                     elif f.kind == "dust_local":
-                        loss = min(p.get("rate_per_day", 0.004) * max(0, di - f.start_day), 1 - p.get("floor", 0.85))
-                        if days_since_rain == 0:
-                            loss *= (1 - p.get("rain_recover", 0.7))
-                        I = I * (1 - loss)
+                        # 积灰逐日累积，雨天冲掉一部分（之后从冲洗后的水平继续累积）
+                        key = ("dust", sid)
+                        acc = soil.get(key, 0.0)
+                        if di == f.start_day:
+                            acc = 0.0
+                        acc = min(acc + p.get("rate_per_day", 0.004), 1 - p.get("floor", 0.85))
+                        if rain_days[di]:
+                            acc *= (1 - p.get("rain_recover", 0.7))
+                        soil[key] = acc
+                        I = I * (1 - acc)
                     elif f.kind == "stuck":
                         I = np.where(G > 15, p.get("value", 8.0), 0.0)
                     elif f.kind == "wrong_profile":
