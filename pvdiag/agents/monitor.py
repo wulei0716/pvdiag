@@ -96,6 +96,7 @@ class MonitorAgent(Agent):
                               ((ctx.run_date - timedelta(days=45)).isoformat(), (ctx.run_date - timedelta(days=8)).isoformat()))["dev_today"].to_numpy(dtype=float)
         drift = psi(ref, recent)
         model_info["dev_psi_7d_vs_prev"] = None if np.isnan(drift) else round(drift, 3)
+        ctx.store.set_state("monitor:psi", {"value": None if np.isnan(drift) else float(drift), "date": today})
         if not np.isnan(drift) and drift > 0.25:
             res.alerts.append(f"互比偏差分布显著漂移 PSI={drift:.2f}（设备更换/季节/集体衰减？），建议检查基线分段与模型重训")
         board["model"] = model_info
@@ -104,15 +105,71 @@ class MonitorAgent(Agent):
         board["kpi"] = self.kpis(ctx)
         from .workorder import WorkOrderAgent
         ok, why = WorkOrderAgent().auto_gate(ctx)
-        board["auto_dispatch_gate"] = {"mode": ctx.settings.dispatch.mode, "passed": ok, "reason": why}
+        gate_state = ctx.store.get_state("dispatch:gate") or {}
+        board["auto_dispatch_gate"] = {"mode": ctx.settings.dispatch.mode, "passed": ok, "reason": why,
+                                       "effective": gate_state.get("effective", "draft"), "streak": gate_state.get("streak", 0),
+                                       "since": gate_state.get("since"), "state_reason": gate_state.get("reason")}
         board["open_alerts"] = int(ctx.store.scalar("SELECT COUNT(*) FROM alerts WHERE resolved=0 AND run_date>=?",
                                                     ((ctx.run_date - timedelta(days=7)).isoformat(),)) or 0)
-        res.metrics = {"alerts": len(res.alerts), **{k: v for k, v in board["kpi"].items() if isinstance(v, (int, float))}}
+
+        # ---- 健康自检（pvdiag doctor 同一套）
+        from ..health import run_health_checks, summarize
+        checks = run_health_checks(ctx.settings, ctx.store, ctx.run_date)
+        hs = summarize(checks)
+        board["health"] = {"ok": hs["ok"], "warn": hs["warn"], "fail": hs["fail"], "checks": checks}
+        for c in hs["failed"]:
+            res.alerts.append(f"健康自检失败 · {c['name']}：{c['detail']}")
+
+        # ---- 自主运行状态汇总（自调参 / 模型 / 门控）
+        board["autonomy"] = self.autonomy_state(ctx)
+
+        res.metrics = {"alerts": len(res.alerts), "health_fail": hs["fail"], **{k: v for k, v in board["kpi"].items() if isinstance(v, (int, float))}}
         res.artifacts = board
         ctx.shared["board"] = board
         res.summary = (f"误报率 {board['kpi'].get('false_alarm_rate')}，发现时延 {board['kpi'].get('detection_latency_days')} 天，"
-                       f"待修复损失 {board['kpi'].get('open_loss_yuan')} 元，告警 {len(res.alerts)}")
+                       f"待修复损失 {board['kpi'].get('open_loss_yuan')} 元，告警 {len(res.alerts)}，自检 {hs['ok']}✓/{hs['warn']}⚠/{hs['fail']}✖")
+
+        # ---- 关键事件推送（人必须知道的：管道 error、自检 fail、门控开合、模型上线/降级、参数生效/回滚）
+        self.push_digest(ctx, res, hs)
         return res
+
+    # ------------------------------------------------------------------ 自主状态 / 推送
+    @staticmethod
+    def autonomy_state(ctx: AgentContext) -> Dict:
+        changes = ctx.store.query("SELECT run_date, param, old_value, new_value, status, reason FROM param_changes ORDER BY change_id DESC LIMIT 10")
+        models = ctx.store.query("SELECT model_version, trained_at, n_labels, active, status FROM model_registry ORDER BY trained_at DESC LIMIT 5")
+        return {
+            "tuning": (ctx.shared.get("tuning_state") or {}).get("decision"),
+            "param_overrides": ctx.store.query("SELECT param, value_json, source FROM param_overrides").to_dict("records"),
+            "recent_param_changes": changes.to_dict("records"),
+            "models": models.to_dict("records"),
+            "live_agreement": ctx.store.get_state("model:live_agreement"),
+            "gate": ctx.store.get_state("dispatch:gate"),
+        }
+
+    def push_digest(self, ctx: AgentContext, res: AgentResult, hs: Dict) -> None:
+        from ..notify import Notifier
+        today = ctx.run_date.isoformat()
+        lines: List[str] = []
+        errs = ctx.store.query("SELECT source, message FROM alerts WHERE run_date=? AND level='error' AND source!='notify'", (today,))
+        lines += [f"[error] {r.source}: {r.message}" for r in errs.itertuples()]
+        lines += [f"[自检] {c['name']}：{c['detail']}" for c in hs["failed"]]
+        gate = ctx.store.get_state("dispatch:gate") or {}
+        lines += [f"[门控] {h['event']}" for h in gate.get("history", []) if h.get("date") == today]
+        ch = ctx.store.query("SELECT param, old_value, new_value, status FROM param_changes WHERE run_date=? AND status IN ('applied','rolled_back')", (today,))
+        lines += [f"[自调参] {r.param} {r.old_value}→{r.new_value}（{r.status}）" for r in ch.itertuples()]
+        mdl = ctx.store.query("SELECT model_version, status FROM model_registry WHERE substr(trained_at,1,10)=? AND status IN ('active','rejected')", (today,))
+        lines += [f"[模型] {r.model_version} {'已上线' if r.status == 'active' else '考试未过未上线'}" for r in mdl.itertuples()]
+        dem = ctx.store.query("SELECT message FROM alerts WHERE run_date=? AND source='classify' AND message LIKE '%降级%'", (today,))
+        lines += [f"[模型] {r.message}" for r in dem.itertuples()]
+        if not lines:
+            return
+        try:
+            out = Notifier(ctx.settings, ctx.store).send(ctx.run_date, "关键事件", lines, level="error", force=True)
+            if out:
+                res.metrics["pushed"] = out
+        except Exception as e:  # 推送失败不影响流水线
+            ctx.store.alert(ctx.run_date, "warn", self.name, f"关键事件推送失败: {e}")
 
     # ------------------------------------------------------------------ KPI
     @staticmethod

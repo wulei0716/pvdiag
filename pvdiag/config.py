@@ -24,6 +24,7 @@ class Thresholds(BaseModel):
     zero_current_a: float = 0.5          # <0.5A 视为未接/夜间
     zero_days: int = 2                   # 全天 0 电流连续天数 → A 故障
     stuck_std_a: float = 0.02            # 日间电流标准差低于此值且均值>0.5A → 电流钉死
+    stale_run_min: int = 90              # 日间连续 ≥90 分钟电流一动不动 → 半天钉死（数据问题），该日不参与互比中位数
     voltage_offset: float = 0.08         # 与群组中位电压偏差 > 8% → 电压异位
     voltage_offset_days: int = 2
     dip_ratio: float = 0.85              # 分时段比值 < 0.85 视为凹陷（遮挡/二极管签名）
@@ -33,6 +34,14 @@ class Thresholds(BaseModel):
     orientation_max_drift: float = 0.012    # 近 10 晴好天偏差 std 超过此值 → 在漂移，不判朝向（积灰/衰减）
     archived_shading_extra: float = -0.05   # 已备案遮挡串，比备案偏差再低 5% 才重新报警
     rainy_streak_caution_days: int = 7      # 连续 ≥7 天无晴好天后的首个晴天 → 低置信
+    # ---- 群组噪声门控（来自公开数据 Kaggle 两站的教训：大电站"晴好天"各逆变器互比偏差的稳健标准差可达 2%~7%）
+    noise_k: float = 2.5                    # 当日偏差还要 ≤ -k×群组稳健标准差(MAD) 才算"统计显著"的一次低发
+    noise_skip: float = 0.04                # 群组稳健标准差 > 4% 的"晴好天"视为云影日：不计入持续度、也不打断持续度
+    cold_start_cap_grade: str = "D"         # 冷启动（晴好天样本不足）期间，仅凭互比偏差最高只给到此分级（不给 B）
+    outage_min_slots: int = 2               # 白天 ≥2 个半小时槽（1h）整段 0 输出而同机其它串正常 → 间歇停机/掉线签名
+    outage_group_ratio: float = 0.30        # 判停机时要求群组曲线 ≥ 当日峰值 30%（排除清晨/傍晚）
+    outage_rel_zero: float = 0.10           # 本串 ≤ 群组同时段 10% 即视为"整段为 0"（晴天散射光占比 10%~15%，遮挡不会更低；15 分钟边沿插值也不会）
+    outage_noon_skip_frac: float = 0.20     # 中午窗口 ≥20% 样本为 0 的日子不计入互比持续度（停机已有独立签名，别把它算成"低发"）
 
 
 class BaselineCfg(BaseModel):
@@ -57,14 +66,25 @@ class Confidence(BaseModel):
     mid: float = 0.50                    # ≥ → 转人工复核；否则仅观察
     min_labels_for_ml: int = 60          # 标注数不足 → 规则代理模型（冷启动）
     retrain_every_days: int = 30
+    # ---- 模型生命周期（自训练 / 自评估 / 自切换 / 自回退）
+    retrain_min_new_labels: int = 20     # 距上次训练新增标注 ≥N 条即触发重训（不必等周期）
+    holdout_fraction: float = 0.25       # 按时间顺序留出最近 25%（至少 10 条）做"考试"，不用随机切分（避免未来信息泄漏）
+    promote_tolerance: float = 0.02      # 挑战者准确率 ≥ 现役 − 2% 且 ≥ 规则代理 − 2% 才上线
+    demote_margin: float = 0.10          # 线上：模型与复核结论的一致率比规则代理低 10 个百分点以上 → 自动降级回规则代理
+    demote_min_samples: int = 20         # 降级判断至少 20 条近 30 天复核样本
+    drift_psi_retrain: float = 0.25      # 偏差分布 PSI 超过此值且有新标注 → 触发重训
 
 
 class DispatchCfg(BaseModel):
-    mode: str = "draft"                  # draft: 生成草稿待人工确认; auto: 高置信自动发送
+    mode: str = "gated"                  # draft: 永远草稿待人工确认; auto: 门控通过即自动发送; gated: 门控连续达标自动放开、恶化自动收回（默认）
     channel: str = "dryrun"              # dryrun | wecom
     wecom_webhook: Optional[str] = None  # 企业微信群机器人 webhook
     auto_gate_fa_rate_max: float = 0.10  # 误报率连续1个月<10% 才允许 auto
     auto_gate_window_days: int = 30
+    auto_gate_min_reviews: int = 30      # 窗口内复核样本至少 30 条
+    gate_open_streak_days: int = 7       # gated：门控连续通过 ≥7 个运行日才放开自动派单（滞回，防抖）
+    gate_close_field_missed: int = 3     # gated：窗口内现场漏报 ≥3 起立即收回
+    gate_close_on_pipeline_fail: bool = True   # gated：当天任一智能体失败 / 数据时延 >2 天 → 收回（数据管道不健康时不自动派人）
     recheck_clear_days: int = 3          # 处理后 N 个晴好天复查
     site_visit_cost_yuan: float = 300.0  # 误派一次现场核查成本（用于优先级与门控）
     merge_same_roof: bool = True         # 同屋面多串合并区域工单
@@ -84,7 +104,7 @@ class LossCfg(BaseModel):
     expected_fault_days_default: int = 30   # 未修复预计持续天数（优先级公式用）
     repair_cost_by_cause: Dict[str, float] = Field(default_factory=lambda: {
         "断线/未接": 300, "旁路二极管": 500, "遮挡": 400, "朝向差异": 0,
-        "MPPT异常": 1500, "组件衰减/积灰": 200, "数据问题": 50, "限发": 0, "未知": 300,
+        "MPPT异常": 1500, "组件衰减/积灰": 200, "数据问题": 50, "限发": 0, "间歇停机/掉线": 200, "未知": 300,
     })
 
 
@@ -104,6 +124,41 @@ class PlatformCfg(BaseModel):
     sungrow_same_day_available: bool = False  # 阳光不返回当天数据
 
 
+class AutotuneCfg(BaseModel):
+    """自调参闭环：用人工复核结果给规则阈值"考试"，只在安全区间内小步调整，留痕、可回滚。"""
+    enabled: bool = True
+    mode: str = "apply"                  # apply: 达标自动生效（写 param_overrides，不改 config.yaml）; shadow: 只评估、只建议
+    min_labels: int = 20                 # 窗口内"纯偏差型"复核样本至少 20 条才动阈值
+    window_days: int = 60                # 评估窗口
+    cooldown_days: int = 7               # 两次调整至少间隔 7 天
+    min_f1_gain: float = 0.05            # 候选参数在留出的复核样本上 F1 至少提升 5 个百分点
+    min_recall_keep: float = 0.80        # 调整后对"已确认"案例的召回不得低于当前的 80%
+    step_floor: float = 0.01             # 阈值步长 1 个百分点
+    fault_floor_bounds: List[float] = Field(default_factory=lambda: [-0.08, -0.04])
+    persist_bounds: List[int] = Field(default_factory=lambda: [2, 4])
+    noise_k_bounds: List[float] = Field(default_factory=lambda: [2.0, 4.0])
+    rollback_confirm_drop: float = 0.10  # 生效后 B 级确认率比生效前低 ≥10 个百分点（≥10 条新复核）→ 自动回滚
+    loosen_on_field_missed: int = 3      # 窗口内现场漏报 ≥3 起 → 提议放松一步（放松无法用已有标注验证，只提议不自动生效）
+
+
+class IngestCfg(BaseModel):
+    """数据接入自愈：缺口自动补拉、失败重试退避、降级到本地文件、连续失败升级告警。"""
+    heal_lookback_days: int = 14         # 每次运行回看 14 天，缺哪天补哪天（不只是 backfill_days 窗口）
+    max_heal_days_per_run: int = 7       # 单次最多补 7 天（控制配额）
+    retries: int = 3                     # 适配器拉取失败重试次数
+    backoff_seconds: float = 5.0         # 指数退避起始秒数（5, 10, 20）
+    escalate_after_failures: int = 3     # 连续失败 ≥3 次升级为 error 告警并推送
+    stale_data_alert_days: int = 2       # 数据时延 >2 天告警
+
+
+class AlertCfg(BaseModel):
+    """关键告警推送（企业微信或 outbox 文件），24h 内相同内容不重复推。"""
+    enabled: bool = True
+    wecom_webhook: Optional[str] = None  # 为空则沿用 dispatch.wecom_webhook；都为空 → 写 data/outbox/alerts/<date>.md
+    min_level: str = "error"             # error | warn：推送级别门槛（门控开合、模型上线/降级、参数生效/回滚 总是推送）
+    dedupe_hours: int = 24
+
+
 class Settings(BaseModel):
     data_dir: Path = Path("./data")
     timezone: str = "Asia/Shanghai"
@@ -113,6 +168,9 @@ class Settings(BaseModel):
     dispatch: DispatchCfg = DispatchCfg()
     loss: LossCfg = LossCfg()
     platforms: PlatformCfg = PlatformCfg()
+    autotune: AutotuneCfg = AutotuneCfg()
+    ingest: IngestCfg = IngestCfg()
+    alerts: AlertCfg = AlertCfg()
 
     # ---- 派生路径 ----
     @property

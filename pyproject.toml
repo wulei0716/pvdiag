@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pvdiag"
-version = "0.1.0"
+version = "0.2.0"
 description = "组串发电量异常诊断智能体系统：同机互比 → 规则/AI 判定 → 人工复核 → 工单闭环 → 自学习"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 web = ["fastapi>=0.100", "uvicorn>=0.22", "jinja2>=3.1", "python-multipart>=0.0.6"]
 dev = ["pytest>=7", "httpx>=0.24"]
+bench = ["pvanalytics>=0.2"]       # 公开数据基准：NREL 标注片段随 pvanalytics 分发
 
 [project.scripts]
 pvdiag = "pvdiag.cli:main"

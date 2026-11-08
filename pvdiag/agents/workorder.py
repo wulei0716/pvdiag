@@ -12,7 +12,7 @@ import json
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -30,6 +30,8 @@ CHECKLIST: Dict[str, List[str]] = {
     Cause.DATA_ISSUE.value: ["检查采集器/通讯链路，核对平台时钟", "重启采集模块后观察电流是否恢复变化", "若现场发电正常则关闭为数据问题"],
     Cause.PROFILE_ERROR.value: ["核对排布图：该串实际串长/MPPT 接线", "更正档案（n_modules/mppt），重算基线"],
     Cause.CURTAILMENT.value: ["核对电网调度/逆变器限功率设置", "确认是否为 EMC 协议允许的限发，不计组件故障"],
+    Cause.OUTAGE.value: ["查逆变器/采集器告警与离线日志，核对停机时段是否与工单一致", "查直流开关/保险丝是否跳脱、通讯链路是否中断",
+                         "若为电网/调度停机或计划检修 → 登记事件并驳回；否则排查设备并回填实际原因"],
     Cause.ORIENTATION.value: ["核对排布图：该串朝向/倾角是否与档案一致", "更正档案后系统自动重分组，不派现场"],
     Cause.UNKNOWN.value: ["现场巡检该串组件、接线、阴影", "拍照回填，记录实际原因"],
 }
@@ -79,20 +81,82 @@ class WorkOrderAgent(Agent):
         res = AgentResult(agent=self.name)
         created = self.generate(ctx)
         sent = 0
-        if ctx.settings.dispatch.mode == "auto":
-            gate_ok, why = self.auto_gate(ctx)
-            if gate_ok:
-                for wo_id in created:
-                    self.send(ctx, wo_id)
-                    sent += 1
-            else:
-                res.alerts.append(f"auto 派单门控未通过，保持草稿：{why}")
+        effective, gate = self.effective_mode(ctx)
+        for t in gate.get("transitions", []):
+            res.alerts.append(t)
+        if effective == "auto":
+            for wo_id in created:
+                self.send(ctx, wo_id)
+                sent += 1
+        elif ctx.settings.dispatch.mode in ("auto", "gated") and created:
+            res.alerts.append(f"派单门控未放开（{gate.get('reason')}），{len(created)} 张新工单保持草稿待人工确认")
         rechecked = self.recheck(ctx)
-        res.metrics = {"created": len(created), "sent": sent, "rechecked": rechecked,
+        res.metrics = {"created": len(created), "sent": sent, "rechecked": rechecked, "effective_mode": effective,
                        "drafts_pending": int(ctx.store.scalar("SELECT COUNT(*) FROM workorders WHERE status='draft'") or 0)}
-        res.artifacts = {"created": created}
-        res.summary = f"新建工单 {len(created)}（已发送 {sent}），待确认草稿 {res.metrics['drafts_pending']}，复查 {rechecked}"
+        res.artifacts = {"created": created, "gate": gate}
+        ctx.shared["dispatch_gate"] = gate
+        res.summary = f"新建工单 {len(created)}（已发送 {sent}，模式 {effective}），待确认草稿 {res.metrics['drafts_pending']}，复查 {rechecked}"
         return res
+
+    # ------------------------------------------------------------------ 门控自动开合（带滞回）
+    def effective_mode(self, ctx: AgentContext) -> Tuple[str, Dict]:
+        """draft → 永远草稿；auto → 门控当天通过就自动；gated → 连续 N 个运行日通过才放开，任一恶化条件立即收回。
+        状态存 platform_state['dispatch:gate']，每次开合都留痕告警。"""
+        d = ctx.settings.dispatch
+        gate_ok, why = self.auto_gate(ctx)
+        healthy, hwhy = self.gate_health(ctx)
+        state = ctx.store.get_state("dispatch:gate") or {"effective": "draft", "streak": 0, "since": None, "history": []}
+        transitions: List[str] = []
+        if d.mode == "draft":
+            effective = "draft"
+            state.update({"effective": "draft", "streak": 0, "reason": "配置 mode=draft"})
+        elif d.mode == "auto":
+            effective = "auto" if (gate_ok and healthy) else "draft"
+            state.update({"effective": effective, "reason": why if not gate_ok else (hwhy if not healthy else "ok")})
+        else:  # gated
+            prev = state.get("effective", "draft")
+            if gate_ok and healthy:
+                if state.get("date") != ctx.run_date.isoformat():          # 同一天重跑不重复累计
+                    state["streak"] = int(state.get("streak", 0)) + 1
+                if prev != "auto" and state["streak"] >= d.gate_open_streak_days:
+                    state.update({"effective": "auto", "since": ctx.run_date.isoformat()})
+                    transitions.append(f"派单门控放开：连续 {state['streak']} 个运行日误报率达标（{why}），自动派单开启")
+                state["reason"] = "ok" if state["effective"] == "auto" else f"门控通过，连续 {state['streak']}/{d.gate_open_streak_days} 天后放开"
+            else:
+                reason = why if not gate_ok else hwhy
+                if prev == "auto":
+                    transitions.append(f"派单门控收回：{reason}，回到草稿模式（需人工确认发送）")
+                state.update({"effective": "draft", "streak": 0, "reason": reason})
+            effective = state["effective"]
+        state["date"] = ctx.run_date.isoformat()
+        state["gate_ok"], state["healthy"] = bool(gate_ok), bool(healthy)
+        hist = state.get("history", [])
+        for t in transitions:
+            hist.append({"date": ctx.run_date.isoformat(), "event": t})
+        state["history"] = hist[-20:]
+        state["transitions"] = transitions
+        ctx.store.set_state("dispatch:gate", {k: v for k, v in state.items() if k != "transitions"})
+        return effective, state
+
+    def gate_health(self, ctx: AgentContext) -> Tuple[bool, str]:
+        """数据管道不健康时不自动派人：当天智能体失败 / 数据时延 / 现场漏报多"""
+        d = ctx.settings.dispatch
+        today = ctx.run_date.isoformat()
+        if d.gate_close_on_pipeline_fail:
+            since = ctx.shared.get("pipeline_started_at") or "0000"
+            failed = ctx.store.query("SELECT DISTINCT agent FROM pipeline_runs WHERE run_date=? AND status='fail' AND started_at>=?", (today, since))
+            if not failed.empty:
+                return False, f"今日智能体失败：{failed['agent'].tolist()}"
+            for st in ctx.stations():
+                dates = ctx.store.available_dates("string", st)
+                lag = (ctx.run_date - date.fromisoformat(dates[-1])).days if dates else None
+                if lag is None or lag > ctx.settings.ingest.stale_data_alert_days:
+                    return False, f"{st} 数据时延 {lag} 天"
+        from .review import ReviewAgent
+        st = ReviewAgent.stats(ctx.store, days=d.auto_gate_window_days)
+        if int(st.get("field_missed", 0) or 0) >= d.gate_close_field_missed:
+            return False, f"近 {d.auto_gate_window_days} 天现场漏报 {st['field_missed']} 起"
+        return True, "ok"
 
     # ------------------------------------------------------------------ 生成
     def generate(self, ctx: AgentContext) -> List[str]:
@@ -213,8 +277,8 @@ class WorkOrderAgent(Agent):
         from .review import ReviewAgent
         d = ctx.settings.dispatch
         st = ReviewAgent.stats(ctx.store, days=d.auto_gate_window_days)
-        if not st.get("n_reviewed") or st["n_reviewed"] < 30:
-            return False, f"近 {d.auto_gate_window_days} 天复核样本 {st.get('n_reviewed', 0)} < 30"
+        if not st.get("n_reviewed") or st["n_reviewed"] < d.auto_gate_min_reviews:
+            return False, f"近 {d.auto_gate_window_days} 天复核样本 {st.get('n_reviewed', 0)} < {d.auto_gate_min_reviews}"
         if (st.get("false_alarm_rate") or 1.0) > d.auto_gate_fa_rate_max:
             return False, f"误报率 {st['false_alarm_rate']:.0%} > {d.auto_gate_fa_rate_max:.0%}"
         return True, "ok"

@@ -84,7 +84,9 @@ class RegionAgent(Agent):
             if cur > -0.03 or cur < -0.30:          # 太深的偏差是故障量级，不是积灰
                 continue
             # 阶跃排除：相邻晴好天之间出现 ≥2 个百分点的"向下阶跃" → 故障（断线/二极管/遮挡），不是积灰
-            diffs = np.diff(devs)
+            # 相邻晴好天之间可能隔着几个阴雨天，积灰会连续累积：按"每日历日"的变化率判阶跃
+            gaps = np.diff(pd.to_datetime(clear["date"]).to_numpy()).astype("timedelta64[D]").astype(float)
+            diffs = np.diff(devs) / np.maximum(gaps, 1.0)
             if len(diffs) and float(np.min(diffs)) <= -0.02:
                 continue
             x = np.arange(len(clear))

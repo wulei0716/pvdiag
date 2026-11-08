@@ -25,6 +25,8 @@ EXPECTED_CAUSE = {
     "wrong_profile": {Cause.PROFILE_ERROR.value},
     "archived_shading": {Cause.SHADING.value},
     "mppt_fault": {Cause.MPPT.value},
+    "outage_intermittent": {Cause.OUTAGE.value},
+    "stale_partial": {Cause.DATA_ISSUE.value},
 }
 
 

@@ -24,7 +24,8 @@ from .base import Agent, AgentContext, AgentResult
 FEATURES = ["dev_today", "dev_vs_own", "dev_roll7", "persist_days_5", "persist_days_3", "baseline_n", "group_n",
             "zero_all_day", "stuck", "voltage_offset", "dip_depth", "dip_len_h", "dip_center_h", "outside_dip_ratio",
             "constant_offset", "ratio_mean", "ratio_std", "am_pm_skew", "overcast_dev", "known_shading",
-            "inverter_level", "low_confidence", "n_clear_recent", "month", "grade_sev"]
+            "inverter_level", "low_confidence", "n_clear_recent", "month", "grade_sev",
+            "outage_hours", "outage_days", "stale_run_min", "group_noise"]
 
 GRADE_SEV = {Grade.A.value: 0, Grade.B.value: 1, Grade.C.value: 2, Grade.D.value: 3, Grade.E.value: 4, Grade.ARCHIVED.value: 5}
 
@@ -57,6 +58,8 @@ def build_features(susp: Dict, bl: Optional[pd.Series], sig: Signature, prof: Op
         "inverter_level": float(sig.inverter_level), "low_confidence": float(susp.get("low_confidence", 0) or 0),
         "n_clear_recent": g(bl, "n_clear_recent", 0), "month": float(run_date.month),
         "grade_sev": float(GRADE_SEV.get(susp.get("grade"), 4)),
+        "outage_hours": float(sig.outage_hours or 0.0), "outage_days": float(sig.outage_days or 0),
+        "stale_run_min": float(sig.stale_run_min or 0), "group_noise": sig.group_noise if sig.group_noise is not None else np.nan,
     }
 
 
@@ -75,6 +78,8 @@ class RuleProxyModel:
         elif grade == Grade.B.value:
             if sig.inverter_level:
                 conf = 0.80 if persist >= 5 else 0.70
+            elif sig.outage_hours > 0:
+                conf = 0.85 if sig.outage_days >= 3 else 0.70
             elif sig.dip_depth is not None:
                 conf = 0.85 if persist >= 3 else 0.75
             elif sig.constant_offset:
@@ -248,27 +253,34 @@ class ClassifyAgent(Agent):
         parts.append(f"→ {cause}（置信度 {conf:.0%}，{mv}）→ {action}")
         return "；".join(parts)
 
-    # ------------------------------------------------------------------ 模型管理
+    # ------------------------------------------------------------------ 模型管理（生命周期：训练 → 留出集考试 → 达标上线 → 线上监督 → 不达标回退）
     def _load_active_model(self, ctx: AgentContext) -> Optional[MLModel]:
         row = ctx.store.query("SELECT * FROM model_registry WHERE active=1 ORDER BY trained_at DESC LIMIT 1")
         if row.empty:
             return None
         try:
-            return MLModel.load(Path(row["path"].iloc[0]))
+            model = MLModel.load(Path(row["path"].iloc[0]))
         except Exception as e:
             ctx.store.alert(ctx.run_date, "warn", self.name, f"模型加载失败，回退规则代理: {e}")
             return None
+        demoted, why = self.live_supervision(ctx, model.version)
+        if demoted:
+            ctx.store.alert(ctx.run_date, "warn", self.name, f"模型 {model.version} 已自动降级回规则代理：{why}")
+            return None
+        return model
 
     @staticmethod
-    def training_set(ctx: AgentContext) -> Tuple[pd.DataFrame, pd.Series]:
-        """标注 = 人工复核（确认/修改 → 真实原因；驳回 → 正常(误报)）；特征取嫌疑当日基线+签名"""
+    def training_set(ctx: AgentContext, with_meta: bool = False):
+        """标注 = 人工复核（确认/修改 → 真实原因；驳回 → 正常(误报)）；特征取嫌疑当日基线+签名。
+        with_meta=True 时额外返回 meta（suspect_id, date, rule_cause）用于按时间留出与规则代理对照。"""
         rv = ctx.store.query(
             "SELECT s.*, r.decision, r.true_cause AS label_cause FROM reviews r JOIN suspects s ON s.suspect_id=r.suspect_id "
             "WHERE r.decision IN ('confirm','modify','reject') ORDER BY r.reviewed_at")
         if rv.empty:
-            return pd.DataFrame(), pd.Series(dtype=str)
+            empty = (pd.DataFrame(), pd.Series(dtype=str))
+            return (*empty, pd.DataFrame()) if with_meta else empty
         rv = rv.drop_duplicates(subset=["suspect_id"], keep="last")
-        rows, ys = [], []
+        rows, ys, meta = [], [], []
         for s in rv.to_dict("records"):
             sig = Signature.model_validate_json(s["signature_json"]) if s.get("signature_json") else Signature()
             bl = prof = None
@@ -280,38 +292,160 @@ class ClassifyAgent(Agent):
             feats = build_features(s, bl, sig, prof, date.fromisoformat(s["date"]))
             rows.append(feats)
             ys.append(Cause.NORMAL.value if s["decision"] == "reject" else (s["label_cause"] or s["rule_cause"]))
+            # 时间留出按案例"首次报警日"排序（suspects.date 是案例最近更新日，在办案例都等于今天，不能用）
+            meta.append({"suspect_id": s["suspect_id"], "date": s.get("first_date") or s["date"], "rule_cause": s["rule_cause"], "grade": s["grade"],
+                         "decision": s["decision"]})
         X = pd.DataFrame(rows)[FEATURES]
-        return X, pd.Series(ys)
+        y = pd.Series(ys)
+        if with_meta:
+            return X, y, pd.DataFrame(meta)
+        return X, y
 
-    def train(self, ctx: AgentContext, force: bool = False) -> Dict:
-        X, y = self.training_set(ctx)
+    # ---- 评估
+    @staticmethod
+    def _metrics(y_true: pd.Series, y_pred) -> Dict[str, float]:
+        from sklearn.metrics import accuracy_score, f1_score
+        y_true = pd.Series(y_true).astype(str).to_numpy()
+        y_pred = pd.Series(y_pred).astype(str).to_numpy()
+        return {"accuracy": round(float(accuracy_score(y_true, y_pred)), 4),
+                "macro_f1": round(float(f1_score(y_true, y_pred, average="macro", zero_division=0)), 4), "n": int(len(y_true))}
+
+    @staticmethod
+    def time_split(meta: pd.DataFrame, frac: float, min_holdout: int = 10):
+        """按嫌疑日期排序，最近 frac（至少 min_holdout 条）留出；样本太少时返回 None（改用交叉验证）"""
+        order = np.argsort(meta["date"].to_numpy())
+        n = len(order)
+        k = max(min_holdout, int(round(n * frac)))
+        if n - k < max(10, min_holdout):
+            return None
+        return order[:n - k], order[n - k:]
+
+    def _exam(self, ctx: AgentContext, X: pd.DataFrame, y: pd.Series, meta: pd.DataFrame, incumbent: Optional[MLModel]) -> Dict:
+        """挑战者 / 现役 / 规则代理 在同一留出集上的成绩"""
+        split = self.time_split(meta, ctx.settings.confidence.holdout_fraction)
+        out: Dict = {"method": "time_holdout" if split else "cv"}
+        if split:
+            tr, ho = split
+            ch = MLModel.train(X.iloc[tr], y.iloc[tr], "exam")
+            pred = [ch.predict(r)[0] for r in X.iloc[ho].to_dict("records")]
+            out["challenger"] = self._metrics(y.iloc[ho], pred)
+            out["rule_proxy"] = self._metrics(y.iloc[ho], meta.iloc[ho]["rule_cause"])
+            # 注意偏置：直接"确认"的标注 = 规则原因本身，规则代理在这些行上天然 100% 对；
+            # 只在"修改原因 / 驳回"的行上比一比才公平，一并给出
+            hard = meta.iloc[ho]["decision"].isin(["modify", "reject"]).to_numpy()
+            if hard.sum() >= 3:
+                out["challenger_on_corrected"] = self._metrics(y.iloc[ho][hard], np.array(pred)[hard])
+                out["rule_proxy_on_corrected"] = self._metrics(y.iloc[ho][hard], meta.iloc[ho]["rule_cause"][hard])
+            if incumbent is not None:
+                try:
+                    ipred = [incumbent.predict(r)[0] for r in X.iloc[ho].to_dict("records")]
+                    out["incumbent"] = self._metrics(y.iloc[ho], ipred)
+                except Exception:
+                    out["incumbent"] = None
+            out["holdout_dates"] = [str(meta.iloc[ho]["date"].min()), str(meta.iloc[ho]["date"].max())]
+        else:
+            from sklearn.model_selection import cross_val_predict
+            cv = int(min(5, y.value_counts().min()))
+            if cv >= 2:
+                est, _ = MLModel.make_estimator(len(y))
+                pred = cross_val_predict(est, X.to_numpy(dtype=float), y.to_numpy(), cv=cv)
+                out["challenger"] = self._metrics(y, pred)
+                out["rule_proxy"] = self._metrics(y, meta["rule_cause"])
+            else:
+                out["challenger"] = {"accuracy": float("nan"), "macro_f1": float("nan"), "n": int(len(y))}
+                out["rule_proxy"] = self._metrics(y, meta["rule_cause"])
+        return out
+
+    def train(self, ctx: AgentContext, force: bool = False, reason: str = "") -> Dict:
+        """训练 + 考试 + 决定是否上线。force=True 为人工强制上线（仍记录成绩）。"""
+        X, y, meta = self.training_set(ctx, with_meta=True)
         n = len(y)
         c = ctx.settings.confidence
         if n < c.min_labels_for_ml and not force:
             return {"trained": False, "reason": f"标注 {n} 条 < {c.min_labels_for_ml}，继续使用规则代理模型"}
         if y.nunique() < 2:
             return {"trained": False, "reason": "标注类别不足 2 类"}
-        stamp = f"{datetime.now():%Y%m%d%H%M}"
-        # 交叉验证评估（类别太少时跳过）
-        acc = np.nan
-        try:
-            from sklearn.model_selection import cross_val_score
-            cv = min(5, int(y.value_counts().min()))
-            if cv >= 2:
-                est, _ = MLModel.make_estimator(n)
-                acc = float(np.mean(cross_val_score(est, X.to_numpy(dtype=float), y.to_numpy(), cv=cv)))
-        except Exception:
-            acc = np.nan
-        model = MLModel.train(X, y, stamp)
+        incumbent = None
+        row = ctx.store.query("SELECT * FROM model_registry WHERE active=1 ORDER BY trained_at DESC LIMIT 1")
+        if not row.empty:
+            try:
+                incumbent = MLModel.load(Path(row["path"].iloc[0]))
+            except Exception:
+                incumbent = None
+        exam = self._exam(ctx, X, y, meta, incumbent)
+        ch = exam.get("challenger") or {}
+        px = exam.get("rule_proxy") or {}
+        inc = exam.get("incumbent") or {}
+        ch_acc = ch.get("accuracy", float("nan"))
+        verdict_ok = True
+        why = []
+        if not np.isnan(ch_acc):
+            if px.get("accuracy") is not None and ch_acc < px["accuracy"] - c.promote_tolerance:
+                verdict_ok, why = False, why + [f"挑战者准确率 {ch_acc:.0%} 低于规则代理 {px['accuracy']:.0%}"]
+            if inc and inc.get("accuracy") is not None and ch_acc < inc["accuracy"] - c.promote_tolerance:
+                verdict_ok, why = False, why + [f"挑战者准确率 {ch_acc:.0%} 低于现役模型 {inc['accuracy']:.0%}"]
+        promote = verdict_ok or force
+        stamp = f"{datetime.now():%Y%m%d%H%M%S}"
+        model = MLModel.train(X, y, stamp)          # 最终模型用全部标注训练
         path = ctx.settings.models_dir / f"{model.version}.joblib"
         model.save(path)
-        ctx.store.execute("UPDATE model_registry SET active=0")
-        ctx.store.execute("INSERT OR REPLACE INTO model_registry VALUES (?,?,?,?,?,?,1)",
-                          (model.version, datetime.now().isoformat(), n, json.dumps(model.classes, ensure_ascii=False),
-                           json.dumps({"cv_accuracy": acc, "class_counts": y.value_counts().to_dict(),
-                                       "feature_importance": model.feature_importance()}, ensure_ascii=False), str(path)))
-        return {"trained": True, "version": model.version, "n_labels": n, "cv_accuracy": acc, "classes": model.classes,
-                "feature_importance": model.feature_importance()}
+        metrics = {"exam": exam, "class_counts": y.value_counts().to_dict(), "feature_importance": model.feature_importance(),
+                   "reason": reason, "forced": bool(force), "rejected_because": why}
+        status = "active" if promote else "rejected"
+        if promote:
+            ctx.store.execute("UPDATE model_registry SET active=0, status=CASE WHEN status='active' THEN 'retired' ELSE status END")
+        ctx.store.execute(
+            "INSERT OR REPLACE INTO model_registry (model_version, trained_at, n_labels, classes_json, metrics_json, path, active, status, holdout_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (model.version, datetime.now().isoformat(), n, json.dumps(model.classes, ensure_ascii=False),
+             json.dumps(metrics, ensure_ascii=False, default=str), str(path), int(promote), status,
+             json.dumps(exam, ensure_ascii=False, default=str)))
+        ctx.store.set_state("model:last_train", {"at": datetime.now().isoformat(), "n_labels": n, "version": model.version, "promoted": promote})
+        return {"trained": True, "promoted": promote, "version": model.version, "n_labels": n, "exam": exam,
+                "cv_accuracy": ch_acc, "classes": model.classes, "feature_importance": model.feature_importance(),
+                "reason": reason, "rejected_because": why}
+
+    @staticmethod
+    def retrain_due(ctx: AgentContext, drift_psi: Optional[float] = None) -> Tuple[bool, str]:
+        """是否该重训：无模型但标注够了 / 新标注够多 / 到周期且有新标注 / 分布漂移且有新标注"""
+        c = ctx.settings.confidence
+        n_labels = int(ctx.store.scalar("SELECT COUNT(DISTINCT suspect_id) FROM reviews WHERE decision IN ('confirm','modify','reject')") or 0)
+        last = ctx.store.get_state("model:last_train") or {}
+        active = ctx.store.query("SELECT trained_at FROM model_registry WHERE active=1")
+        new_labels = n_labels - int(last.get("n_labels", 0))
+        if n_labels < c.min_labels_for_ml:
+            return False, f"标注 {n_labels} < {c.min_labels_for_ml}"
+        if active.empty and not last:
+            return True, f"标注已达 {n_labels} 条，首次训练"
+        if new_labels >= c.retrain_min_new_labels:
+            return True, f"新增标注 {new_labels} ≥ {c.retrain_min_new_labels}"
+        if last.get("at"):
+            days = (datetime.now() - datetime.fromisoformat(last["at"])).days
+            if days >= c.retrain_every_days and new_labels >= 5:
+                return True, f"距上次训练 {days} 天且新增标注 {new_labels}"
+        if drift_psi is not None and not np.isnan(drift_psi) and drift_psi > c.drift_psi_retrain and new_labels >= 5:
+            return True, f"偏差分布漂移 PSI={drift_psi:.2f} 且新增标注 {new_labels}"
+        return False, f"新增标注 {new_labels}，未到重训条件"
+
+    @staticmethod
+    def live_supervision(ctx: AgentContext, model_version: str) -> Tuple[bool, str]:
+        """线上监督：近 30 天已复核的嫌疑里，模型判定与复核结论一致率 vs 规则代理一致率。差太多 → 降级。"""
+        c = ctx.settings.confidence
+        since = (ctx.run_date - timedelta(days=30)).isoformat()
+        df = ctx.store.query(
+            "SELECT r.decision, r.true_cause, s.rule_cause, v.cause AS ml_cause FROM reviews r "
+            "JOIN suspects s ON s.suspect_id=r.suspect_id JOIN verdicts v ON v.suspect_id=r.suspect_id "
+            "WHERE r.decision IN ('confirm','modify','reject') AND r.reviewed_at>=? AND v.model_version=?", (since, model_version))
+        if len(df) < c.demote_min_samples:
+            return False, f"样本 {len(df)} 不足"
+        label = np.where(df["decision"] == "reject", Cause.NORMAL.value, df["true_cause"].fillna(df["rule_cause"]))
+        ml = float((df["ml_cause"].to_numpy() == label).mean())
+        px = float((df["rule_cause"].to_numpy() == label).mean())
+        ctx.store.set_state("model:live_agreement", {"model": ml, "rule_proxy": px, "n": int(len(df)), "date": ctx.run_date.isoformat()})
+        if ml < px - c.demote_margin:
+            ctx.store.execute("UPDATE model_registry SET active=0, status='demoted' WHERE model_version=?", (model_version,))
+            return True, f"近 30 天一致率 模型 {ml:.0%} vs 规则 {px:.0%}（n={len(df)}）"
+        return False, f"一致率 模型 {ml:.0%} vs 规则 {px:.0%}"
 
     # ------------------------------------------------------------------ 无监督兜底
     def _novelty_scores(self, ctx: AgentContext) -> Dict[str, float]:

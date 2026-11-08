@@ -13,6 +13,13 @@ thresholds:
   zero_days: 2               # 全天 0 电流连续天数 → A
   voltage_offset: 0.08       # 中午电压偏离同机中位 >8% → 电压异位（串长/MPPT 配置）
   rainy_streak_caution_days: 7   # 连续阴雨后首个晴天 → 低置信
+  stale_run_min: 90          # 日间连续 ≥90 分钟电流一动不动 → 半天钉死（数据问题），该日不参与互比
+  # 群组噪声门控（来自 Kaggle 两站真实数据：大电站"晴好天"各机互比偏差的稳健标准差可达 2%~7%）
+  noise_k: 2.5               # 偏差还要 ≤ -k×群组稳健标准差 才算显著低发
+  noise_skip: 0.04           # 群组稳健标准差 >4% 的"晴好天"按云影日处理：不计入也不打断持续度
+  cold_start_cap_grade: D    # 冷启动（晴好天基线样本不足）只凭互比偏差最高给 D
+  outage_min_slots: 2        # 白天 ≥1h 整段 0 输出而同机其它串正常 → 间歇停机/掉线
+  outage_rel_zero: 0.10      # ≤ 群组同时段 10% 视为"整段为 0"
 
 baseline:
   noon_start: "11:30"
@@ -28,15 +35,53 @@ confidence:
   mid: 0.50                  # ≥ 转人工复核，否则仅观察
   min_labels_for_ml: 60      # 标注不足用规则代理模型
   retrain_every_days: 30
+  # 模型生命周期：自训练 → 时间留出集考试 → 达标上线 → 线上监督 → 不达标回退
+  retrain_min_new_labels: 20 # 新增标注 ≥20 条即触发重训
+  holdout_fraction: 0.25     # 按时间留出最近 25%（≥10 条）考试
+  promote_tolerance: 0.02    # 挑战者准确率 ≥ 现役 − 2% 且 ≥ 规则代理 − 2% 才上线
+  demote_margin: 0.10        # 线上一致率比规则代理低 ≥10 个百分点 → 自动降级回规则代理
+  demote_min_samples: 20
 
 dispatch:
-  mode: draft                # draft: 生成草稿+人工一键确认；auto: 误报率连续1个月<10% 后放开
+  mode: gated                # draft: 永远草稿；auto: 门控通过即自动；gated: 连续达标自动放开、恶化自动收回（默认）
   channel: dryrun            # dryrun（写 outbox/*.md）| wecom（企业微信群机器人）
   wecom_webhook: null        # https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx
   auto_gate_fa_rate_max: 0.10
+  auto_gate_min_reviews: 30
+  gate_open_streak_days: 7   # gated：门控连续 7 个运行日通过才放开自动派单
+  gate_close_field_missed: 3 # gated：窗口内现场漏报 ≥3 起立即收回
+  gate_close_on_pipeline_fail: true   # 当天智能体失败 / 数据时延 >2 天 → 收回
   recheck_clear_days: 3      # 处理后 N 个晴好天复查归零
   site_visit_cost_yuan: 300
   merge_same_roof: true      # 同屋面多串合并区域工单
+
+autotune:                    # 阈值自调参闭环（复核结果当考题，影子回放，安全区间内一步，留痕可回滚）
+  enabled: true
+  mode: apply                # apply: 考试达标自动生效（写运行时覆盖层，本文件不动）；shadow: 只评估只建议
+  min_labels: 20             # 窗口内"纯偏差型"复核样本 ≥20 条才动
+  window_days: 60
+  cooldown_days: 7
+  min_f1_gain: 0.05
+  min_recall_keep: 0.80
+  fault_floor_bounds: [-0.08, -0.04]
+  persist_bounds: [2, 4]
+  noise_k_bounds: [2.0, 4.0]
+  rollback_confirm_drop: 0.10   # 生效后 B 级确认率下跌 ≥10 个百分点 → 自动回滚
+  loosen_on_field_missed: 3     # 现场漏报 ≥3 起 → 提议放松（只提议，不自动生效）
+
+ingest:                      # 数据接入自愈
+  heal_lookback_days: 14     # 回看 14 天补缺口
+  max_heal_days_per_run: 7
+  retries: 3
+  backoff_seconds: 5         # 5 → 10 → 20 秒
+  escalate_after_failures: 3 # 连续失败 ≥3 次升级 error 并推送
+  stale_data_alert_days: 2
+
+alerts:                      # 关键事件推送（管道 error / 自检 fail / 门控开合 / 模型上线降级 / 参数生效回滚）
+  enabled: true
+  wecom_webhook: null        # 为空沿用 dispatch.wecom_webhook；都为空写 data/outbox/alerts/<date>.md
+  min_level: error
+  dedupe_hours: 24
 
 loss:
   default_price_yuan_per_kwh: 0.60
@@ -53,6 +98,7 @@ loss:
     组件衰减/积灰: 200
     MPPT异常: 1500
     数据问题: 50
+    间歇停机/掉线: 200
 
 platforms:
   huawei: { base_quota: 24, devices_per_unit: 100, batch_days: 4, token_ttl_minutes: 30 }
@@ -65,3 +111,4 @@ platforms:
 #   ginlong: { key_id, key_secret, plant_id }
 #   sungrow: { appkey, access_key, user_account, user_password, ps_id, points_map: { pac: "p24", strings: { 1: {i: "p5", u: "p6"} } } }
 #   csv:     { root: ./import }     # 对接 F:\Hermes 已有拉数脚本的落地文件
+#   任意平台可加 fallback_csv_root: ./import —— 云平台连续拉取失败时自动降级读本地落地文件（自愈）

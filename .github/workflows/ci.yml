@@ -18,21 +18,37 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install
-        run: pip install -e ".[web,dev]"
-      - name: Unit + end-to-end tests（合成故障召回/误报、闭环、训练）
+        run: pip install -e ".[web,dev,bench]"
+      - name: Cache public datasets
+        uses: actions/cache@v4
+        with:
+          path: data/public
+          key: public-kaggle-solar-v1
+      - name: Fetch public datasets（GitHub 镜像 + sha256）
+        run: pvdiag public fetch kaggle_solar
+      - name: Unit + end-to-end + autonomy + public-data tests
         run: python -m pytest -q
-      - name: Demo smoke（simulate → backfill → report）
+      - name: Demo smoke（simulate → backfill → report → doctor）
         run: |
           pvdiag init --data-dir ./data
           pvdiag simulate --out ./demo --days 45 --load
           pvdiag backfill --start 2026-10-01 --end 2026-10-15 --no-ingest
           test -f data/reports/2026-10-15/report.md && head -40 data/reports/2026-10-15/report.md
-      - name: Upload demo report
+          pvdiag doctor --date 2026-10-15
+          pvdiag tune show
+          pvdiag gate status
+      - name: Public-data benchmark（Kaggle 两站 + NREL 标注片段 + 弱标注训练）
+        if: matrix.python-version == '3.12'
+        run: pvdiag bench --dataset all --out ./bench
+      - name: Upload reports
         if: matrix.python-version == '3.12'
         uses: actions/upload-artifact@v4
         with:
-          name: demo-report
-          path: data/reports/
+          name: reports
+          path: |
+            data/reports/
+            bench/bench_report.md
+            bench/bench_report.json
 
   docker:
     runs-on: ubuntu-latest

@@ -226,6 +226,35 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         dates = sorted([p.name for p in settings.reports_dir.iterdir() if (p / "report.json").exists()], reverse=True)
         return render("report.html", r=r, dates=dates[:30], date=d)
 
+    # ------------------------------------------------------------------ 自主运行
+    @app.get("/autonomy", response_class=HTMLResponse)
+    def autonomy():
+        from ..agents.tuning import TuningAgent, apply_overrides
+        eff = apply_overrides(settings, store)
+        gate = store.get_state("dispatch:gate") or {"effective": "draft", "streak": 0}
+        changes = store.query("SELECT run_date, param, old_value, new_value, status, reason FROM param_changes ORDER BY change_id DESC LIMIT 30")
+        models = store.query("SELECT model_version, trained_at, n_labels, active, status, metrics_json FROM model_registry ORDER BY trained_at DESC LIMIT 10")
+        if not models.empty:
+            def _exam(m):
+                ex = (json.loads(m or "{}").get("exam") or {})
+                f = lambda d: (f"{d['accuracy']:.0%}" if d and d.get("accuracy") is not None else "—")
+                return f"{f(ex.get('challenger'))} / {f(ex.get('rule_proxy'))} / {f(ex.get('incumbent'))}"
+            models["exam"] = models["metrics_json"].map(_exam)
+        hd = store.scalar("SELECT MAX(run_date) FROM health_checks")
+        health = store.query("SELECT name, status, detail FROM health_checks WHERE run_date=? ORDER BY check_id", (hd,)) if hd else pd.DataFrame()
+        ingest = [{"station_id": st, "last": (store.available_dates("string", st) or [None])[-1],
+                   "failures": int(store.get_state(f"ingest:{st}:failures", 0) or 0)} for st in store.stations()["station_id"]]
+        pushed = store.query("SELECT run_date, message FROM alerts WHERE source='notify' ORDER BY alert_id DESC LIMIT 10")
+        latest_rep = report_json(latest_date() or "") if latest_date() else {}
+        n_labels = int(store.scalar("SELECT COUNT(DISTINCT suspect_id) FROM reviews WHERE decision IN ('confirm','modify','reject')") or 0)
+        return render("autonomy.html", cfg_mode=settings.dispatch.mode, gate=gate, open_days=settings.dispatch.gate_open_streak_days,
+                      autotune=settings.autotune, current=TuningAgent.current_params(eff),
+                      overrides=store.query("SELECT param FROM param_overrides").pipe(recs),
+                      tuning_decision=(latest_rep.get("tuning") or {}).get("decision"), changes=changes.pipe(recs),
+                      models=models.pipe(recs) if not models.empty else [], live=store.get_state("model:live_agreement"),
+                      n_labels=n_labels, min_labels=settings.confidence.min_labels_for_ml, health=health.pipe(recs) if not health.empty else [],
+                      health_date=hd, ingest=ingest, pushed=pushed.pipe(recs))
+
     # ------------------------------------------------------------------ JSON API
     @app.get("/api/queue")
     def api_queue(station: Optional[str] = None):
@@ -376,7 +405,8 @@ def md_to_html(md: str) -> str:
                 close()
                 out.append("<ol>")
                 in_ol = True
-            out.append(f"<li>{inline(re.sub(r'^\d+\. ', '', s))}</li>")
+            item = re.sub(r"^\d+\. ", "", s)          # Python 3.11 的 f-string 表达式里不能带反斜杠
+            out.append(f"<li>{inline(item)}</li>")
         else:
             close()
             out.append(f"<p>{inline(s)}</p>")

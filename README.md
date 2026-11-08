@@ -6,7 +6,9 @@
 >
 > 一句话结论（来自需求表）：判定标准不取"某一天"，而是统计基线——以"晴好天中午窗口(11:30-13:30)、同逆变器各串电流中位数互比"为主力（辐照/温度天然归一），偏离 ≥5% 且连续 2 个晴好天即判异常；先用可解释规则引擎起步，人工复核结果作为标注数据喂养模型，逐步过渡到 AI 自动判定 + 自动派单。
 
-本仓库是该需求的 **v0.1 可运行实现**：10 个阶段 → 10 个智能体 + 每日闭环编排 + CLI + 人工复核 Web 界面，自带合成电站与故障注入，可在没有真实数据时跑通并验证召回/误报。
+本仓库是该需求的 **v0.2 可运行实现**：10 个阶段 → 11 个智能体 + 每日闭环编排 + CLI + 人工复核 Web 界面，自带合成电站与故障注入，可在没有真实数据时跑通并验证召回/误报。
+
+**v0.2 新增（自主运行 + 公开数据考试）**：阈值自调参闭环（影子回放 · 安全区间 · 留痕 · 自动回滚）、模型生命周期（时间留出集考试 · 达标上线 · 线上落后自动降级）、派单门控自动开合（连续达标放开 · 管道异常收回）、数据接入自愈（补缺口 · 重试 · 降级 · 升级告警）、`pvdiag doctor` 自检与关键事件推送、控制台「自主运行」页；并用 **Kaggle 两座真实电站（44 台逆变器）+ NREL 人工标注片段** 做了基准评测，据此新增「间歇停机/掉线」原因、群组噪声门控、冷启动分级上限、半天钉死检测等（[报告](docs/公开数据基准报告.md) · [说明](docs/自主运行与公开数据说明.md)）。
 
 ---
 
@@ -21,10 +23,13 @@
                  │  ⑤ ClassifyAgent 特征工程·树模型/规则代理·孤立森林兜底·置信度分流·可解释  │
                  │  ⑧ LossAgent     损失电量/电费台账（起算日=首次跌破-3%的晴好日）          │
                  │  ⑥ ReviewAgent   复核队列·标注回写·确认率统计·阈值调优建议               │
-                 │  ⑦ WorkOrderAgent 工单模板/优先级/区域合并·dryrun|企业微信·回填·复查归零  │
+                 │  ④' TuningAgent  阈值自调参：复核结果当考题·影子回放·安全区间·留痕·自动回滚   │
+                 │  ⑦ WorkOrderAgent 工单模板/优先级/区域合并·dryrun|企业微信·回填·复查归零·  │
+                 │                   门控自动开合(gated)                                   │
                  │  ⑨ RegionAgent   区域任务包·积灰签名(慢渐变+雨后恢复)·清洗效果验证        │
-                 │  ⑩ MonitorAgent  管道健康·配额/token·模型漂移(PSI)·KPI·自动派单门控       │
+                 │  ⑩ MonitorAgent  管道健康·配额/token·模型漂移(PSI)·KPI·健康自检·关键事件推送 │
                  └──────────────────────────────────────────────────────────────────┘
+                                   public/（Kaggle 两站 · NREL 标注片段 → pvdiag bench 考试）
                                    orchestrator.DailyPipeline（每日 / 历史回放）
                                    → data/reports/<date>/report.{json,md}
                                    → web/（FastAPI 复核界面）  → cli（pvdiag ...）
@@ -36,13 +41,15 @@
 | 阶段1 数据接入与治理 | `adapters/`（huawei/ginlong/sungrow/csv）`agents/ingest.py` `features.py` | ✅ 框架+CSV 可用；三家云 API 需用真实凭证联调字段 |
 | 阶段2 组串档案 | `agents/profile.py` | ✅ |
 | 阶段3 基线建模 | `agents/baseline.py` | ✅ |
-| 阶段4 异常检测（规则引擎） | `agents/detect.py` | ✅ |
-| 阶段5 AI 判定 | `agents/classify.py` | ✅ 冷启动规则代理 → 标注≥60 自动切树模型 |
-| 阶段6 人工复核平台 | `agents/review.py` `web/` | ✅ |
-| 阶段7 工单派发与闭环 | `agents/workorder.py` | ✅ dryrun + 企业微信 webhook |
+| 阶段4 异常检测（规则引擎） | `agents/detect.py` | ✅ v0.2：间歇停机/掉线签名、群组噪声门控、冷启动分级上限、半天钉死 |
+| 阶段4·块二 阈值调优 | `agents/tuning.py` | ✅ v0.2：自调参闭环（影子回放 → 达标生效 → 确认率下跌回滚） |
+| 阶段5 AI 判定 | `agents/classify.py` | ✅ 冷启动规则代理 → 标注≥60 自动训练；v0.2：时间留出集考试、达标上线、线上落后自动降级 |
+| 阶段6 人工复核平台 | `agents/review.py` `web/` | ✅ 控制台新增「自主运行」页 |
+| 阶段7 工单派发与闭环 | `agents/workorder.py` | ✅ dryrun + 企业微信 webhook；v0.2：`gated` 门控自动开合 |
 | 阶段8 损失量化 | `agents/loss.py` | ✅ |
 | 阶段9 区域检修/清洗 | `agents/region.py` | ✅ |
-| 阶段10 闭环自学习与监控 | `agents/monitor.py` `orchestrator.py` | ✅ |
+| 阶段10 闭环自学习与监控 | `agents/monitor.py` `health.py` `notify.py` `orchestrator.py` | ✅ v0.2：健康自检、关键事件推送、接入自愈 |
+| 公开数据基准 | `public/` | ✅ v0.2：Kaggle 两站 + NREL 标注片段，`pvdiag bench` |
 
 ## 2. 快速开始
 
@@ -69,8 +76,26 @@ pvdiag report --date 2026-10-30                      # 当日 Markdown 巡检报
 pvdiag review list                                   # 复核队列
 pvdiag wo list                                       # 工单（draft 草稿）
 pvdiag serve --port 8080                             # 复核 Web 界面 http://127.0.0.1:8080
-pytest -q                                            # 10 个测试：召回/误报、闭环、训练、单元
+pvdiag doctor                                        # 健康自检
+pytest -q                                            # 21 个测试：召回/误报、闭环、训练、自主运行、公开数据基准、单元
 ```
+
+### 2.2 公开数据考试（真实电站）
+
+```bash
+pip install -e ".[web,dev,bench]"
+pvdiag public fetch kaggle_solar                     # 4 个 CSV（GitHub 镜像，sha256 校验）→ data/public/kaggle_solar
+pvdiag bench --dataset all --out ./bench             # Kaggle 两站回放打分 + NREL 标注片段 + 弱标注训练，生成 bench_report.md
+pvdiag public load --plant 2 && pvdiag backfill --start 2020-05-15 --end 2020-06-17 --no-ingest && pvdiag serve   # 在控制台里看真实电站
+```
+
+| 考题 | 结果（v0.2） |
+|---|---|
+| Kaggle 44 台逆变器中 4 台持续低发 | 召回 **4/4** |
+| 20 台从未掉线的健康机器 | A/B 误报 **0/20**（v0.1 为 4/20） |
+| Plant 2 的 18 台间歇掉线机器 | **18/18** 识别为「间歇停机/掉线」（v0.1 全判遮挡） |
+| NREL 人工标注钉死日 / 限发日 | 钉死 4/4 零误报；限发 4/4、1 天误标 |
+| 弱标注训练（53 条、10 类）时间留出集 | 随机森林 69% vs 规则代理 54% → 达标上线 |
 
 合成故障与系统判定（30 天回放，36 串，全部命中、健康串零误报）：
 
@@ -85,6 +110,8 @@ pytest -q                                            # 10 个测试：召回/误
 | 串长档案错（电压 -9%） | 档案差异/串长（电压异位） | A → 核档案 |
 | 已备案遮挡 | 已备案（抑制，不报警） | — |
 | -4.5% 阶跃均匀低发 | 组件衰减/积灰 | B |
+| 间歇停机（每天随机 2h 掉到 0） | 间歇停机/掉线（白天整段 0 而同机正常，不是遮挡） | B |
+| 半天钉死（10:30 起冻结 3h） | 数据问题（stale_run_min ≥90） | A |
 | 整机 MPPT -8% | MPPT异常（机间互比，互比看不出） | B（整机级） |
 
 ## 3. 接入真实电站
@@ -118,6 +145,7 @@ macOS launchd / Windows 计划任务 / cron 任选其一每天 20:00 后执行�
 | 页面 | 作用 |
 |---|---|
 | 看板 `/` | **组串热力图**（行 = 逆变器，列 = pv 编号，颜色 = 当日互比偏差，描边 = 在办案例）+ 待复核 + 工单 + 损失台账 + 流水线状态 |
+| 自主运行 `/autonomy` | 派单门控状态与开合历史、运行口径与覆盖层、参数变更留痕、模型注册表与考试成绩、健康自检、接入自愈、已推送事件 |
 | 组串热力图 `/strings` | 全站/按站、按日切换；点格子进单串详情 |
 | 单串详情 `/string/{id}` | 当日电流曲线 vs 群组中位、45 天偏差趋势、档案、案例、近 10 日签名、事件 |
 | 复核队列 `/review` | 按分级/电站筛选，行内确认 / 驳回；详情页"下一条"连续复核 |
@@ -130,8 +158,15 @@ macOS launchd / Windows 计划任务 / cron 任选其一每天 20:00 后执行�
 - 现场回填实际原因/动作后自动登记事件（基线分段重置），3 个晴好天后自动复查：归零 → `verified`，未归零 → 自动重开
 - 误报率连续 1 个月 <10% 且复核样本 ≥30 后，可把 `dispatch.mode` 改为 `auto`（门控在 MonitorAgent 看板里实时显示）
 
-### 3.4 调优（阶段4 块二）
-`pvdiag review stats` 给出确认率；ReviewAgent 自动在日报中给阈值调优建议（B 级确认率 <50% → 收紧到 -6%/-7%；现场漏报多 → 放松到 -4%）。改 `config.yaml` 即生效，无需改代码。
+### 3.4 调优（阶段4 块二）—— v0.2 起自动
+`pvdiag review stats` 给出确认率；TuningAgent 把复核结果当考题，对候选阈值做影子回放，只在安全区间内走一步、考试达标才生效（写运行时覆盖层，`config.yaml` 不动），生效后确认率下跌自动回滚；放松只提议不自动生效。`pvdiag tune show|apply|rollback|clear`，或 `autotune.mode: shadow` 只看不动。
+
+### 3.5 自主运行（v0.2）
+- **模型**：标注够了自动训练，按时间留出最近 25% 考试，不低于规则代理/现役才上线；线上一致率落后 10 个百分点自动降级。`pvdiag model list|promote|demote`
+- **派单门控**：`dispatch.mode: gated`（默认）——误报率连续 7 个运行日达标自动放开 auto，智能体失败/数据时延/现场漏报立即收回；`draft` 永远草稿。`pvdiag gate status|open|close`
+- **接入自愈**：回看 14 天补缺口、重试退避、云平台失败降级读 `fallback_csv_root`、连续失败升级告警
+- **自检与推送**：`pvdiag doctor`；关键事件（管道 error / 自检 fail / 门控开合 / 模型上线降级 / 参数生效回滚）推企业微信或写 `outbox/alerts/`，24h 去重
+- 控制台 `/autonomy` 一屏看全。详见 [docs/自主运行与公开数据说明.md](docs/自主运行与公开数据说明.md)
 
 ## 4. 关键口径实现说明
 
@@ -140,7 +175,10 @@ macOS launchd / Windows 计划任务 / cron 任选其一每天 20:00 后执行�
 - **持续度**：`persist_days_5/3` 只在晴好天序列上计数；非晴好天沿用已有判定不新增
 - **限发**：逆变器功率"平顶"（连续 ≥6 点相对变化 ≤0.3% 且贴近额定）→ 该时段剔除出签名与损失
 - **停机/缺测**：全站 nodata 日不计入 0 电流连续天数（缺数据 ≠ 零发电）
-- **冷启动**：晴好天样本 <5 → 只做同日互比，置信度下调；全站集体衰减用机间互比 + 站级趋势提示兜底
+- **群组噪声门控**（v0.2，来自 Kaggle 两站）：每日算群组偏差稳健标准差 σ=1.4826·MAD；当日偏差还要 ≤ -k·σ（k=2.5）才算一次显著低发；σ>4% 的"晴好天"按云影日处理（不计入也不打断持续度）
+- **间歇停机/掉线**（v0.2）：白天 ≥1h 本串 ≤ 群组同时段 10% 而群组 ≥ 峰值 30% → 停机签名，近 7 日 ≥2 天判 B；停机日不计入互比持续度；停机不等于遮挡（遮挡不会到 0）
+- **冷启动**：晴好天样本 <5 → 只做同日互比，仅凭偏差最高给 D（v0.2），置信度下调；全站集体衰减用机间互比 + 站级趋势提示兜底
+- **数据冻结**（v0.2）：日间电流连续 ≥90 分钟一动不动 → 半天钉死，该日不参与互比中位数，连续 2 天判 A 数据问题；冻结机器的功率平顶不标限发
 - **案例连续性**：同一串的异常跨天是一个案例（suspect_id 固定），分级只升不降；驳回的案例 30 天内不重复报警（除非恶化 ≥5 个百分点或升级）；连续 3 个晴好天回到正常带自愈关闭
 - **损失**：仅晴好天累计，`Σ时段 max(0, 群组同时段中位电流×基线比 − 实际电流) × 群组电压 × 0.5h`，限发时段不计，峰谷平电价；起算日取 suspect_id 中的推定起始日
 
@@ -148,14 +186,16 @@ macOS launchd / Windows 计划任务 / cron 任选其一每天 20:00 后执行�
 
 ```
 pvdiag/
-  config.py        口径参数（YAML）         storage.py   SQLite + Parquet
-  models.py        统一数据模型/枚举        features.py  日特征/天气/平顶
+  config.py        口径参数（YAML）         storage.py   SQLite + Parquet（老库自动补列迁移）
+  models.py        统一数据模型/枚举        features.py  日特征/天气/平顶/钉死时长
   adapters/        huawei ginlong sungrow csv（QuotaPlanner）
-  agents/          ingest profile baseline detect classify loss review workorder region monitor
-  orchestrator.py  DailyPipeline（run/backfill/报告）
-  sim/synth.py     合成电站 + 故障注入        web/         FastAPI 复核界面（服务端 SVG 图，无外网依赖）
-  cli.py           pvdiag 命令行
-tests/             端到端召回/误报、闭环、训练、单元
+  agents/          ingest profile baseline detect classify loss review tuning workorder region monitor
+  orchestrator.py  DailyPipeline（run/backfill/报告；运行口径 = yaml + 自调参覆盖层）
+  health.py        健康自检（pvdiag doctor）   notify.py    关键事件推送（企业微信 / outbox，24h 去重）
+  public/          公开数据：datasets 下载校验 · kaggle_solar · nrel · bench（打分/弱标注训练/报告）
+  sim/synth.py     合成电站 + 12 种故障注入   web/         FastAPI 复核界面（服务端 SVG 图，无外网依赖）
+  cli.py           pvdiag 命令行（含 doctor / tune / gate / model / public / bench）
+tests/             端到端召回/误报、闭环、训练、自主运行、公开数据基准、单元
 deploy/            macOS 一键安装（launchd 每日巡检 + 常驻复核界面）
 docker/ Dockerfile docker-compose.yml   容器化体验/部署
 .devcontainer/     GitHub Codespaces 一键环境
@@ -185,6 +225,8 @@ bash deploy/install_mac.sh --demo     # .venv + 依赖 + 演示数据 + launchd�
 ## 7. 已知限制 / 下一步
 
 - 三家云 API 适配器按公开接口实现，**字段名与限流细节需用 F:\Hermes 现有工具包和真实凭证联调**
-- 天气标记无外部气象数据，"雨天"用阴雨日近似；有气象 API 时在 IngestAgent 填 `irradiance/rain`
-- 规则阈值是经验起步值；ML 模型需 ≥60 条人工标注后自动启用，首版可用历史人工判定结果灌入 `reviews`
-- 性能：36 串×30 天回放约 25 s；400 串规模每日任务约 1 分钟；万串规模建议把基线计算向量化或按站并行
+- 天气标记无外部气象数据时只看功率，"雨天"用阴雨日近似；有辐照（气象站/卫星）时自动用它校正（Kaggle 基准即如此）
+- 规则阈值是经验起步值；v0.2 起由 TuningAgent 按复核结果自动在安全区间内调；ML 模型需 ≥60 条标注后自动训练，考试达标才上线
+- 公开数据的"参考标签"是统计得出的弱标注，不是现场确认；弱标注训练验证的是链路和闸门，上生产仍以复核结论为准
+- Kaggle 数据是逆变器级，"同机互比"在那里是"同站各逆变器互比"；组串级真实数据的考试需要接入自有电站后用复核结论做
+- 性能：36 串×30 天回放约 25 s；Kaggle 22 路×34 天约 20 s/站；400 串规模每日任务约 1 分钟；万串规模建议把基线计算向量化或按站并行

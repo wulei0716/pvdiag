@@ -14,3 +14,5 @@ python-multipart>=0.0.6
 # 测试
 pytest>=7
 httpx>=0.24
+# 公开数据基准：NREL 标注片段随 pvanalytics 分发（pip install -e '.[bench]'）
+pvanalytics>=0.2

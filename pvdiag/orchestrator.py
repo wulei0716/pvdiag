@@ -24,6 +24,7 @@ from .agents.monitor import MonitorAgent
 from .agents.profile import ProfileAgent
 from .agents.region import RegionAgent
 from .agents.review import ReviewAgent
+from .agents.tuning import TuningAgent, apply_overrides
 from .agents.workorder import WorkOrderAgent
 from .config import Settings
 from .storage import Store
@@ -33,9 +34,10 @@ log = logging.getLogger("pvdiag")
 
 class DailyPipeline:
     def __init__(self, settings: Settings, store: Optional[Store] = None, ingest: bool = True, backfill_days: int = 0):
-        self.settings = settings
         settings.ensure_dirs()
         self.store = store or Store(settings.db_path, settings.samples_dir)
+        # 运行时口径 = config.yaml + 自调参覆盖层（param_overrides）
+        self.settings = apply_overrides(settings, self.store)
         self.ingest = ingest
         self.backfill_days = backfill_days
 
@@ -45,18 +47,20 @@ class DailyPipeline:
             chain.append(IngestAgent(backfill_days=self.backfill_days))
         chain += [ProfileAgent(), BaselineAgent(), DetectAgent(), ClassifyAgent(), LossAgent()]
         if not light:
-            chain += [ReviewAgent(), WorkOrderAgent(), RegionAgent(), MonitorAgent()]
+            chain += [ReviewAgent(), TuningAgent(), WorkOrderAgent(), RegionAgent(), MonitorAgent()]
         return chain
 
     # ------------------------------------------------------------------
     def run(self, run_date: Optional[date] = None, station_ids: Optional[List[str]] = None, write_report: bool = True) -> Dict:
         run_date = run_date or date.today()
         ctx = AgentContext(settings=self.settings, store=self.store, run_date=run_date, station_ids=station_ids)
+        ctx.shared["pipeline_started_at"] = datetime.now().isoformat()
         results: List[AgentResult] = []
+        retrain: Dict = {}
         for agent in self.agents(with_ingest=self.ingest):
+            if isinstance(agent, MonitorAgent):
+                retrain = self._maybe_retrain(ctx)          # 先重训再监控，监控才能把"上线/未过考"当天推送出去
             results.append(agent(ctx))
-        # 月度重训钩子
-        retrain = self._maybe_retrain(ctx)
         report = self.build_report(ctx, results, retrain)
         if write_report:
             self.write_report(report, run_date)
@@ -71,11 +75,15 @@ class DailyPipeline:
         d = start
         while d <= end:
             ctx = AgentContext(settings=self.settings, store=self.store, run_date=d, station_ids=station_ids)
+            ctx.shared["pipeline_started_at"] = datetime.now().isoformat()
             light = d < end
+            retrain: Dict = {}
             for agent in self.agents(with_ingest=False, light=light):
+                if isinstance(agent, MonitorAgent):
+                    retrain = self._maybe_retrain(ctx)
                 agent(ctx)
             if not light:
-                rep = self.build_report(ctx, list(ctx.shared.values()), self._maybe_retrain(ctx))
+                rep = self.build_report(ctx, [v for v in ctx.shared.values() if isinstance(v, AgentResult)], retrain)
                 self.write_report(rep, d)
                 out.append(rep)
             d += timedelta(days=1)
@@ -83,12 +91,18 @@ class DailyPipeline:
 
     # ------------------------------------------------------------------
     def _maybe_retrain(self, ctx: AgentContext) -> Dict:
-        last = ctx.store.query("SELECT trained_at FROM model_registry WHERE active=1")
-        due = last.empty or (datetime.now() - datetime.fromisoformat(last["trained_at"].iloc[0])).days >= ctx.settings.confidence.retrain_every_days
+        """模型生命周期钩子：按触发条件重训 → 留出集考试 → 达标才上线（不达标继续用现役/规则代理）"""
+        psi = (ctx.store.get_state("monitor:psi") or {}).get("value")      # 上一次监控算出的偏差分布漂移
+        due, why = ClassifyAgent.retrain_due(ctx, drift_psi=psi)
         if not due:
-            return {"trained": False, "reason": "未到重训周期"}
+            return {"trained": False, "reason": why}
         try:
-            return ClassifyAgent().train(ctx)
+            res = ClassifyAgent().train(ctx, reason=why)
+            if res.get("trained"):
+                msg = (f"模型 {res['version']} {'已上线' if res.get('promoted') else '未上线（考试不达标）'}：{why}；"
+                       f"考试 {json.dumps(res.get('exam', {}).get('challenger'), ensure_ascii=False)} vs 规则 {json.dumps(res.get('exam', {}).get('rule_proxy'), ensure_ascii=False)}")
+                ctx.store.alert(ctx.run_date, "info", "classify", msg)
+            return res
         except Exception as e:
             ctx.store.alert(ctx.run_date, "warn", "classify", f"重训失败: {e}")
             return {"trained": False, "reason": str(e)}
@@ -118,6 +132,8 @@ class DailyPipeline:
             "region": ctx.shared.get("region_artifacts", {}),
             "board": ctx.shared.get("board", {}),
             "retrain": retrain,
+            "tuning": ctx.shared.get("tuning_state", {}),
+            "dispatch_gate": ctx.shared.get("dispatch_gate", {}),
             "alerts": clean(alerts),
         }
 
@@ -217,7 +233,29 @@ def render_markdown(r: Dict) -> str:
         L.append(f"- 挽回电量 {k.get('recovered_kwh')} kWh ≈ {k.get('recovered_yuan')} 元 · 待修复损失 {k.get('open_loss_yuan')} 元")
         L.append(f"- 模型：{b.get('model', {}).get('active')}，标注 {b.get('model', {}).get('n_labels')} 条，偏差分布 PSI {b.get('model', {}).get('dev_psi_7d_vs_prev')}")
         g = b.get("auto_dispatch_gate", {})
-        L.append(f"- 自动派单门控：mode={g.get('mode')} passed={g.get('passed')}（{g.get('reason')}）")
+        L.append(f"- 自动派单门控：配置 {g.get('mode')} / 当前 **{g.get('effective', 'draft')}**（门控 {'通过' if g.get('passed') else '未通过'}：{g.get('reason')}；{g.get('state_reason') or ''}）")
+        h = b.get("health", {})
+        if h:
+            L.append(f"- 健康自检：{h.get('ok')} 项正常 / {h.get('warn')} 项提醒 / {h.get('fail')} 项失败" + (
+                "：" + "；".join(f"{c['name']}（{c['detail']}）" for c in h.get("checks", []) if c["status"] == "fail") if h.get("fail") else ""))
+        L.append("")
+    t = r.get("tuning", {})
+    rt = r.get("retrain", {})
+    if t or rt:
+        L.append("## 自主运行（自调参 / 模型生命周期）")
+        if t:
+            L.append(f"- 阈值自调参（{t.get('mode')}）：{t.get('decision')}")
+            if t.get("loosen_proposal"):
+                L.append(f"- 放松提议：{t['loosen_proposal']['text']}")
+            if (t.get("rollback") or {}).get("rolled_back"):
+                L.append(f"- 已回滚：{t['rollback']['param']} → {t['rollback']['old_value']}（{t['rollback']['reason']}）")
+        if rt:
+            if rt.get("trained"):
+                ex = rt.get("exam", {})
+                L.append(f"- 模型：{rt.get('version')} {'已上线' if rt.get('promoted') else '考试未过，未上线'}（{rt.get('reason')}）；"
+                         f"留出集 挑战者 {ex.get('challenger')} / 规则代理 {ex.get('rule_proxy')} / 现役 {ex.get('incumbent')}")
+            else:
+                L.append(f"- 模型：{rt.get('reason')}")
         L.append("")
     if r.get("alerts"):
         L.append("## 告警")
