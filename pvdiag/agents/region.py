@@ -58,7 +58,7 @@ class RegionAgent(Agent):
             out.append({"station_id": st, "roof_area": roof, "n_strings": int(len(g)),
                         "strings": g["string_id"].tolist(), "causes": g["rule_cause"].value_counts().to_dict(),
                         "loss_kwh_total": round(k, 1), "loss_yuan_total": round(y, 1), "loss_kwh_per_day": round(per_day, 2),
-                        "priority": round(per_day * price * ctx.settings.loss.expected_fault_days_default / cost, 2)})
+                        "priority": round(per_day * price * ctx.settings.loss.expected_fault_days_default / max(cost, 1.0), 2)})   # 朝向差异修复成本 0 → 防除零（压测发现）
         return sorted(out, key=lambda r: -r["priority"])
 
     # ------------------------------------------------------------------ 积灰签名

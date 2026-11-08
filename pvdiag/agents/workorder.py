@@ -300,6 +300,24 @@ class WorkOrderAgent(Agent):
             r = store.query("SELECT scope, inverter_id FROM suspects WHERE suspect_id=?", (sid,))
             if not r.empty and r["scope"].iloc[0] == "inverter":
                 ProfileAgent.add_event(store, "inverter", r["inverter_id"].iloc[0], ev.value, done_date, f"{wo_id} {field_cause}")
+        # 现场回填是最可靠的标注：按实际原因给工单里每个嫌疑写一条复核记录（原因一致→confirm，不一致→modify，"正常/误报/无异常"→reject）
+        normal_words = ("正常", "误报", "无异常", "未发现")
+        for sid in json.loads(wo["suspect_ids_json"]):
+            r = store.query("SELECT rule_cause FROM suspects WHERE suspect_id=?", (sid,))
+            if r.empty:
+                continue
+            already = store.scalar("SELECT COUNT(*) FROM reviews WHERE suspect_id=? AND reviewer='field'", (sid,)) or 0
+            if already:
+                continue
+            if any(w in (field_cause or "") for w in normal_words):
+                store.execute("INSERT INTO reviews (suspect_id, reviewer, decision, true_cause, reject_reason, note, reviewed_at) VALUES (?,?,?,?,?,?,?)",
+                              (sid, "field", "reject", Cause.NORMAL.value, "其他", f"{wo_id} 现场：{field_cause}", datetime.now().isoformat()))
+            else:
+                known = field_cause if field_cause in [c.value for c in Cause] else r["rule_cause"].iloc[0]
+                decision = "confirm" if known == r["rule_cause"].iloc[0] else "modify"
+                store.execute("INSERT INTO reviews (suspect_id, reviewer, decision, true_cause, reject_reason, note, reviewed_at) VALUES (?,?,?,?,?,?,?)",
+                              (sid, "field", decision, known, None, f"{wo_id} 现场：{field_cause} / {field_action}", datetime.now().isoformat()))
+                store.execute("UPDATE suspects SET rule_cause=? WHERE suspect_id=? AND rule_cause=?", (known, sid, Cause.UNKNOWN.value))
         # closed_at 记录"现场处理日"（而非录入时刻），复查以此为起点
         closed_at = datetime.combine(done_date, datetime.now().time()).isoformat()
         store.execute(

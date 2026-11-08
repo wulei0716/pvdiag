@@ -17,7 +17,8 @@
   pvdiag gate status|open|close                          派单门控：状态 / 手动放开 / 手动收回
   pvdiag model list|promote|demote                       模型注册表：列出 / 指定版本上线 / 降级回规则代理
   pvdiag public fetch|load|list                          公开数据：下载（GitHub 镜像+sha256）/ 转成电站入库 / 列表
-  pvdiag bench [--dataset kaggle|nrel|all] [--out DIR]   公开数据基准评测（召回/误报/停机识别/钉死/限发）
+  pvdiag bench [--dataset kaggle|nrel|train|all]         公开数据基准评测（召回/误报/停机识别/钉死/限发/弱标注训练）
+  pvdiag soak --days 180 --stations 2                    连续运行压测：模拟复核员/主管/现场，看自调参/模型/门控长期行为
 """
 from __future__ import annotations
 
@@ -349,6 +350,24 @@ def cmd_bench(args):
     print("报告：", p)
 
 
+def cmd_soak(args):
+    from .sim.soak import SoakConfig, SoakRunner, write_report
+    s = _settings(args, with_overrides=False)
+    cfg = SoakConfig(days=args.days, n_stations=args.stations, n_inverters=args.inverters, strings_per_inverter=args.strings,
+                     seed=args.seed, fault_rate=args.fault_rate, reviewer_error=args.reviewer_error)
+    out = Path(args.out or (s.data_dir / "soak"))
+    runner = SoakRunner(cfg, out / "world", s)
+    runner.build_world()
+    print(f"世界已生成：{cfg.n_stations} 站 × {cfg.n_inverters * cfg.strings_per_inverter} 串 × {cfg.days} 天，注入故障 {len(runner.truth)} 个")
+    summary = runner.run(progress=lambda d, snap: print(f"  {d} 嫌疑 {snap['suspects']} 误报率 {snap['false_alarm_rate']} 门控 {snap['gate_effective']} "
+                                                       f"模型 {snap['model']} 标注 {snap['n_labels']} 覆盖层 {snap['overrides']}"))
+    p = write_report(summary, out)
+    print(f"召回 {summary['faults_recalled_ab']}/{summary['faults_injected']}，健康串误报 {summary['healthy_false_alarm_ab_strings']}，"
+          f"整体误报率 {summary['false_alarm_rate_overall']}，门控 auto {summary['gate']['days_auto']} 天，模型{'已' if summary['model_promoted'] else '未'}上线，"
+          f"自调参生效 {summary['autotune']['applied']} 回滚 {summary['autotune']['rolled_back']}，振荡 {summary['autotune']['oscillation']}")
+    print("报告：", p)
+
+
 def main(argv=None):
     # 全局选项既可放在子命令前，也可放在子命令后
     common = argparse.ArgumentParser(add_help=False)
@@ -389,6 +408,10 @@ def main(argv=None):
     p = add("model"); p.add_argument("action", choices=["list", "promote", "demote"]); p.add_argument("version", nargs="?"); p.set_defaults(fn=cmd_model)
     p = add("public"); p.add_argument("action", choices=["list", "fetch", "load"]); p.add_argument("name", nargs="?")
     p.add_argument("--plant", type=int); p.add_argument("--public-dir"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_public)
+    p = add("soak"); p.add_argument("--days", type=int, default=180); p.add_argument("--stations", type=int, default=2)
+    p.add_argument("--inverters", type=int, default=3); p.add_argument("--strings", type=int, default=12); p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--fault-rate", type=float, default=0.004); p.add_argument("--reviewer-error", type=float, default=0.08); p.add_argument("--out")
+    p.set_defaults(fn=cmd_soak)
     p = add("bench"); p.add_argument("--dataset", choices=["kaggle", "nrel", "train", "all"], default="all"); p.add_argument("--out")
     p.add_argument("--public-dir"); p.set_defaults(fn=cmd_bench)
 
