@@ -76,11 +76,15 @@ class Confidence(BaseModel):
 
 
 class DispatchCfg(BaseModel):
-    mode: str = "draft"                  # draft: 生成草稿待人工确认; auto: 高置信自动发送
+    mode: str = "gated"                  # draft: 永远草稿待人工确认; auto: 门控通过即自动发送; gated: 门控连续达标自动放开、恶化自动收回（默认）
     channel: str = "dryrun"              # dryrun | wecom
     wecom_webhook: Optional[str] = None  # 企业微信群机器人 webhook
     auto_gate_fa_rate_max: float = 0.10  # 误报率连续1个月<10% 才允许 auto
     auto_gate_window_days: int = 30
+    auto_gate_min_reviews: int = 30      # 窗口内复核样本至少 30 条
+    gate_open_streak_days: int = 7       # gated：门控连续通过 ≥7 个运行日才放开自动派单（滞回，防抖）
+    gate_close_field_missed: int = 3     # gated：窗口内现场漏报 ≥3 起立即收回
+    gate_close_on_pipeline_fail: bool = True   # gated：当天任一智能体失败 / 数据时延 >2 天 → 收回（数据管道不健康时不自动派人）
     recheck_clear_days: int = 3          # 处理后 N 个晴好天复查
     site_visit_cost_yuan: float = 300.0  # 误派一次现场核查成本（用于优先级与门控）
     merge_same_roof: bool = True         # 同屋面多串合并区域工单
@@ -120,6 +124,41 @@ class PlatformCfg(BaseModel):
     sungrow_same_day_available: bool = False  # 阳光不返回当天数据
 
 
+class AutotuneCfg(BaseModel):
+    """自调参闭环：用人工复核结果给规则阈值"考试"，只在安全区间内小步调整，留痕、可回滚。"""
+    enabled: bool = True
+    mode: str = "apply"                  # apply: 达标自动生效（写 param_overrides，不改 config.yaml）; shadow: 只评估、只建议
+    min_labels: int = 20                 # 窗口内"纯偏差型"复核样本至少 20 条才动阈值
+    window_days: int = 60                # 评估窗口
+    cooldown_days: int = 7               # 两次调整至少间隔 7 天
+    min_f1_gain: float = 0.05            # 候选参数在留出的复核样本上 F1 至少提升 5 个百分点
+    min_recall_keep: float = 0.80        # 调整后对"已确认"案例的召回不得低于当前的 80%
+    step_floor: float = 0.01             # 阈值步长 1 个百分点
+    fault_floor_bounds: List[float] = Field(default_factory=lambda: [-0.08, -0.04])
+    persist_bounds: List[int] = Field(default_factory=lambda: [2, 4])
+    noise_k_bounds: List[float] = Field(default_factory=lambda: [2.0, 4.0])
+    rollback_confirm_drop: float = 0.10  # 生效后 B 级确认率比生效前低 ≥10 个百分点（≥10 条新复核）→ 自动回滚
+    loosen_on_field_missed: int = 3      # 窗口内现场漏报 ≥3 起 → 提议放松一步（放松无法用已有标注验证，只提议不自动生效）
+
+
+class IngestCfg(BaseModel):
+    """数据接入自愈：缺口自动补拉、失败重试退避、降级到本地文件、连续失败升级告警。"""
+    heal_lookback_days: int = 14         # 每次运行回看 14 天，缺哪天补哪天（不只是 backfill_days 窗口）
+    max_heal_days_per_run: int = 7       # 单次最多补 7 天（控制配额）
+    retries: int = 3                     # 适配器拉取失败重试次数
+    backoff_seconds: float = 5.0         # 指数退避起始秒数（5, 10, 20）
+    escalate_after_failures: int = 3     # 连续失败 ≥3 次升级为 error 告警并推送
+    stale_data_alert_days: int = 2       # 数据时延 >2 天告警
+
+
+class AlertCfg(BaseModel):
+    """关键告警推送（企业微信或 outbox 文件），24h 内相同内容不重复推。"""
+    enabled: bool = True
+    wecom_webhook: Optional[str] = None  # 为空则沿用 dispatch.wecom_webhook；都为空 → 写 data/outbox/alerts/<date>.md
+    min_level: str = "error"             # error | warn：推送级别门槛（门控开合、模型上线/降级、参数生效/回滚 总是推送）
+    dedupe_hours: int = 24
+
+
 class Settings(BaseModel):
     data_dir: Path = Path("./data")
     timezone: str = "Asia/Shanghai"
@@ -129,6 +168,9 @@ class Settings(BaseModel):
     dispatch: DispatchCfg = DispatchCfg()
     loss: LossCfg = LossCfg()
     platforms: PlatformCfg = PlatformCfg()
+    autotune: AutotuneCfg = AutotuneCfg()
+    ingest: IngestCfg = IngestCfg()
+    alerts: AlertCfg = AlertCfg()
 
     # ---- 派生路径 ----
     @property

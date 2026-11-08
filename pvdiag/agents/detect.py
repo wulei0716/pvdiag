@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -275,7 +276,9 @@ class DetectAgent(Agent):
             key = bl.loc[sid, "group_key"] if bl.loc[sid, "group_level"] == "group" else prof.loc[sid, "inverter_id"]
             vec = np.array([np.nan if v is None else v for v in json.loads(row["i_profile_json"])], dtype=float)
             curves.setdefault(key, []).append(vec)
-        return {k: np.nanmedian(np.vstack(v), axis=0) for k, v in curves.items() if len(v) >= 3}
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)      # 夜间槽全 NaN 属正常
+            return {k: np.nanmedian(np.vstack(v), axis=0) for k, v in curves.items() if len(v) >= 3}
 
     @staticmethod
     def _voltage_offsets(ft: pd.DataFrame, prof: pd.DataFrame, bl: pd.DataFrame) -> Dict[str, float]:

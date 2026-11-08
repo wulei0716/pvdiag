@@ -51,7 +51,7 @@ DATASETS: Dict[str, PublicDataset] = {
     # NREL 片段随 pvanalytics 包分发（pip install pvanalytics），无需单独下载
     "nrel_pvanalytics": PublicDataset(
         key="nrel_pvanalytics",
-        title="NREL 真实逆变器片段（pvanalytics 自带：ac_power_inv_2173 钉死/插值标注、ac_power_inv_7539 离群标注、SERF East 限发）",
+        title="NREL 真实逆变器片段（pvanalytics 自带：ac_power_inv_2173 钉死标注、ac_power_inv_7539 限发标注）",
         license_note="pvanalytics (MIT) 随包分发的 NREL 数据；pip install pvanalytics 即得",
         source="https://github.com/pvlib/pvanalytics/tree/main/pvanalytics/data",
     ),

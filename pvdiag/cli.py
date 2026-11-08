@@ -9,9 +9,15 @@
   pvdiag review list|confirm|reject|batch                复核操作
   pvdiag wo list|show|send|close                         工单操作
   pvdiag event add --scope string --target X --type cleaning --date 2026-10-20
-  pvdiag train                                           用标注训练/重训分类模型
+  pvdiag train                                           用标注训练/重训分类模型（考试达标才上线；--force 强制上线）
   pvdiag report --date 2026-10-30                        打印当日 Markdown 报告
   pvdiag serve --port 8080                               人工复核 Web 界面
+  pvdiag doctor [--vacuum]                               健康自检（数据库/磁盘/数据新鲜度/调度/模型/配置）
+  pvdiag tune show|apply|rollback|clear                  自调参：查看评估与变更留痕 / 手动生效某参数 / 回滚 / 清空覆盖层
+  pvdiag gate status|open|close                          派单门控：状态 / 手动放开 / 手动收回
+  pvdiag model list|promote|demote                       模型注册表：列出 / 指定版本上线 / 降级回规则代理
+  pvdiag public fetch|load|list                          公开数据：下载（GitHub 镜像+sha256）/ 转成电站入库 / 列表
+  pvdiag bench [--dataset kaggle|nrel|all] [--out DIR]   公开数据基准评测（召回/误报/停机识别/钉死/限发）
 """
 from __future__ import annotations
 
@@ -28,11 +34,14 @@ from .config import Settings
 from .storage import Store
 
 
-def _settings(args) -> Settings:
+def _settings(args, with_overrides: bool = True) -> Settings:
     s = Settings.load(args.config)
     if getattr(args, "data_dir", None):
         s.data_dir = Path(args.data_dir)
     s.ensure_dirs()
+    if with_overrides:
+        from .agents.tuning import apply_overrides
+        s = apply_overrides(s, Store(s.db_path, s.samples_dir))
     return s
 
 
@@ -190,6 +199,148 @@ def cmd_serve(args):
     uvicorn.run(create_app(s), host=args.host, port=args.port)
 
 
+def cmd_doctor(args):
+    from .health import run_health_checks, summarize, vacuum
+    s = _settings(args)
+    store = Store(s.db_path, s.samples_dir)
+    checks = run_health_checks(s, store, date.today())
+    icon = {"ok": "✅", "warn": "⚠️ ", "fail": "❌"}
+    for c in checks:
+        print(f"{icon[c['status']]} {c['name']}: {c['detail']}")
+    sm = summarize(checks)
+    print(f"\n{sm['ok']} 项正常 / {sm['warn']} 项提醒 / {sm['fail']} 项失败")
+    if args.vacuum:
+        print(vacuum(store))
+    sys.exit(1 if sm["fail"] else 0)
+
+
+def cmd_tune(args):
+    from .agents.tuning import TUNABLE, TuningAgent, set_param
+    from .agents.base import AgentContext
+    s = _settings(args)
+    store = Store(s.db_path, s.samples_dir)
+    pd.set_option("display.width", 220)
+    if args.action == "show":
+        print("当前运行口径：", json.dumps(TuningAgent.current_params(s), ensure_ascii=False))
+        ov = store.query("SELECT * FROM param_overrides")
+        print("覆盖层：", "无" if ov.empty else "")
+        if not ov.empty:
+            print(ov.to_string(index=False))
+        ch = store.query("SELECT change_id, run_date, param, old_value, new_value, status, reason FROM param_changes ORDER BY change_id DESC LIMIT 20")
+        print("\n变更留痕（最近 20 条）：", "无" if ch.empty else "")
+        if not ch.empty:
+            print(ch.to_string(index=False))
+        ctx = AgentContext(settings=s, store=store, run_date=date.today())
+        cases = TuningAgent.labeled_cases(ctx, s.autotune.window_days)
+        print(f"\n窗口内纯偏差型复核样本 {len(cases)} 条（正例 {sum(c['label'] for c in cases)}）")
+        if len(cases) >= 5:
+            agent = TuningAgent()
+            table = agent.evaluate_grid(ctx, cases, TuningAgent.current_params(s))
+            print(pd.DataFrame(table)[["params", "precision", "recall", "f1", "is_current"]].to_string(index=False))
+    elif args.action == "apply":
+        if args.param not in TUNABLE:
+            sys.exit(f"可调参数：{list(TUNABLE)}")
+        val = TUNABLE[args.param](args.value)
+        old = json.dumps(TuningAgent.current_params(s)[args.param])
+        store.execute("INSERT OR REPLACE INTO param_overrides (param, value_json, updated_at, source) VALUES (?,?,?,?)",
+                      (args.param, json.dumps(val), datetime.now().isoformat(), "manual"))
+        store.execute("INSERT INTO param_changes (run_date, param, old_value, new_value, reason, metrics_json, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                      (date.today().isoformat(), args.param, old, json.dumps(val), args.note or "人工生效", "{}", "applied", datetime.now().isoformat()))
+        print(f"已生效 {args.param} {old}→{val}（写入覆盖层，config.yaml 未改）")
+    elif args.action == "rollback":
+        ch = store.query("SELECT * FROM param_changes WHERE status='applied' ORDER BY change_id DESC LIMIT 1")
+        if ch.empty:
+            sys.exit("没有生效中的自动/人工调整")
+        c = ch.iloc[0]
+        store.execute("INSERT OR REPLACE INTO param_overrides (param, value_json, updated_at, source) VALUES (?,?,?,?)",
+                      (c["param"], c["old_value"], datetime.now().isoformat(), "rollback"))
+        store.execute("UPDATE param_changes SET status='rolled_back', rolled_back_at=? WHERE change_id=?", (datetime.now().isoformat(), int(c["change_id"])))
+        print(f"已回滚 {c['param']} → {c['old_value']}")
+    elif args.action == "clear":
+        store.execute("DELETE FROM param_overrides")
+        store.execute("UPDATE param_changes SET status='rolled_back', rolled_back_at=? WHERE status='applied'", (datetime.now().isoformat(),))
+        print("覆盖层已清空，回到 config.yaml 口径")
+
+
+def cmd_gate(args):
+    s = _settings(args)
+    store = Store(s.db_path, s.samples_dir)
+    state = store.get_state("dispatch:gate") or {"effective": "draft", "streak": 0}
+    if args.action == "status":
+        print(json.dumps({"config_mode": s.dispatch.mode, **state}, ensure_ascii=False, indent=2, default=str))
+    else:
+        eff = "auto" if args.action == "open" else "draft"
+        state.update({"effective": eff, "streak": s.dispatch.gate_open_streak_days if eff == "auto" else 0,
+                      "since": date.today().isoformat(), "reason": f"人工 {args.action}"})
+        hist = state.get("history", []); hist.append({"date": date.today().isoformat(), "event": f"人工 {args.action} → {eff}"}); state["history"] = hist[-20:]
+        store.set_state("dispatch:gate", state)
+        print(f"派单门控已{'放开（auto）' if eff == 'auto' else '收回（draft）'}；下次巡检若条件不满足仍会按 gated 规则自动调整")
+
+
+def cmd_model(args):
+    s = _settings(args)
+    store = Store(s.db_path, s.samples_dir)
+    pd.set_option("display.width", 220)
+    if args.action == "list":
+        df = store.query("SELECT model_version, trained_at, n_labels, active, status, metrics_json FROM model_registry ORDER BY trained_at DESC")
+        if df.empty:
+            print("无模型（规则代理）"); return
+        df["exam"] = df["metrics_json"].map(lambda m: json.dumps((json.loads(m or "{}").get("exam") or {}).get("challenger"), ensure_ascii=False))
+        print(df.drop(columns=["metrics_json"]).to_string(index=False))
+        print("线上一致率：", store.get_state("model:live_agreement"))
+    elif args.action == "promote":
+        store.execute("UPDATE model_registry SET active=0, status=CASE WHEN status='active' THEN 'retired' ELSE status END")
+        store.execute("UPDATE model_registry SET active=1, status='active' WHERE model_version=?", (args.version,))
+        print(f"已上线 {args.version}")
+    elif args.action == "demote":
+        store.execute("UPDATE model_registry SET active=0, status='demoted' WHERE active=1")
+        print("已降级回规则代理")
+
+
+def cmd_public(args):
+    from .public import DATASETS, dataset_dir, fetch_dataset
+    if args.action == "list":
+        for k, d in DATASETS.items():
+            print(f"{k}: {d.title}\n    {d.license_note}\n    {d.source}")
+    elif args.action == "fetch":
+        keys = [args.name] if args.name else [k for k, d in DATASETS.items() if d.files]
+        for k in keys:
+            print(k, "→", fetch_dataset(k, args.public_dir, force=args.force))
+    elif args.action == "load":
+        from .public.kaggle_solar import load_kaggle_plant
+        from .public.bench import load_bundle
+        s = _settings(args)
+        root = dataset_dir("kaggle_solar", args.public_dir)
+        if not root.exists():
+            fetch_dataset("kaggle_solar", args.public_dir)
+        for plant in ([args.plant] if args.plant else [1, 2]):
+            b = load_kaggle_plant(root, plant)
+            store = load_bundle(s, b)
+            ts = pd.to_datetime(b["samples_strings"]["ts"])
+            print(f"已入库 Kaggle Plant {plant} → 电站 {b['stations']['station_id'].iloc[0]}（{len(b['strings'])} 路，{ts.min().date()}~{ts.max().date()}）；"
+                  f"回放：pvdiag backfill --start {ts.min().date()} --end {ts.max().date()} --no-ingest")
+            store.close()
+
+
+def cmd_bench(args):
+    from .public.bench import bench_kaggle, bench_nrel, write_report
+    s = _settings(args, with_overrides=False)
+    out = Path(args.out or (s.data_dir / "bench"))
+    work = out / "work"
+    rep = {"generated_at": datetime.now().isoformat(timespec="minutes")}
+    if args.dataset in ("kaggle", "all"):
+        rep["kaggle"] = bench_kaggle(work, s, public_root=args.public_dir)
+        print("Kaggle:", json.dumps(rep["kaggle"]["summary"], ensure_ascii=False))
+    if args.dataset in ("nrel", "all"):
+        try:
+            rep["nrel"] = bench_nrel(work, s)
+            print("NREL:", json.dumps(rep["nrel"]["summary"], ensure_ascii=False))
+        except ImportError as e:
+            print("NREL 跳过：", e)
+    p = write_report(rep, out)
+    print("报告：", p)
+
+
 def main(argv=None):
     # 全局选项既可放在子命令前，也可放在子命令后
     common = argparse.ArgumentParser(add_help=False)
@@ -223,6 +374,15 @@ def main(argv=None):
     p = add("train"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_train)
     p = add("report"); p.add_argument("--date"); p.set_defaults(fn=cmd_report)
     p = add("serve"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8080); p.set_defaults(fn=cmd_serve)
+    p = add("doctor"); p.add_argument("--vacuum", action="store_true"); p.set_defaults(fn=cmd_doctor)
+    p = add("tune"); p.add_argument("action", choices=["show", "apply", "rollback", "clear"]); p.add_argument("param", nargs="?")
+    p.add_argument("value", nargs="?"); p.add_argument("--note"); p.set_defaults(fn=cmd_tune)
+    p = add("gate"); p.add_argument("action", choices=["status", "open", "close"]); p.set_defaults(fn=cmd_gate)
+    p = add("model"); p.add_argument("action", choices=["list", "promote", "demote"]); p.add_argument("version", nargs="?"); p.set_defaults(fn=cmd_model)
+    p = add("public"); p.add_argument("action", choices=["list", "fetch", "load"]); p.add_argument("name", nargs="?")
+    p.add_argument("--plant", type=int); p.add_argument("--public-dir"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_public)
+    p = add("bench"); p.add_argument("--dataset", choices=["kaggle", "nrel", "all"], default="all"); p.add_argument("--out")
+    p.add_argument("--public-dir"); p.set_defaults(fn=cmd_bench)
 
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")

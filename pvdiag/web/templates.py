@@ -108,6 +108,7 @@ dl.kv{display:grid;grid-template-columns:max-content 1fr;gap:6px 14px;margin:0}d
   <a class="item {% if active=='review' %}on{% endif %}" href="/review">复核队列 <span class="cnt {% if pending_n %}hot{% endif %}">{{ pending_n }}</span></a>
   <a class="item {% if active=='wo' %}on{% endif %}" href="/workorders">工单 <span class="cnt">{{ draft_n }}</span></a>
   <a class="item {% if active=='report' %}on{% endif %}" href="/reports">每日报告</a>
+  <a class="item {% if active=='autonomy' %}on{% endif %}" href="/autonomy">自主运行</a>
   <div class="foot">最近巡检日 {{ latest or '—' }}<br>{{ now }}</div>
 </nav>
 <main>{% block body %}{% endblock %}</main>
@@ -339,5 +340,42 @@ REPORT = r"""{% extends "base.html" %}{% set active='report' %}{% block title %}
 </div></div>{% endif %}
 {% endblock %}"""
 
-TEMPLATES = {"base.html": BASE, "index.html": INDEX, "strings.html": STRINGS, "string.html": STRING, "review.html": REVIEW,
+
+AUTONOMY = r"""{% extends "base.html" %}{% set active='autonomy' %}{% block title %}自主运行{% endblock %}{% block body %}
+<div class="top"><h1>自主运行</h1><span class="sub">系统自己在调什么、为什么、怎么撤回</span></div>
+<div class="grid cols-3-1">
+<div class="grid" style="gap:16px">
+ <section class="panel"><h2>派单门控 <span class="hint">配置 {{ cfg_mode }} · 连续 {{ gate.streak or 0 }}/{{ open_days }} 天达标后放开，恶化立即收回</span></h2>
+  <p><span class="chip {% if gate.effective=='auto' %}ok{% else %}warn{% endif %}">当前 {{ '自动派单' if gate.effective=='auto' else '草稿待人工确认' }}</span>
+   <span class="small muted">{{ gate.reason or '' }}{% if gate.since %} · 自 {{ gate.since }}{% endif %}</span></p>
+  {% if gate.history %}<table><tbody>{% for h in gate.history|reverse %}<tr><td class="small muted" style="width:90px">{{h.date}}</td><td class="small">{{h.event}}</td></tr>{% endfor %}</tbody></table>{% else %}<p class="empty">尚无开合记录</p>{% endif %}
+ </section>
+ <section class="panel"><h2>阈值自调参 <span class="hint">{{ autotune.mode }} · 影子回放考试达标才生效 · 生效后确认率下跌自动回滚</span></h2>
+  <p class="small">当前运行口径：{% for k,v in current.items() %}<code>{{k.split('.')[-1]}}={{v}}</code> {% endfor %}
+   {% if overrides %}<span class="chip info">覆盖层生效中</span>{% else %}<span class="chip">使用 config.yaml 口径</span>{% endif %}</p>
+  {% if tuning_decision %}<div class="why small">{{ tuning_decision }}</div>{% endif %}
+  <table style="margin-top:10px"><thead><tr><th>日期</th><th>参数</th><th>变更</th><th>状态</th><th>原因</th></tr></thead><tbody>
+  {% for c in changes %}<tr><td class="small">{{c.run_date}}</td><td class="id">{{c.param.split('.')[-1]}}</td><td>{{c.old_value}} → {{c.new_value}}</td>
+   <td><span class="chip {% if c.status=='applied' %}ok{% elif c.status=='rolled_back' %}bad{% else %}info{% endif %}">{{ {'applied':'已生效','rolled_back':'已回滚','proposed':'提议','deferred':'冷却中'}.get(c.status, c.status) }}</span></td><td class="small muted">{{c.reason}}</td></tr>
+  {% else %}<tr><td colspan="5" class="empty">尚无参数变更（复核样本够了才会动）</td></tr>{% endfor %}</tbody></table>
+ </section>
+ <section class="panel"><h2>模型生命周期 <span class="hint">按时间留出最近 25% 标注考试，不低于规则代理/现役才上线；线上一致率落后 → 自动降级</span></h2>
+  {% if live %}<p class="small">近 30 天与复核结论一致率：模型 <b>{{ (live.model*100)|num(0) }}%</b> vs 规则代理 <b>{{ (live.rule_proxy*100)|num(0) }}%</b>（n={{ live.n }}）</p>{% endif %}
+  <table><thead><tr><th>版本</th><th>训练于</th><th class="num">标注数</th><th>状态</th><th>留出集考试（挑战者 / 规则 / 现役）</th></tr></thead><tbody>
+  {% for m in models %}<tr><td class="id">{{m.model_version}}</td><td class="small">{{m.trained_at[:16]}}</td><td class="num">{{m.n_labels}}</td>
+   <td><span class="chip {% if m.status=='active' %}ok{% elif m.status in ('rejected','demoted') %}bad{% else %}{% endif %}">{{ {'active':'现役','rejected':'未过考','retired':'已退役','demoted':'已降级'}.get(m.status or '', m.status or '—') }}</span></td>
+   <td class="small muted">{{ m.exam }}</td></tr>
+  {% else %}<tr><td colspan="5" class="empty">规则代理（标注 {{ n_labels }} / {{ min_labels }} 条，够了自动训练）</td></tr>{% endfor %}</tbody></table>
+ </section>
+</div>
+<div class="grid" style="gap:16px;align-content:start">
+ <section class="panel"><h2>健康自检 <span class="hint">{{ health_date or '—' }}</span></h2>
+  {% for c in health %}<div class="alert" style="display:flex;gap:8px"><span class="chip {% if c.status=='ok' %}ok{% elif c.status=='fail' %}bad{% else %}warn{% endif %}">{{c.status}}</span><span class="small"><b style="color:inherit">{{c.name}}</b> {{c.detail}}</span></div>{% else %}<p class="empty">跑过一次巡检后出现</p>{% endfor %}
+ </section>
+ <section class="panel"><h2>数据接入自愈</h2>{% for i in ingest %}<div class="small" style="margin-bottom:6px"><b>{{i.station_id}}</b> 最后数据 {{ i.last or '—' }}{% if i.failures %} · <span class="chip bad">连续失败 {{i.failures}}</span>{% endif %}</div>{% else %}<p class="empty">无电站</p>{% endfor %}</section>
+ <section class="panel"><h2>已推送的关键事件</h2>{% for a in pushed %}<div class="alert small"><b>{{a.run_date}}</b> {{a.message}}</div>{% else %}<p class="empty">尚无推送</p>{% endfor %}</section>
+</div></div>
+{% endblock %}"""
+
+TEMPLATES = {"base.html": BASE, "autonomy.html": AUTONOMY, "index.html": INDEX, "strings.html": STRINGS, "string.html": STRING, "review.html": REVIEW,
              "suspect.html": SUSPECT, "workorders.html": WORKORDERS, "workorder.html": WORKORDER, "report.html": REPORT}

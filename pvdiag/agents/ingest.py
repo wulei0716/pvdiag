@@ -34,44 +34,106 @@ class IngestAgent(Agent):
         if stations.empty:
             res.status, res.summary = "skipped", "无电站档案，先导入 stations/strings"
             return res
-        total_rows, fetched_days = 0, 0
+        total_rows, fetched_days, healed_days = 0, 0, 0
+        icfg = ctx.settings.ingest
         for _, st in stations.iterrows():
-            if ctx.station_ids and st["station_id"] not in ctx.station_ids:
+            sid = st["station_id"]
+            if ctx.station_ids and sid not in ctx.station_ids:
                 continue
             extra = json.loads(st.get("extra_json") or "{}")
             pconf = {**extra.get("platform_config", {}), **self.platform_overrides.get(st["platform"], {})}
             if st["platform"] != "csv" and not pconf:
-                res.alerts.append(f"{st['station_id']} 平台 {st['platform']} 未配置凭证，跳过拉取（仅用已落库数据）")
-                self._refresh_features(ctx, st["station_id"], [ctx.run_date])
+                res.alerts.append(f"{sid} 平台 {st['platform']} 未配置凭证，跳过拉取（仅用已落库数据）")
+                self._refresh_features(ctx, sid, [ctx.run_date])
                 continue
             try:
-                adapter = build_adapter(st["platform"], st["station_id"], pconf, ctx.store)
+                adapter = build_adapter(st["platform"], sid, pconf, ctx.store)
             except Exception as e:
-                res.alerts.append(f"{st['station_id']} 适配器初始化失败: {e}")
+                res.alerts.append(f"{sid} 适配器初始化失败: {e}")
+                self._record_failure(ctx, sid, f"适配器初始化失败: {e}", res)
                 continue
+            # 断点续拉 + 自愈补缺：backfill 窗口内缺的日期 + 回看 heal_lookback_days 内的缺口（当天总是重拉以补齐增量）
+            have = set(ctx.store.available_dates("string", sid))
             start = ctx.run_date - timedelta(days=self.backfill_days)
-            have = set(ctx.store.available_dates("string", st["station_id"]))
-            # 断点续拉：只拉缺的日期（当天总是重拉以补齐增量）
-            missing = [start + timedelta(days=k) for k in range((ctx.run_date - start).days + 1)
-                       if (start + timedelta(days=k)).isoformat() not in have or (start + timedelta(days=k)) == ctx.run_date]
-            if not missing:
-                self._refresh_features(ctx, st["station_id"], [ctx.run_date])
+            window = [start + timedelta(days=k) for k in range((ctx.run_date - start).days + 1)]
+            missing = [d for d in window if d.isoformat() not in have or d == ctx.run_date]
+            heal_start = ctx.run_date - timedelta(days=icfg.heal_lookback_days)
+            gaps = [heal_start + timedelta(days=k) for k in range((ctx.run_date - heal_start).days)
+                    if (heal_start + timedelta(days=k)).isoformat() not in have and (heal_start + timedelta(days=k)) < start]
+            gaps = [g for g in gaps if g >= self._earliest_data(ctx, sid)]          # 比首个数据日更早的不算缺口
+            gaps = gaps[-icfg.max_heal_days_per_run:]
+            if gaps:
+                res.alerts.append(f"{sid} 发现 {len(gaps)} 个历史缺口日（{gaps[0]}~{gaps[-1]}），本次补拉")
+            if not missing and not gaps:
+                self._refresh_features(ctx, sid, [ctx.run_date])
                 continue
-            try:
-                fr = adapter.fetch(min(missing), max(missing))
-            except Exception as e:
-                res.alerts.append(f"{st['station_id']} 拉取失败: {e}")
-                ctx.store.alert(ctx.run_date, "error", self.name, f"{st['station_id']} 拉取失败: {e}")
-                continue
-            for n in fr.notes:
-                res.alerts.append(f"{st['station_id']}: {n}")
-            total_rows += self.ingest_frames(ctx, st["station_id"], fr.strings, fr.inverters, fr.irradiance)
-            fetched_days += len(missing)
-            ctx.store.set_state(f"ingest:{st['station_id']}:last_ok", {"date": ctx.run_date.isoformat(),
-                                                                       "rows": int(len(fr.strings)), "calls": fr.calls_used})
-        res.metrics = {"rows_written": total_rows, "days": fetched_days}
-        res.summary = f"写入 {total_rows} 行明细，覆盖 {fetched_days} 站·日"
+            ok_any = False
+            for lo, hi in self._ranges(sorted(set(missing) | set(gaps))):
+                fr, err = self._fetch_with_retry(ctx, adapter, lo, hi, pconf)
+                if fr is None:
+                    self._record_failure(ctx, sid, f"拉取 {lo}~{hi} 失败: {err}", res)
+                    continue
+                ok_any = True
+                for n in fr.notes:
+                    res.alerts.append(f"{sid}: {n}")
+                total_rows += self.ingest_frames(ctx, sid, fr.strings, fr.inverters, fr.irradiance)
+                n_days = (hi - lo).days + 1
+                fetched_days += n_days
+                healed_days += sum(1 for g in gaps if lo <= g <= hi)
+            if ok_any:
+                ctx.store.set_state(f"ingest:{sid}:last_ok", {"date": ctx.run_date.isoformat(), "at": datetime.now().isoformat()})
+                ctx.store.set_state(f"ingest:{sid}:failures", 0)
+        res.metrics = {"rows_written": total_rows, "days": fetched_days, "healed_gap_days": healed_days}
+        res.summary = f"写入 {total_rows} 行明细，覆盖 {fetched_days} 站·日" + (f"，补齐历史缺口 {healed_days} 天" if healed_days else "")
         return res
+
+    # ------------------------------------------------------------------ 自愈工具
+    @staticmethod
+    def _ranges(days: List[date]) -> List[tuple]:
+        """连续日期合并成区间，减少 API 调用"""
+        out: List[tuple] = []
+        for d in days:
+            if out and (d - out[-1][1]).days == 1:
+                out[-1] = (out[-1][0], d)
+            else:
+                out.append((d, d))
+        return out
+
+    @staticmethod
+    def _earliest_data(ctx: AgentContext, station_id: str) -> date:
+        ds = ctx.store.available_dates("string", station_id)
+        return date.fromisoformat(ds[0]) if ds else ctx.run_date
+
+    def _fetch_with_retry(self, ctx: AgentContext, adapter, lo: date, hi: date, pconf: Dict):
+        """指数退避重试；全部失败且配置了 fallback_csv_root → 降级读本地文件（已有拉数脚本的落地目录）"""
+        import time
+        icfg = ctx.settings.ingest
+        err = None
+        for attempt in range(icfg.retries):
+            try:
+                return adapter.fetch(lo, hi), None
+            except Exception as e:
+                err = e
+                ctx.logger.warning("%s 拉取 %s~%s 第 %d 次失败: %s", adapter.station_id, lo, hi, attempt + 1, e)
+                if attempt < icfg.retries - 1:
+                    time.sleep(min(icfg.backoff_seconds * (2 ** attempt), 60))
+        fb = pconf.get("fallback_csv_root")
+        if fb:
+            try:
+                fr = build_adapter("csv", adapter.station_id, {"root": fb}, ctx.store).fetch(lo, hi)
+                fr.notes.append(f"平台拉取失败（{err}），已降级读取本地文件 {fb}")
+                return fr, None
+            except Exception as e2:
+                err = f"{err}；降级读本地文件也失败: {e2}"
+        return None, err
+
+    def _record_failure(self, ctx: AgentContext, station_id: str, msg: str, res: AgentResult) -> None:
+        n = int(ctx.store.get_state(f"ingest:{station_id}:failures", 0) or 0) + 1
+        ctx.store.set_state(f"ingest:{station_id}:failures", n)
+        level = "error" if n >= ctx.settings.ingest.escalate_after_failures else "warn"
+        text = f"{station_id} {msg}（连续第 {n} 次）" + ("，已升级告警：检查授权/配额/网络" if level == "error" else "")
+        res.alerts.append(text)
+        ctx.store.alert(ctx.run_date, level, self.name, text)
 
     # ------------------------------------------------------------------ 直接灌入 DataFrame（模拟/测试/旧文件）
     def ingest_frames(self, ctx: AgentContext, station_id: str, strings: pd.DataFrame,

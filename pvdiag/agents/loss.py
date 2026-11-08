@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -118,7 +119,9 @@ class LossAgent(Agent):
             return {**base, "quantified": 0}
         I = np.vstack([np.array([np.nan if v is None else v for v in json.loads(x)], dtype=float) for x in peers["i_profile_json"]])
         V = np.vstack([np.array([np.nan if v is None else v for v in json.loads(x)], dtype=float) for x in peers["v_profile_json"]])
-        g_i, g_v = np.nanmedian(I, axis=0), np.nanmedian(V, axis=0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)      # 夜间槽全 NaN 属正常
+            g_i, g_v = np.nanmedian(I, axis=0), np.nanmedian(V, axis=0)
         actual = np.array([np.nan if v is None else v for v in json.loads(f["i_profile_json"])], dtype=float)
         ratio = float(b["baseline_ratio"].iloc[0]) if (not b.empty and pd.notna(b["baseline_ratio"].iloc[0]) and not b["cold_start"].iloc[0]) else 1.0
         ratio = min(max(ratio, 0.9), 1.1)
