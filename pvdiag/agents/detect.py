@@ -171,9 +171,12 @@ class DetectAgent(Agent):
         voff = self._voltage_offsets(ft, prof, bl)
         zero_streak, stuck_streak = self._zero_stuck_streaks(feats, ctx.store, station_id, d, th.stale_run_min)
         sig_hist = ctx.store.query(
-            "SELECT s.string_id, s.date, s.dip_depth, s.dip_start, s.dip_end, s.outside_dip_ratio, s.voltage_offset, s.weather_tag "
-            "FROM signatures s JOIN strings p ON p.string_id=s.string_id WHERE p.station_id=? AND s.date BETWEEN ? AND ?",
+            "SELECT s.string_id, s.date, s.dip_depth, s.dip_start, s.dip_end, s.outside_dip_ratio, s.voltage_offset, s.weather_tag, s.outage_slots "
+            "FROM signatures s JOIN strings p ON p.string_id=s.string_id WHERE p.station_id=? AND s.date BETWEEN ? AND ? ORDER BY s.date DESC",
             (station_id, (d - timedelta(days=15)).isoformat(), (d - timedelta(days=1)).isoformat()))
+        hist_by: Dict[str, List[Dict]] = {sid: g.to_dict("records") for sid, g in sig_hist.groupby("string_id", sort=False)} if not sig_hist.empty else {}
+        outage_cut = (d - timedelta(days=7)).isoformat()
+        prof_rows = prof.to_dict("index"); ft_rows = ft.to_dict("index")
         rainy_caution = weather == "clear" and ("n_clear_recent" in bl and bl["n_clear_recent"].max() <= 1)
         # 近 10 个晴好天偏差的离散度：朝向差异是恒定的（std 很小），积灰/衰减会漂移
         dev_hist = ctx.store.query(
@@ -184,22 +187,24 @@ class DetectAgent(Agent):
 
         out: List[Dict] = []
         sig_rows: List[Dict] = []
-        for sid, b in bl.iterrows():
-            if sid not in prof.index:
+        for sid, b in bl.to_dict("index").items():
+            p = prof_rows.get(sid)
+            if p is None:
                 continue
-            p = prof.loc[sid]
-            f = ft.loc[sid] if sid in ft.index else None
+            f = ft_rows.get(sid)
+            h = hist_by.get(sid, [])
             sig, skew = self._signature(sid, f, p, b, group_curves, inv_daily, th, cfg)
             if sig.orientation_like and not np.isnan(dev_std.get(sid, np.nan)) and dev_std[sid] > th.orientation_max_drift:
                 sig.orientation_like = False      # 偏差在漂移 → 不是恒定的朝向差异（更像积灰/衰减）
                 sig.notes.append(f"晴好天偏差离散度 {dev_std[sid]:.1%} 偏大，不按朝向差异处理")
             v_off = voff.get(sid)
-            v_days = self._voltage_days(sig_hist, sid, v_off, th) if v_off is not None else 0
+            v_days = self._voltage_days(h, v_off, th) if v_off is not None else 0
             if v_off is not None and abs(v_off) > th.voltage_offset and v_days + 1 >= th.voltage_offset_days:
                 sig.voltage_offset = v_off
-            dip_days = self._dip_days(sig_hist, sid, sig, th)
+            dip_days = self._dip_days(h, sig, th)
             if sig.outage_hours > 0:
-                sig.outage_days = self._outage_days(ctx.store, sid, d, th) + 1
+                sig.outage_days = sum(1 for r in h if r["date"] >= outage_cut and r.get("outage_slots") is not None
+                                      and not pd.isna(r["outage_slots"]) and r["outage_slots"] >= th.outage_min_slots) + 1
             out_slots = int(round(sig.outage_hours * 60 / cfg.slot_minutes)) if sig.outage_hours else 0
             sig_rows.append({"string_id": sid, "date": today, "weather_tag": weather, "ratio_mean": sig.ratio_mean,
                              "ratio_std": sig.ratio_std, "am_pm_skew": skew, "dip_depth": sig.dip_depth,
@@ -268,12 +273,14 @@ class DetectAgent(Agent):
     @staticmethod
     def _group_curves(ft: pd.DataFrame, prof: pd.DataFrame, bl: pd.DataFrame) -> Dict[str, np.ndarray]:
         curves: Dict[str, List[np.ndarray]] = {}
-        for sid, row in ft.iterrows():
-            if sid not in prof.index or sid not in bl.index:
+        inv_of = prof["inverter_id"].to_dict()
+        gkey, glevel = bl["group_key"].to_dict(), bl["group_level"].to_dict()
+        for sid, row in ft.to_dict("index").items():
+            if sid not in inv_of or sid not in gkey:
                 continue
             if row["zero_all_day"] or row["stuck"] or pd.isna(row["noon_median_i"]) or row["noon_median_i"] < 0.5:
                 continue
-            key = bl.loc[sid, "group_key"] if bl.loc[sid, "group_level"] == "group" else prof.loc[sid, "inverter_id"]
+            key = gkey[sid] if glevel[sid] == "group" else inv_of[sid]
             vec = np.array([np.nan if v is None else v for v in json.loads(row["i_profile_json"])], dtype=float)
             curves.setdefault(key, []).append(vec)
         with warnings.catch_warnings():
@@ -297,29 +304,30 @@ class DetectAgent(Agent):
         return out
 
     @staticmethod
-    def _voltage_days(sig_hist: pd.DataFrame, sid: str, v_off: float, th) -> int:
-        if sig_hist.empty:
-            return 0
-        h = sig_hist[(sig_hist["string_id"] == sid)].sort_values("date", ascending=False)
+    def _voltage_days(hist: List[Dict], v_off: float, th) -> int:
+        """hist：该串近 15 天签名记录（按日期倒序）"""
         n = 0
-        for r in h.itertuples():
-            if r.voltage_offset is not None and not pd.isna(r.voltage_offset) and abs(r.voltage_offset) > th.voltage_offset and np.sign(r.voltage_offset) == np.sign(v_off):
+        for r in hist:
+            vo = r.get("voltage_offset")
+            if vo is not None and not pd.isna(vo) and abs(vo) > th.voltage_offset and np.sign(vo) == np.sign(v_off):
                 n += 1
             else:
                 break
         return n
 
     @staticmethod
-    def _dip_days(sig_hist: pd.DataFrame, sid: str, sig: Signature, th) -> int:
-        """此前连续多少个晴好天出现（时段重叠的）同类凹陷"""
-        if sig.dip_depth is None or sig_hist.empty:
+    def _dip_days(hist: List[Dict], sig: Signature, th) -> int:
+        """此前连续多少个晴好天出现（时段重叠的）同类凹陷；hist 为该串签名记录（日期倒序）"""
+        if sig.dip_depth is None or not hist:
             return 0
-        h = sig_hist[(sig_hist["string_id"] == sid) & (sig_hist["weather_tag"] == "clear")].sort_values("date", ascending=False)
         n = 0
-        for r in h.itertuples():
-            if r.dip_depth is None or pd.isna(r.dip_depth) or r.dip_depth < 0.1:
+        for r in hist:
+            if r.get("weather_tag") != "clear":
+                continue
+            dd = r.get("dip_depth")
+            if dd is None or pd.isna(dd) or dd < 0.1:
                 break
-            if r.dip_start and sig.dip_start and not (r.dip_end <= sig.dip_start or r.dip_start >= sig.dip_end):
+            if r.get("dip_start") and sig.dip_start and not (r["dip_end"] <= sig.dip_start or r["dip_start"] >= sig.dip_end):
                 n += 1
             else:
                 break
@@ -333,22 +341,23 @@ class DetectAgent(Agent):
         sd = store.station_daily(station_id, d - timedelta(days=10), d)
         producing = set(sd[sd["weather_tag"] != "nodata"]["date"]) if not sd.empty else set(feats["date"])
         zero, stuck = {}, {}
-        for sid, g in feats[feats["date"].isin(producing)].groupby("string_id"):
-            g = g.sort_values("date", ascending=False)
-            z = s = 0
-            for r in g.itertuples():
-                if r.zero_all_day:
-                    z += 1
-                else:
-                    break
-            for r in g.itertuples():
-                # 全天钉死，或日间连续 ≥90 分钟钉死不动（半天冻结：pvanalytics 标注数据里常见）
-                if r.stuck or (getattr(r, "stale_run_min", 0) or 0) >= stale_min:
-                    s += 1
-                else:
-                    break
-            zero[sid], stuck[sid] = z, s
+        fp = feats[feats["date"].isin(producing)].sort_values(["string_id", "date"], ascending=[True, False])
+        z_all = fp["zero_all_day"].to_numpy(dtype=float) == 1
+        sr = fp["stale_run_min"].to_numpy(dtype=float) if "stale_run_min" in fp.columns else np.zeros(len(fp))
+        # 全天钉死，或日间连续 ≥stale_min 分钟钉死不动（半天冻结：pvanalytics 标注数据里常见）
+        s_all = (fp["stuck"].to_numpy(dtype=float) == 1) | (np.nan_to_num(sr) >= stale_min)
+        for sid, idx in fp.groupby("string_id", sort=False).indices.items():
+            zero[sid] = int(DetectAgent._leading_true(z_all[idx]))
+            stuck[sid] = int(DetectAgent._leading_true(s_all[idx]))
         return zero, stuck
+
+    @staticmethod
+    def _leading_true(mask: np.ndarray) -> int:
+        """从头开始连续 True 的个数（序列已按日期倒序 → 即"连续至今"的天数）"""
+        if len(mask) == 0:
+            return 0
+        nz = np.flatnonzero(~mask)
+        return int(nz[0]) if len(nz) else int(len(mask))
 
     @staticmethod
     def _runs(mask: np.ndarray, min_len: int) -> List[Tuple[int, int]]:
@@ -365,13 +374,6 @@ class DetectAgent(Agent):
             else:
                 k += 1
         return runs
-
-    @staticmethod
-    def _outage_days(store, sid: str, d: date, th) -> int:
-        """近 7 个有数据日中（不含今天）出现停机签名的天数"""
-        h = store.query("SELECT outage_slots FROM signatures WHERE string_id=? AND date BETWEEN ? AND ? AND outage_slots IS NOT NULL",
-                        (sid, (d - timedelta(days=7)).isoformat(), (d - timedelta(days=1)).isoformat()))
-        return int((h["outage_slots"] >= th.outage_min_slots).sum()) if not h.empty else 0
 
     # ------------------------------------------------------------------ 签名
     def _signature(self, sid: str, f: Optional[pd.Series], p: pd.Series, b: pd.Series,

@@ -162,18 +162,20 @@ class ClassifyAgent(Agent):
         proxy = RuleProxyModel()
         verdicts: List[Dict] = []
         novelty = self._novelty_scores(ctx)
+        # 一次取齐当日基线/档案/签名，不在循环里逐条查库（万串级）
+        bl_rows = ctx.store.query("SELECT * FROM baselines WHERE date=?", (today,)).set_index("string_id").to_dict("index") if not susp.empty else {}
+        prof_rows = ctx.store.strings().set_index("string_id").to_dict("index") if not susp.empty else {}
+        skew_rows = ctx.store.query("SELECT string_id, am_pm_skew FROM signatures WHERE date=?", (today,)).set_index("string_id")["am_pm_skew"].to_dict() if not susp.empty else {}
         for s in susp.to_dict("records"):
             sig = Signature.model_validate_json(s["signature_json"]) if s.get("signature_json") else Signature()
-            bl, prof, sg = None, None, pd.DataFrame()
+            bl, prof, skew = None, None, None
             if s["scope"] == "string":
-                b = ctx.store.query("SELECT * FROM baselines WHERE string_id=? AND date=?", (s["string_id"], today))
-                bl = b.iloc[0] if not b.empty else None
-                p = ctx.store.query("SELECT * FROM strings WHERE string_id=?", (s["string_id"],))
-                prof = p.iloc[0] if not p.empty else None
-                sg = ctx.store.query("SELECT am_pm_skew FROM signatures WHERE string_id=? AND date=?", (s["string_id"], today))
+                bl = bl_rows.get(s["string_id"])
+                prof = prof_rows.get(s["string_id"])
+                skew = skew_rows.get(s["string_id"])
             feats = build_features(s, bl, sig, prof, ctx.run_date)
-            if s["scope"] == "string" and not sg.empty and pd.notna(sg["am_pm_skew"].iloc[0]):
-                feats["am_pm_skew"] = float(sg["am_pm_skew"].iloc[0])
+            if skew is not None and pd.notna(skew):
+                feats["am_pm_skew"] = float(skew)
             r_cause, r_conf, r_proba = proxy.predict(s, feats, sig)
             if model is not None:
                 m_cause, m_conf, m_proba = model.predict(feats)
@@ -462,8 +464,10 @@ class ClassifyAgent(Agent):
         X = df[cols].astype(float).fillna(0.0)
         try:
             from sklearn.ensemble import IsolationForest
-            iso = IsolationForest(n_estimators=150, contamination=0.02, random_state=42).fit(X.to_numpy())
-            sc = iso.decision_function(X.to_numpy())
+            Xn = X.to_numpy()
+            fit_X = Xn if len(Xn) <= 20000 else Xn[np.random.default_rng(42).choice(len(Xn), 20000, replace=False)]   # 万串级抽样拟合
+            iso = IsolationForest(n_estimators=100, contamination=0.02, random_state=42).fit(fit_X)
+            sc = iso.decision_function(Xn)
         except Exception:
             return {}
         df["score"] = sc

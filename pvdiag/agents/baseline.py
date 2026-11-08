@@ -71,8 +71,12 @@ class BaselineAgent(Agent):
         stale = f["stale_run_min"].fillna(0) >= th.stale_run_min if "stale_run_min" in f.columns else pd.Series(False, index=f.index)
         f["valid"] = (f["noon_median_i"] >= th.zero_current_a) & (f["stuck"] == 0) & (f["zero_all_day"] == 0) & f["noon_median_i"].notna() & (~stale)
         # 限发标记（逆变器当天限发 → 该日不参与竖向/机间比，互比仍有效）
-        lim = inv_daily.set_index(["inverter_id", "date"])["limited_flag"] if not inv_daily.empty else None
-        f["limited"] = [int(lim.get((r.inverter_id, r.date), 0)) if lim is not None else 0 for r in f.itertuples()]
+        if not inv_daily.empty:
+            lim = inv_daily[["inverter_id", "date", "limited_flag"]].rename(columns={"limited_flag": "limited"})
+            f = f.merge(lim, on=["inverter_id", "date"], how="left")
+            f["limited"] = f["limited"].fillna(0).astype(int)
+        else:
+            f["limited"] = 0
 
         # ---- 群组中位数（三级回退：配置群组 → 整机 → 无）
         v = f[f["valid"]]
@@ -93,51 +97,68 @@ class BaselineAgent(Agent):
         # ---- 群组当日噪声：有效串偏差的稳健标准差（1.4826×MAD）。云影在大电站各逆变器间不同步，
         #      "晴好天"也可能噪声 3%~7%；此时 -5% 只是噪声，不是低发（统计显著性门控用）
         f["group_level_key"] = np.where(use_group, f["group_key"].astype(str), f["inverter_id"].astype(str))
-        vv = f[f["valid"] & f["dev"].notna()]
-        noise = vv.groupby(["date", "group_level_key"])["dev"].agg(_robust_std).rename("group_noise")
-        f = f.merge(noise, left_on=["date", "group_level_key"], right_index=True, how="left")
+        vv = f[f["valid"] & f["dev"].notna() & (f["dev"] > -0.9)]
+        keys = ["date", "group_level_key"]
+        med = vv.groupby(keys)["dev"].transform("median")
+        mad = (vv["dev"] - med).abs().groupby([vv["date"], vv["group_level_key"]]).agg(["median", "size"])
+        noise = (1.4826 * mad["median"]).where(mad["size"] >= 3).rename("group_noise")      # 与 _robust_std 同口径，向量化
+        f = f.merge(noise, left_on=keys, right_index=True, how="left")
 
-        # ---- 每串滚动统计
+        # ---- 每串滚动统计（numpy 向量化：按串取下标一次，不在循环里切 DataFrame；万串级每日秒级）
         today = d.isoformat()
+        f = f.sort_values(["string_id", "date"]).reset_index(drop=True)
+        seg_map = self._segment_starts(strings, events, d)
+        irr_series = weather["irradiance_kwh_m2"] if (not weather.empty and "irradiance_kwh_m2" in weather.columns
+                                                     and weather["irradiance_kwh_m2"].notna().any()) else None
+        col = {c: f[c].to_numpy() for c in ("date", "weather_tag", "ratio", "dev", "valid", "group_noise", "zero_all_day", "limited")}
+        nz_all = f["noon_zero_frac"].to_numpy(dtype=float) if "noon_zero_frac" in f.columns else np.full(len(f), np.nan)
+        irr_all = f["date"].map(irr_series).to_numpy(dtype=float) if irr_series is not None else None
+        energy_all = f["day_energy_kwh"].to_numpy(dtype=float) if irr_series is not None else None
+        today_rows = {sid: i for sid, i in zip(f.loc[f["date"] == today, "string_id"], f.index[f["date"] == today])}
+        recent_cut = (d - timedelta(days=th.rainy_streak_caution_days)).isoformat()
         rows: List[Dict] = []
-        for sid, g in f.groupby("string_id", sort=False):
-            g = g.sort_values("date")
-            srow = strings.loc[strings["string_id"] == sid].iloc[0]
-            seg_start = ProfileAgent.segment_start_for(srow, events, d)
-            if seg_start:
-                g = g[g["date"] >= seg_start]
-            cur = g[g["date"] == today]
-            if cur.empty:
+        for sid, idx in f.groupby("string_id", sort=False).indices.items():
+            ti = today_rows.get(sid)
+            if ti is None:
                 continue
-            cur = cur.iloc[0]
-            clear_hist = g[(g["weather_tag"] == "clear") & (g["date"] < today) & g["ratio"].notna() & g["valid"]]
-            clear_hist = clear_hist.tail(cfg.rolling_clear_days)
-            baseline_n = int(len(clear_hist))
-            baseline_ratio = float(clear_hist["ratio"].median()) if baseline_n else np.nan
+            seg_start = seg_map.get(sid)
+            if seg_start:
+                idx = idx[col["date"][idx] >= seg_start]
+            dates = col["date"][idx]; wtag = col["weather_tag"][idx]
+            ratio = col["ratio"][idx].astype(float); dev = col["dev"][idx].astype(float)
+            valid = col["valid"][idx].astype(bool); noise = col["group_noise"][idx].astype(float)
+            zad = col["zero_all_day"][idx]
+            before = dates < today
+            clear = wtag == "clear"
+            hist_mask = clear & before & ~np.isnan(ratio) & valid
+            hist = ratio[hist_mask][-cfg.rolling_clear_days:]
+            baseline_n = int(len(hist))
+            baseline_ratio = float(np.median(hist)) if baseline_n else np.nan
             cold = int(baseline_n < cfg.min_clear_days)
-            ratio_today = cur["ratio"]
-            dev_today = cur["dev"]
+            cur = f.iloc[ti]
+            ratio_today, dev_today = cur["ratio"], cur["dev"]
             dev_vs_own = (ratio_today / baseline_ratio - 1) if (not cold and pd.notna(ratio_today) and baseline_ratio) else np.nan
-            # 晴好天序列（含今天若为晴好天）用于持续度；群组噪声过大的日子跳过（不计也不打断）
-            clear_seq = g[(g["weather_tag"] == "clear") & g["dev"].notna()].sort_values("date")
-            clear_seq = clear_seq[clear_seq["date"] <= today]
-            devs = clear_seq["dev"].to_numpy(dtype=float)
-            noises = clear_seq["group_noise"].to_numpy(dtype=float) if "group_noise" in clear_seq else np.zeros(len(devs))
-            # 中午窗口有整段 0 输出（间歇停机）的日子：偏差被停机拉低，不是"低发"，持续度里跳过（停机有独立签名）
-            if "noon_zero_frac" in clear_seq.columns:
-                nz = clear_seq["noon_zero_frac"].to_numpy(dtype=float)
-                skip_day = (np.nan_to_num(nz) >= th.outage_noon_skip_frac) & (clear_seq["zero_all_day"].to_numpy() == 0)
-                noises = np.where(skip_day, np.inf, noises)
-            dates = clear_seq["date"].tolist()
+            # 晴好天序列（含今天）用于持续度；群组噪声过大的日子跳过；中午整段 0 输出（停机）的日子跳过
+            seq = clear & ~np.isnan(dev) & (dates <= today)
+            devs = dev[seq]
+            noises = np.nan_to_num(noise[seq], nan=0.0)
+            skip_day = (np.nan_to_num(nz_all[idx][seq]) >= th.outage_noon_skip_frac) & (zad[seq] == 0)
+            noises = np.where(skip_day, np.inf, noises)
+            seq_dates = dates[seq]
             p5, idx5 = self._streak_gated(devs, noises, th.fault_floor, th.noise_k, th.noise_skip)
             p3, idx3 = self._streak_gated(devs, noises, th.normal_floor, th.noise_k, th.noise_skip)
-            first_breach = dates[idx3] if p3 > 0 and idx3 is not None else None
+            first_breach = str(seq_dates[idx3]) if p3 > 0 and idx3 is not None else None
             roll7 = float(np.median(devs[-7:])) if len(devs) else np.nan
-            # 阴天（散射光）偏差：朝向差异在阴天消失 → 用于 C 级"疑朝向"判定；只取纯阴雨天
-            oc = g[(g["weather_tag"] == "overcast") & g["dev"].notna() & g["valid"]].tail(5)
-            overcast_dev = float(oc["dev"].median()) if len(oc) >= 2 else np.nan
-            recent = g[g["date"] > (d - timedelta(days=th.rainy_streak_caution_days)).isoformat()]
-            n_clear_recent = int((recent["weather_tag"] == "clear").sum())
+            oc = dev[(wtag == "overcast") & ~np.isnan(dev) & valid][-5:]
+            overcast_dev = float(np.median(oc)) if len(oc) >= 2 else np.nan
+            n_clear_recent = int(np.sum(clear & (dates > recent_cut)))
+            v_dev = np.nan
+            if irr_all is not None:
+                h = irr_all[idx]; y = energy_all[idx] / np.where(h == 0, np.nan, h)
+                yh = y[before & clear & (col["limited"][idx] == 0) & ~np.isnan(y)][-30:]
+                yt = y[dates == today]
+                if len(yh) >= 5 and len(yt) and not np.isnan(yt[0]):
+                    v_dev = float(yt[0] / np.median(yh) - 1)
             rows.append({
                 "string_id": sid, "date": today, "segment_start": seg_start, "group_key": cur["group_key"],
                 "group_n": int(cur["group_n"]), "group_level": cur["group_level"],
@@ -145,7 +166,7 @@ class BaselineAgent(Agent):
                 "baseline_ratio": baseline_ratio, "baseline_n": baseline_n,
                 "dev_today": dev_today, "dev_vs_own": dev_vs_own, "dev_roll7": roll7,
                 "persist_days_5": int(p5), "persist_days_3": int(p3), "first_breach_date": first_breach,
-                "v_dev": self._vertical_dev(g, weather, today), "overcast_dev": overcast_dev,
+                "v_dev": v_dev, "overcast_dev": overcast_dev,
                 "n_clear_recent": n_clear_recent, "cold_start": cold,
                 "weather_tag": cur["weather_tag"], "limited": int(cur["limited"]),
                 "group_noise": None if pd.isna(cur.get("group_noise")) else float(cur["group_noise"]),
@@ -157,6 +178,13 @@ class BaselineAgent(Agent):
         return bl, ibl
 
     # ------------------------------------------------------------------ 工具
+    @staticmethod
+    def _segment_starts(strings: pd.DataFrame, events: pd.DataFrame, d: date) -> Dict[str, Optional[str]]:
+        """每串的基线分段起点（最近一次清洗/维修/换串等事件日），一次算完"""
+        if events.empty:
+            return {}
+        return {r["string_id"]: ProfileAgent.segment_start_for(r, events, d) for r in strings.to_dict("records")}
+
     @staticmethod
     def _streak(devs: np.ndarray, floor: float) -> int:
         n = 0
