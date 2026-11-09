@@ -76,6 +76,10 @@ class IngestAgent(Agent):
                 ok_any = True
                 for n in fr.notes:
                     res.alerts.append(f"{sid}: {n}")
+                created = self._ensure_profile(ctx, sid, adapter, fr, pconf)
+                if created:
+                    res.alerts.append(f"{sid} 自动建立档案骨架：{created['inverters']} 台逆变器、{created['strings']} 路（n_modules/朝向待补；"
+                                      f"华为站可用 pvdiag platform hints 由 MPPT 容量反推）")
                 total_rows += self.ingest_frames(ctx, sid, fr.strings, fr.inverters, fr.irradiance)
                 n_days = (hi - lo).days + 1
                 fetched_days += n_days
@@ -89,6 +93,45 @@ class IngestAgent(Agent):
         res.metrics = {"rows_written": total_rows, "days": fetched_days, "healed_gap_days": healed_days}
         res.summary = f"写入 {total_rows} 行明细，覆盖 {fetched_days} 站·日" + (f"，补齐历史缺口 {healed_days} 天" if healed_days else "")
         return res
+
+    # ------------------------------------------------------------------ 档案骨架
+    @staticmethod
+    def _ensure_profile(ctx: AgentContext, station_id: str, adapter, fr, pconf: Dict) -> Optional[Dict[str, int]]:
+        """云平台新站第一次拉到数据而档案为空 → 用设备清单 + 样本里出现过的路建立骨架（只填 string_id/inverter_id/pv_index/mppt），
+        流水线即可跑同机互比；组件数/朝向/并联数等由人工或 platform hints 补。已有档案的站不动。"""
+        from .profile import ProfileAgent
+        have_inv = ctx.store.inverters(station_id)
+        have_str = ctx.store.strings(station_id)
+        if (not have_inv.empty and not have_str.empty) or fr.strings is None or fr.strings.empty:
+            return None
+        created = {"inverters": 0, "strings": 0}
+        if have_inv.empty:
+            try:
+                devs = adapter.list_devices()
+            except Exception:
+                devs = pd.DataFrame()
+            if devs.empty:
+                ids = sorted(fr.inverters["inverter_id"].unique()) if fr.inverters is not None and not fr.inverters.empty else \
+                    sorted(fr.strings["string_id"].str.replace(r"-pv\d+$", "", regex=True).unique())
+                devs = pd.DataFrame({"inverter_id": ids, "name": ids, "model": "", "rated_ac_kw": None})
+            inv_df = pd.DataFrame({"inverter_id": devs["inverter_id"], "station_id": station_id, "name": devs.get("name", devs["inverter_id"]),
+                                   "model": devs.get("model", ""), "rated_ac_kw": devs.get("rated_ac_kw"),
+                                   "extra_json": [json.dumps({k: (None if pd.isna(v) else v) for k, v in r.items()
+                                                              if k in ("esn", "dev_id", "ps_key", "sn")}, ensure_ascii=False) for r in devs.to_dict("records")]})
+            ProfileAgent.import_inverters(ctx.store, inv_df)
+            created["inverters"] = int(len(inv_df))
+        if have_str.empty:
+            ipm = int(pconf.get("inputs_per_mppt", 2))
+            channel_is_mppt = bool(pconf.get("channel_is_mppt", getattr(adapter, "platform", "") == "sungrow"))
+            sid_series = pd.Series(sorted(fr.strings["string_id"].unique()))
+            pv = sid_series.str.extract(r"pv(\d+)$")[0].astype(float)
+            inv = sid_series.str.replace(r"-pv\d+$", "", regex=True)
+            st_df = pd.DataFrame({"string_id": sid_series, "station_id": station_id, "inverter_id": inv, "pv_index": pv,
+                                  "mppt": pv if channel_is_mppt else ((pv - 1) // ipm + 1),
+                                  "n_modules": None, "azimuth": None, "tilt": None, "notes": "auto:skeleton"})
+            ProfileAgent.import_strings(ctx.store, st_df)
+            created["strings"] = int(len(st_df))
+        return created
 
     # ------------------------------------------------------------------ 自愈工具
     @staticmethod

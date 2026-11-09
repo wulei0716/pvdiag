@@ -27,7 +27,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -111,6 +111,74 @@ def cmd_ingest(args):
     ctx = AgentContext(settings=s, store=store, run_date=end, station_ids=[args.station] if args.station else None)
     res = IngestAgent(backfill_days=(end - start).days, platform_overrides=overrides)(ctx)
     print(res.summary, res.alerts)
+
+
+def cmd_platform(args):
+    """云平台接入：register 登记电站+凭证；test 列设备/令牌状态（1~2 次调用）；auth 阳光授权码换令牌；hints 华为 MPPT 容量→档案建议"""
+    from .adapters import build_adapter
+    s = _settings(args)
+    store = Store(s.db_path, s.samples_dir)
+    if args.action == "register":
+        from .agents.profile import ProfileAgent
+        cfg = json.loads(Path(args.conf).read_text(encoding="utf-8")) if args.conf else {}
+        if args.set:
+            for kv in args.set:
+                k, v = kv.split("=", 1); cfg[k] = v
+        extra = {"platform_config": cfg}
+        if args.mount:
+            extra["mount"] = args.mount
+        row = {"station_id": args.station, "name": args.name or args.station, "platform": args.platform, "capacity_kwp": args.capacity,
+               "region": args.region, "lat": args.lat, "lon": args.lon, "extra_json": json.dumps(extra, ensure_ascii=False)}
+        old = store.query("SELECT extra_json, tariff_json FROM stations WHERE station_id=?", (args.station,))
+        if not old.empty:                                    # 保留已有的其它 extra 字段
+            ex = json.loads(old["extra_json"].iloc[0] or "{}"); ex.update(extra); row["extra_json"] = json.dumps(ex, ensure_ascii=False)
+            row["tariff_json"] = old["tariff_json"].iloc[0]
+        ProfileAgent.import_stations(store, pd.DataFrame([row]))
+        secret_keys = [k for k in cfg if any(t in k.lower() for t in ("code", "secret", "password", "pwd"))]
+        print(f"已登记 {args.station}（{args.platform}）；凭证字段 {secret_keys} 已写入本地库 stations.extra_json（勿把 data 目录上传）。"
+              f"建议用 *_env 把密钥放环境变量：如 system_code_env=PVDIAG_HW_SECRET")
+        return
+    st = store.query("SELECT * FROM stations WHERE station_id=?", (args.station,))
+    if st.empty:
+        print(f"电站 {args.station} 未登记：pvdiag platform register --station ... --platform ... --conf cfg.json"); return
+    pconf = json.loads(st["extra_json"].iloc[0] or "{}").get("platform_config", {})
+    adapter = build_adapter(st["platform"].iloc[0], args.station, pconf, store)
+    if args.action == "auth":
+        if st["platform"].iloc[0] != "sungrow":
+            print("auth 只用于阳光云（授权码换令牌）"); return
+        if not args.code:
+            print(f"请业主登录阳光云授权页勾选电站并同意授权，把回调地址里的 ?code=XXXX 交给：\n"
+                  f"  pvdiag platform auth --station {args.station} --code XXXX\n当前令牌状态：{adapter.token_status()}"); return
+        t = adapter.token_by_code(args.code)
+        print(f"令牌已保存：授权电站 {t.get('auth_ps_list')}，有效至 {datetime.fromtimestamp(t['expire_at']):%Y-%m-%d %H:%M}（48h 自动续期）")
+    elif args.action == "test":
+        if hasattr(adapter, "token_status"):
+            print("令牌：", adapter.token_status())
+        devs = adapter.list_devices()
+        print(f"{args.station}（{st['platform'].iloc[0]}）设备 {len(devs)} 台：")
+        if not devs.empty:
+            print(devs.to_string(index=False))
+        if hasattr(adapter, "calls_used_today"):
+            print(f"今日已用调用 {adapter.calls_used_today()} 次")
+    elif args.action == "hints":
+        from .adapters.huawei import HuaweiAdapter
+        caps = store.get_state(f"huawei:{args.station}:mppt_caps") or []
+        end = _date(args.end) if args.end else date.today()
+        start = _date(args.start) if args.start else end - timedelta(days=3)
+        frames = []
+        for k in range((end - start).days + 1):
+            df_ = store.read_samples("string", args.station, start + timedelta(days=k))
+            if df_ is not None and not df_.empty:
+                frames.append(df_)
+        smp = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if smp.empty:
+            print("没有该站的 5 分钟样本（先 pvdiag ingest --station ...）"); return
+        h = HuaweiAdapter.profile_hints(smp, pd.DataFrame(caps), module_wp=args.module_wp, inputs_per_mppt=args.inputs_per_mppt,
+                                        typical_n_modules=args.typical_modules)
+        print(h["state"].value_counts().to_dict())
+        print(h[h["state"] != "connected"][["string_id", "mppt", "cap_w", "state", "note"]].to_string(index=False))
+        if args.out:
+            h.to_csv(args.out, index=False, encoding="utf-8-sig"); print("档案建议：", args.out, "（核对后可并入 strings.csv 导入）")
 
 
 def cmd_run(args):
@@ -470,6 +538,12 @@ def main(argv=None):
     p = add("public"); p.add_argument("action", choices=["list", "fetch", "load"]); p.add_argument("name", nargs="?")
     p.add_argument("--plant", type=int); p.add_argument("--public-dir"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_public)
     p = add("explain"); p.add_argument("suspect_id"); p.add_argument("--ask"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_explain)
+    p = add("platform"); p.add_argument("action", choices=["register", "test", "auth", "hints"]); p.add_argument("--station", required=True)
+    p.add_argument("--platform", choices=["huawei", "sungrow", "ginlong", "csv"]); p.add_argument("--conf", help="platform_config JSON 文件"); p.add_argument("--set", action="append")
+    p.add_argument("--name"); p.add_argument("--capacity", type=float); p.add_argument("--region"); p.add_argument("--lat", type=float); p.add_argument("--lon", type=float)
+    p.add_argument("--mount"); p.add_argument("--code"); p.add_argument("--start"); p.add_argument("--end")
+    p.add_argument("--module-wp", type=float); p.add_argument("--typical-modules", type=int); p.add_argument("--inputs-per-mppt", type=int, default=2)
+    p.add_argument("--out"); p.set_defaults(fn=cmd_platform)
     p = add("daily"); p.add_argument("action", choices=["import", "diagnose"]); p.add_argument("--station", required=True)
     p.add_argument("--file"); p.add_argument("--platform"); p.add_argument("--inputs-per-mppt", type=int, default=2)
     p.add_argument("--start"); p.add_argument("--end"); p.add_argument("--group", choices=["auto", "inverter", "channel"], default="auto")

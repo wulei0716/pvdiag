@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pvdiag"
-version = "0.4.0"
+version = "0.5.0"
 description = "组串发电量异常诊断智能体系统：同机互比 → 规则/AI 判定 → 人工复核 → 工单闭环 → 自学习"
 readme = "README.md"
 requires-python = ">=3.10"

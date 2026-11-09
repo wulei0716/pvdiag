@@ -6,7 +6,9 @@
 >
 > 一句话结论（来自需求表）：判定标准不取"某一天"，而是统计基线——以"晴好天中午窗口(11:30-13:30)、同逆变器各串电流中位数互比"为主力（辐照/温度天然归一），偏离 ≥5% 且连续 2 个晴好天即判异常；先用可解释规则引擎起步，人工复核结果作为标注数据喂养模型，逐步过渡到 AI 自动判定 + 自动派单。
 
-本仓库是该需求的 **v0.4 可运行实现**：10 个阶段 → 11 个智能体 + 每日闭环编排 + CLI + 人工复核 Web 界面，自带合成电站与故障注入，可在没有真实数据时跑通并验证召回/误报。
+本仓库是该需求的 **v0.5 可运行实现**：10 个阶段 → 11 个智能体 + 每日闭环编排 + CLI + 人工复核 Web 界面，自带合成电站与故障注入，可在没有真实数据时跑通并验证召回/误报。
+
+**v0.5 新增（云平台适配器现网校准）**：华为 FusionSolar / 阳光 iSolarCloud / 锦浪 SolisCloud 三家适配器按实测工具包逐字段校准（接口、鉴权、时区、限流、测点编号、命名），`pvdiag platform register|test|auth|hints` 一条命令接站；新站自动建档案骨架，华为 MPPT 容量反推组件数/并联数/空输入；假会话全链路测试。
 
 **v0.4 新增（接真实电站前补齐代码欠缺）**：**日电量模式** `pvdiag daily import|diagnose`——只有"每串每日 kWh"（巡检报告/平台导出宽表）也能跑同机/同通道互比与通道三态（接入/空输入/零电流/未接），并用三座真实屋顶电站的巡检表做了基准（[说明与结果](docs/日电量模式与真实电站基准.md)）；
 辐照源可插拔（实测 → NASA POWER → Meteonorm → Open-Meteo → 晴空模型，按序回退+缓存+来源标记）与同区域站间 PR 互比；设备类型（优化器/微逆功率输入、双面组件增益归一、`n_parallel` 并联串数归一、空输入不报断线）；双轴跟踪建模与卡滞物理曲线校核；按站并行 `--workers`。
@@ -146,7 +148,17 @@ pvdiag import-profiles ./import
 ### 3.2 数据（阶段1）
 三种方式任选：
 1. **复用 F:\Hermes 已有拉数脚本**：把 `pull_range.py` 的落地文件放到 `<root>/<station_id>/strings/`（长表 `string_id,ts,current_a,voltage_v` 或华为宽表 `inverter_id,ts,pv1_i,pv1_u,...` 都认），`inverters/` 放 `inverter_id,ts,pac_kw,status`，电站 `platform=csv`，`extra_json={"platform_config":{"root":"<root>"}}`
-2. **直连云平台**：`platform=huawei|ginlong|sungrow`，凭证放 `extra_json.platform_config`（见 `config.example.yaml` 末尾）。华为配额"先算后拉"（`QuotaPlanner`：日限额 = Σ⌈设备数/100⌉+24，每批 ≤4 天，登录计入），token 30 分钟续期；锦浪 pac W→kW；阳光 token 48h、不取当天
+2. **直连云平台**（v0.5 起按三家现网实测校准）：
+   ```bash
+   pvdiag platform register --station XWZ3 --platform huawei --conf hw.json --name 小王子三厂 --capacity 2200 --lat 30.23 --lon 119.72
+   export PVDIAG_HW_XWZ3='<北向密码>'        # hw.json 里写 system_code_env: PVDIAG_HW_XWZ3，密钥不落库
+   pvdiag platform test --station XWZ3        # 登录 + 设备清单（2 次调用）
+   pvdiag ingest --station XWZ3 --start 2026-10-28 --end 2026-10-29   # 一天一次 getDevFiveMinutes，自动建档案骨架
+   pvdiag platform hints --station XWZ3 --module-wp 550 --typical-modules 20 --out hints.csv   # MPPT 容量反推组件数/并联数/空输入
+   pvdiag platform auth --station JK --code XXXX   # 阳光云：业主授权回调里的 code 换令牌（48h 自动续期）
+   ```
+   华为：`getDevFiveMinutes` 一天一次、两次调用间隔 ≥65 s、配额 Σ⌈设备数/100⌉+24 次/日含登录（20 台 = 25 次）、token 30 分钟、`collectTime` UTC→北京时、设备名作 inverter_id；
+   阳光：OAuth 授权码 + refresh_token 滚动、`getDevicePointMinuteDataList` 3 小时窗口、不返回当天、SG110CX 9 路 MPPT 默认测点；锦浪：HMAC-SHA1 签名、2 次/秒、pac W→kW。详见 `config.example.yaml` 末尾
 3. **程序内直灌**：`IngestAgent().ingest_frames(ctx, station_id, strings_df, inverters_df)`
 
 4. **只有"每串每日 kWh"时（v0.4 日电量模式）**：巡检报告/平台导出的宽表（行 = 逆变器×通道，列 = 日期，另有 状态 列）或长表 CSV
@@ -262,7 +274,7 @@ bash deploy/install_mac.sh --demo     # .venv + 依赖 + 演示数据 + launchd�
 
 ## 7. 已知限制 / 下一步
 
-- 三家云 API 适配器按公开接口实现，**字段名与限流细节需用 F:\Hermes 现有工具包和真实凭证联调**
+- 三家云 API 适配器已按工具包的现网实测行为校准（v0.5），并用假会话走通华为全链路；真实出站联调需在能访问各云平台的机器上跑（见 3.2）
 - 天气标记无外部气象数据时只看功率，"雨天"用阴雨日近似；有辐照（气象站/卫星）时自动用它校正（Kaggle 基准即如此）
 - 规则阈值是经验起步值；v0.2 起由 TuningAgent 按复核结果自动在安全区间内调；ML 模型需 ≥60 条标注后自动训练，考试达标才上线
 - 公开数据的"参考标签"是统计得出的弱标注，不是现场确认；弱标注训练验证的是链路和闸门，上生产仍以复核结论为准
