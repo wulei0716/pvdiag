@@ -35,8 +35,12 @@ class DetectAgent(Agent):
     def run(self, ctx: AgentContext) -> AgentResult:
         res = AgentResult(agent=self.name)
         all_susp: List[Dict] = []
-        for sid in ctx.stations():
-            all_susp.extend(self.detect_station(ctx, sid, ctx.run_date))
+        from ..parallel import map_stations
+        sids = ctx.stations()
+        for susp, sig_rows in map_stations(ctx.settings, ctx, self.detect_station, sids, ctx.run_date):
+            all_susp.extend(susp)
+            if sig_rows:
+                ctx.store.upsert_df("signatures", pd.DataFrame(sig_rows))      # 写只在主进程做
         all_susp = self._reconcile_cases(ctx, all_susp)
         if all_susp:
             ctx.store.upsert_df("suspects", pd.DataFrame(all_susp))
@@ -158,13 +162,14 @@ class DetectAgent(Agent):
         return best[0]
 
     # ------------------------------------------------------------------ 单站
-    def detect_station(self, ctx: AgentContext, station_id: str, d: date) -> List[Dict]:
+    def detect_station(self, ctx: AgentContext, station_id: str, d: date) -> Tuple[List[Dict], List[Dict]]:
+        """单站诊断（只读库）：返回 (嫌疑候选, 签名行)；落库由 run() 在主进程统一做，便于按站并行"""
         th, cfg = ctx.settings.thresholds, ctx.settings.baseline
         today = d.isoformat()
         strings = ctx.store.strings(station_id)
         bl = ctx.store.baselines(station_id, d, d)
         if bl.empty or strings.empty:
-            return []
+            return [], []
         feats = ctx.store.daily_features(station_id, d - timedelta(days=10), d)
         ft = feats[feats["date"] == today].set_index("string_id")
         weather_row = ctx.store.station_daily(station_id, d, d)
@@ -277,8 +282,6 @@ class DetectAgent(Agent):
                 "archived_shading": int(archived), "status": SuspectStatus.OPEN.value,
                 "created_at": pd.Timestamp.now().isoformat(),
             })
-        if sig_rows:
-            ctx.store.upsert_df("signatures", pd.DataFrame(sig_rows))
 
         # ---- 整机级嫌疑（机间互比兜底整机问题）
         for r in inv_bl.itertuples():
@@ -303,7 +306,7 @@ class DetectAgent(Agent):
                     "signature_json": sig.model_dump_json(), "low_confidence": 0, "archived_shading": 0,
                     "status": SuspectStatus.OPEN.value, "created_at": pd.Timestamp.now().isoformat(),
                 })
-        return out
+        return out, sig_rows
 
     # ------------------------------------------------------------------ 工具
     @staticmethod

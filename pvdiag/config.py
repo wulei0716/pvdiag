@@ -195,9 +195,16 @@ class LLMCfg(BaseModel):
     timeout_seconds: int = 40
 
 
+class RuntimeCfg(BaseModel):
+    """运行规模：万串级多站时按站并行算基线/诊断（每站独立进程只读库，结果回主进程统一落库）"""
+    workers: int = 1                        # 1 = 串行；N>1 或 0（=CPU 核数）按站并行。可用环境变量 PVDIAG_WORKERS 覆盖
+    parallel_min_stations: int = 2          # 站数少于此值不起进程池（省启动开销）
+
+
 class Settings(BaseModel):
     data_dir: Path = Path("./data")
     timezone: str = "Asia/Shanghai"
+    runtime: RuntimeCfg = RuntimeCfg()
     thresholds: Thresholds = Thresholds()
     baseline: BaselineCfg = BaselineCfg()
     confidence: Confidence = Confidence()

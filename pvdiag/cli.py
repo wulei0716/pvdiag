@@ -40,6 +40,8 @@ def _settings(args, with_overrides: bool = True) -> Settings:
     s = Settings.load(args.config)
     if getattr(args, "data_dir", None):
         s.data_dir = Path(args.data_dir)
+    if getattr(args, "workers", None) is not None:
+        s.runtime.workers = int(args.workers)
     s.ensure_dirs()
     if with_overrides:
         from .agents.tuning import apply_overrides
@@ -386,6 +388,7 @@ def main(argv=None):
     common.add_argument("--config", default=argparse.SUPPRESS)
     common.add_argument("--data-dir", default=argparse.SUPPRESS)
     common.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
+    common.add_argument("--workers", type=int, default=argparse.SUPPRESS, help="按站并行进程数（1 串行，0 = CPU 核数）")
     ap = argparse.ArgumentParser("pvdiag", description="组串发电量异常诊断智能体系统", parents=[common])
     ap.set_defaults(config="config.yaml", data_dir=None, verbose=False)
     sub = ap.add_subparsers(dest="cmd", required=True)

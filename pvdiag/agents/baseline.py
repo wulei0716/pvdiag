@@ -34,8 +34,9 @@ class BaselineAgent(Agent):
     def run(self, ctx: AgentContext) -> AgentResult:
         res = AgentResult(agent=self.name)
         n_rows, n_cold, n_inv = 0, 0, 0
-        for sid in ctx.stations():
-            bl, ibl = self.compute_for_date(ctx, sid, ctx.run_date)
+        from ..parallel import map_stations
+        sids = ctx.stations()
+        for sid, (bl, ibl) in zip(sids, map_stations(ctx.settings, ctx, self.compute_for_date, sids, ctx.run_date)):
             if not bl.empty:
                 ctx.store.upsert_df("baselines", bl)
                 n_rows += len(bl)
