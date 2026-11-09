@@ -66,7 +66,7 @@ class BaselineAgent(Agent):
             "SELECT i.* FROM inverter_daily i JOIN inverters v ON v.inverter_id=i.inverter_id "
             "WHERE v.station_id=? AND i.date BETWEEN ? AND ?", (station_id, lookback.isoformat(), d.isoformat()))
 
-        keep = ["string_id", "inverter_id", "group_key", "azimuth", "tilt", "known_shading"] + [c for c in ("module_type", "device_type") if c in strings.columns]
+        keep = ["string_id", "inverter_id", "group_key", "azimuth", "tilt", "known_shading"] + [c for c in ("module_type", "device_type", "n_parallel") if c in strings.columns]
         f = feats.merge(strings[keep], on="string_id", how="left")
         f["weather_tag"] = f["date"].map(weather["weather_tag"]) if not weather.empty else "nodata"
         stale = f["stale_run_min"].fillna(0) >= th.stale_run_min if "stale_run_min" in f.columns else pd.Series(False, index=f.index)
@@ -90,6 +90,8 @@ class BaselineAgent(Agent):
             g = th.bifacial_gain
             factor = np.where((mt == "bifacial") & ~is_ref_bif, g, np.where((mt != "bifacial") & is_ref_bif, 1.0 / g, 1.0))
             f["orient_exp_ratio"] = f["orient_exp_ratio"] * factor
+        if "n_parallel" in f.columns:            # 双串并联的一路：电流按并联数折成单串再互比
+            f["orient_exp_ratio"] = f["orient_exp_ratio"] * pd.to_numeric(f["n_parallel"], errors="coerce").fillna(1).clip(lower=1)
         f["noon_norm"] = f["noon_median_i"] / f["orient_exp_ratio"]
 
         # ---- 群组中位数（三级回退：配置群组 → 整机 → 无）
@@ -171,7 +173,7 @@ class BaselineAgent(Agent):
                 h = irr_all[idx]; y = energy_all[idx] / np.where(h == 0, np.nan, h)
                 yh = y[before & clear & (col["limited"][idx] == 0) & ~np.isnan(y)][-30:]
                 yt = y[dates == today]
-                if len(yh) >= 5 and len(yt) and not np.isnan(yt[0]):
+                if len(yh) >= 5 and len(yt) and not np.isnan(yt[0]) and np.median(yh) > 0:      # 全期 0 电量的空输入：中位 0 不除
                     v_dev = float(yt[0] / np.median(yh) - 1)
             rows.append({
                 "string_id": sid, "date": today, "segment_start": seg_start, "group_key": cur["group_key"],

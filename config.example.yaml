@@ -4,6 +4,18 @@
 data_dir: ./data
 timezone: Asia/Shanghai
 
+runtime:                     # 运行规模（v0.4）
+  workers: 1                 # 按站并行进程数：1 串行；N>1 或 0（=CPU 核数）多站并行算基线/诊断，主进程统一落库；环境变量 PVDIAG_WORKERS 可覆盖
+  parallel_min_stations: 2
+
+irradiance:                  # 辐照源（v0.4）：竖向基线 Y=E/H、站级 PR、站间互比用。按 providers 顺序回退，每天的来源记在 station_daily.irradiance_source
+  source: auto               # auto | none
+  providers: [measured, nasa_power, meteonorm, openmeteo, clearsky]
+  nasa_power: false          # NASA POWER 日 ALLSKY_SFC_SW_DWN（免费无 key，滞后数天）— 打开即可用，需 stations.lat/lon
+  meteonorm: false           # Meteonorm REST（Bearer token，环境变量 METEONORM_TOKEN；导出的小时 CSV 放 <root>/<station>/irradiance/ 也认）
+  openmeteo: false           # Open-Meteo ERA5 再分析（免费无 key）
+  cache_days: 400            # 外部日值按站缓存在 platform_state，一天只拉一次
+
 thresholds:
   normal_floor: -0.03        # > -3% 正常（正常串自然波动 ±1~2%）
   fault_floor: -0.05         # ≤ -5% 持续低发候选（≈ 噪声带 2~3 倍）
@@ -20,9 +32,11 @@ thresholds:
   cold_start_cap_grade: D    # 冷启动（晴好天基线样本不足）只凭互比偏差最高给 D
   outage_min_slots: 2        # 白天 ≥1h 整段 0 输出而同机其它串正常 → 间歇停机/掉线
   outage_rel_zero: 0.10      # ≤ 群组同时段 10% 视为"整段为 0"
-  tracker_side_ratio: 0.85   # 跟踪电站（stations.extra.mount=tracker）：清晨/傍晚相对群组都 ≤0.85 且中午正常 → 支架卡滞
+  tracker_side_ratio: 0.85   # 跟踪电站（stations.extra.mount=tracker|tracker_dual）：清晨/傍晚相对群组都 ≤0.85 → 卡滞候选；双轴/中午也偏低时再做物理曲线校核
+  bifacial_gain: 1.08        # 双面组件（strings.module_type=bifacial）与单面同机混装时的背面增益归一（按场地反射率调）
 
 baseline:
+  tz_meridian_deg: 120       # 时区中央经线（北京时间 120°E）：中午窗口按 stations.lon 平移到太阳时
   noon_start: "11:30"
   noon_end: "13:30"
   rolling_clear_days: 30

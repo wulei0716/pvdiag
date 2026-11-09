@@ -6,7 +6,10 @@
 >
 > 一句话结论（来自需求表）：判定标准不取"某一天"，而是统计基线——以"晴好天中午窗口(11:30-13:30)、同逆变器各串电流中位数互比"为主力（辐照/温度天然归一），偏离 ≥5% 且连续 2 个晴好天即判异常；先用可解释规则引擎起步，人工复核结果作为标注数据喂养模型，逐步过渡到 AI 自动判定 + 自动派单。
 
-本仓库是该需求的 **v0.3 可运行实现**：10 个阶段 → 11 个智能体 + 每日闭环编排 + CLI + 人工复核 Web 界面，自带合成电站与故障注入，可在没有真实数据时跑通并验证召回/误报。
+本仓库是该需求的 **v0.4 可运行实现**：10 个阶段 → 11 个智能体 + 每日闭环编排 + CLI + 人工复核 Web 界面，自带合成电站与故障注入，可在没有真实数据时跑通并验证召回/误报。
+
+**v0.4 新增（接真实电站前补齐代码欠缺）**：**日电量模式** `pvdiag daily import|diagnose`——只有"每串每日 kWh"（巡检报告/平台导出宽表）也能跑同机/同通道互比与通道三态（接入/空输入/零电流/未接），并用三座真实屋顶电站的巡检表做了基准（[说明与结果](docs/日电量模式与真实电站基准.md)）；
+辐照源可插拔（实测 → NASA POWER → Meteonorm → Open-Meteo → 晴空模型，按序回退+缓存+来源标记）与同区域站间 PR 互比；设备类型（优化器/微逆功率输入、双面组件增益归一、`n_parallel` 并联串数归一、空输入不报断线）；双轴跟踪建模与卡滞物理曲线校核；按站并行 `--workers`。
 
 **v0.3 新增**：连续运行压测 `pvdiag soak`（模拟复核员/主管/现场跑半年，验证自调参/模型/门控的长期行为，[报告](docs/连续运行压测报告.md)）；
 诊断能力——季节性朝向物理归一与档案校核（晴空倾斜面模型 + 朝向网格拟合，直接告诉复核员"曲线最像东向 90°"）、跟踪支架卡滞签名、站级积灰量化与清洗回本；
@@ -45,13 +48,13 @@ LLM 分析助手（复核页「分析助手」面板 + 追问，`pvdiag explain`
 | 阶段1 数据接入与治理 | `adapters/`（huawei/ginlong/sungrow/csv）`agents/ingest.py` `features.py` | ✅ 框架+CSV 可用；三家云 API 需用真实凭证联调字段 |
 | 阶段2 组串档案 | `agents/profile.py` | ✅ |
 | 阶段3 基线建模 | `agents/baseline.py` | ✅ |
-| 阶段4 异常检测（规则引擎） | `agents/detect.py` `solar.py` | ✅ v0.2：间歇停机/掉线签名、群组噪声门控、冷启动分级上限、半天钉死；v0.3：季节性朝向物理归一+档案校核、跟踪支架卡滞 |
+| 阶段4 异常检测（规则引擎） | `agents/detect.py` `solar.py` `daily_energy.py` | ✅ v0.2：间歇停机/掉线签名、群组噪声门控、冷启动分级上限、半天钉死；v0.3：季节性朝向物理归一+档案校核、跟踪支架卡滞；v0.4：双轴卡滞物理校核、空输入、并联归一、日电量模式 |
 | 阶段4·块二 阈值调优 | `agents/tuning.py` | ✅ v0.2：自调参闭环（影子回放 → 达标生效 → 确认率下跌回滚） |
 | 阶段5 AI 判定 | `agents/classify.py` | ✅ 冷启动规则代理 → 标注≥60 自动训练；v0.2：时间留出集考试、达标上线、线上落后自动降级 |
 | 阶段6 人工复核平台 | `agents/review.py` `web/` | ✅ 控制台新增「自主运行」页 |
 | 阶段7 工单派发与闭环 | `agents/workorder.py` | ✅ dryrun + 企业微信 webhook；v0.2：`gated` 门控自动开合 |
 | 阶段8 损失量化 | `agents/loss.py` | ✅ |
-| 阶段9 区域检修/清洗 | `agents/region.py` | ✅ v0.3：站级积灰量化（PR/清洁参考/日损/清洗回本） |
+| 阶段9 区域检修/清洗 | `agents/region.py` `irradiance.py` | ✅ v0.3：站级积灰量化（PR/清洁参考/日损/清洗回本）；v0.4：辐照源回退链、同区域站间 PR 互比 |
 | 阶段10 闭环自学习与监控 | `agents/monitor.py` `health.py` `notify.py` `orchestrator.py` | ✅ v0.2：健康自检、关键事件推送、接入自愈 |
 | 公开数据基准 | `public/` | ✅ v0.2：Kaggle 两站 + NREL 标注片段，`pvdiag bench` |
 | 连续运行压测 | `sim/soak.py` | ✅ v0.3：`pvdiag soak`，模拟复核员/主管/现场 |
@@ -134,6 +137,8 @@ pvdiag public load --plant 2 && pvdiag backfill --start 2020-05-15 --end 2020-06
 pvdiag import-profiles ./import
 ```
 - `strings.csv` 必填：`string_id, station_id, inverter_id, pv_index, n_modules, azimuth, tilt`；强烈建议填 `roof_area, module_wp, module_vmp, module_imp, known_shading, shading_expected_dev`
+- v0.4 新增可选列：`n_parallel`（一路 MPPT 接两串并联填 2，电流按并联数折成单串再互比——否则双串占多数的逆变器里单串会恒显 −50%）、`device_type`（string|optimizer|microinverter，后两者只有功率、不判电压异位）、`module_type`（mono|bifacial，双面按 `thresholds.bifacial_gain` 归一）
+- `mppt` 列用于"空输入"判别：华为/阳光每 MPPT 两路输入只接一路时，空的那路读到共压电压、电流恒 0——档案未登记组件数且同 MPPT 兄弟路正常 → 不报断线（0 电流 + 档案有组件数才是真断线）
 - `string_id` 约定 `<inverter_id>-pv<N>`，与适配器输出一致；**pv 编号与物理串的对应关系须由现场排布图确认**
 - 配置差异串自动分组（逆变器|串长|朝向桶|倾角桶|组件型号），不同配置不混合互比
 - 清洗/维修/换串用 `pvdiag event add ...` 登记，基线自该日分段重置
@@ -144,9 +149,18 @@ pvdiag import-profiles ./import
 2. **直连云平台**：`platform=huawei|ginlong|sungrow`，凭证放 `extra_json.platform_config`（见 `config.example.yaml` 末尾）。华为配额"先算后拉"（`QuotaPlanner`：日限额 = Σ⌈设备数/100⌉+24，每批 ≤4 天，登录计入），token 30 分钟续期；锦浪 pac W→kW；阳光 token 48h、不取当天
 3. **程序内直灌**：`IngestAgent().ingest_frames(ctx, station_id, strings_df, inverters_df)`
 
+4. **只有"每串每日 kWh"时（v0.4 日电量模式）**：巡检报告/平台导出的宽表（行 = 逆变器×通道，列 = 日期，另有 状态 列）或长表 CSV
+   ```bash
+   pvdiag daily import --station XWZ3 --file 月报.xlsx --platform huawei      # 档案 + 日电量 + 天气（概况表的占晴峰%/天气）
+   pvdiag daily diagnose --station XWZ3 [--group auto|inverter|channel]      # 同机（或同编号通道跨设备）日电量互比 → suspects
+   ```
+   没有曲线形状，证据弱于 5 分钟互比：互比最高给 B、晴好天 <5 天上限 D；阴天偏差消失 → C 朝向；与天气无关的恒定比例 → C 档案差异/串长（电压型偏差，电流互比看不见）；
+   通道三态：接入 / 空输入（同 MPPT 兄弟路在发电）/ 零电流待核实 / 未接；电量 ≥1.6× 群组中位 → 疑双串并联，不作异常也不进中位数。详见 [docs/日电量模式与真实电站基准.md](docs/日电量模式与真实电站基准.md)
+
 每日任务：
 ```bash
 pvdiag run --date $(date +%F)          # 拉当天增量 + 全链路；阳光站自动取 T-1
+pvdiag run --workers 0                 # 多站：按站并行（0 = CPU 核数；或 config runtime.workers / 环境变量 PVDIAG_WORKERS）
 pvdiag run --backfill-days 3           # 断点续拉近 3 天
 ```
 macOS launchd / Windows 计划任务 / cron 任选其一每天 20:00 后执行（需要全天数据）。
@@ -176,7 +190,9 @@ macOS launchd / Windows 计划任务 / cron 任选其一每天 20:00 后执行�
 ### 3.5 诊断能力（v0.3）
 - **季节性朝向**：同机各串朝向/倾角不同时，先按晴空倾斜面辐照把中午电流折算到参考朝向再互比（冬天东向比南向低 25% 是物理不是故障）；
   曲线形状明显像另一个朝向（网格拟合误差 <0.05 且显著优于档案朝向）→ C 级「朝向差异」并给出最像的方位/倾角，核排布图即可，不派现场
-- **跟踪支架**：`stations.extra_json.mount: tracker` 的电站，某串清晨/傍晚相对同机都 ≤85% 而中午正常 → 「跟踪支架卡滞」，带专用检查项
+- **跟踪支架**：`stations.extra_json.mount: tracker`（水平单轴）或 `tracker_dual`（双轴，v0.4）的电站，某串清晨/傍晚相对同机都 ≤85% → 卡滞候选；单轴要求中午 ≈1，双轴冬季中午也会偏低，改用物理曲线校核（比值曲线 vs "卡在固定倾角"的期望曲线，rmse<0.06 且明显优于平直假设）→ 「跟踪支架卡滞」并给出最像的卡滞倾角
+- **辐照源可插拔**（v0.4）：`irradiance.providers` 按序回退 实测 → NASA POWER → Meteonorm → Open-Meteo → 晴空模型；每天来源记在 `station_daily.irradiance_source`，晴空模型只作分母不判天气；同区域同一来源的站做 **站间 PR 互比**（全站一起低发的互比盲区）
+- **设备类型**（v0.4）：优化器/微逆只有功率 → 按 `P/U`（无电压按 100V 虚拟电压）折等效电流走同机互比、不判电压异位；双面组件按增益归一；`n_parallel` 并联串数归一
 - **站级积灰**：有辐照用 PR、无辐照用中午功率/峰值参考；清洁参考取最近降雨后首个晴好天；输出积灰损失 %、kWh/天、清洗成本与回本天数（`loss.cleaning_cost_per_kwp`）
 - **分析助手**：复核页「分析助手」面板把案卷（偏差序列/签名/档案/历史复核/同类案例现场结论/损失/工单）交给大模型写 结论/依据/建议/不确定性，并可追问；模型只能引用案卷事实；无 key 用模板，`llm.enabled: false` 彻底关闭出站
 
@@ -235,13 +251,13 @@ bash deploy/install_mac.sh --demo     # .venv + 依赖 + 演示数据 + launchd�
 ## 6. 待决策事项（需求表第六块，代码已留接口）
 
 1. 派单渠道：已实现 dryrun + 企业微信；钉钉/自有工单系统可实现 `DispatchChannel.send()` 接入
-2. 站间对比气象源：`station_daily.irradiance_kwh_m2` 预留，有辐照仪/卫星数据时竖向基线 Y=E/H 自动启用
+2. 站间对比气象源：v0.4 已接 NASA POWER / Meteonorm / Open-Meteo（`irradiance.providers`，默认关闭，打开即用）；有辐照仪数据走 measured 优先
 3. 缺组件参数的站：ProfileAgent 每日报告缺参串；损失用实测 V/I 不依赖铭牌，缺电压时标"待量化"
 4. 冷启动口径：`baseline.min_clear_days`，不足只做同日互比
 5. 已知遮挡备案：`strings.known_shading / shading_expected_dev`，备案由谁维护需定
 6. 复核责任人与频率：`pvdiag review batch --station X` 生成周批清单
 7. 数据合规：全部本地 SQLite/Parquet，私有化部署无出站
-8. 跟踪支架/双面组件、9. 微逆/优化器：未建模，接入前先盘点设备类型
+8. 跟踪支架/双面组件、9. 微逆/优化器：v0.4 已建模（`mount` / `module_type` / `device_type`），接入前仍需盘点并写进档案
 10. 运行归属：CLI 可在本机 Hermes 定时任务或服务器 cron 下运行，状态/配额/告警都在库里
 
 ## 7. 已知限制 / 下一步
@@ -252,5 +268,6 @@ bash deploy/install_mac.sh --demo     # .venv + 依赖 + 演示数据 + launchd�
 - 公开数据的"参考标签"是统计得出的弱标注，不是现场确认；弱标注训练验证的是链路和闸门，上生产仍以复核结论为准
 - Kaggle 数据是逆变器级，"同机互比"在那里是"同站各逆变器互比"；组串级真实数据的考试需要接入自有电站后用复核结论做
 - 性能（v0.3）：72 串×20 天回放 16 s（v0.2 为 47 s）；360 串每日全链路约 2 s；按此线性外推万串级约 1 分钟/天；接入特征计算约 4 ms/串·日
-- 跟踪支架只建模水平单轴（东西转动）；双面组件/微逆/优化器仍未建模
+- v0.4 补齐：双轴跟踪、双面组件、微逆/优化器（功率输入）、并联串数、按站并行、辐照源（NASA POWER / Meteonorm / Open-Meteo）与站间互比；云平台适配器真实字段仍待凭证联调
+- 日电量模式只有量没有形状：遮挡 / 积灰 / 组件故障分不开（统一 B 待复核），朝向与串长靠"阴天是否消失 / 是否与天气无关"区分；真实站基准见 [docs/日电量模式与真实电站基准.md](docs/日电量模式与真实电站基准.md)
 - 季节性朝向模型是简化晴空模型（直射 + 各向同性散射），用于比值不用于绝对发电量；纬度取 stations.lat，缺省 30°

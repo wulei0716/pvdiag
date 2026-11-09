@@ -136,11 +136,17 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
             known, exp_dev, note = 0, None, ""
             az_doc, tilt_doc = cfg.azimuth, cfg.tilt
             module_type = "mono"
+            n_parallel = 1
+            nm_doc = cfg.n_modules
             for f in sf_by_string.get(sid, []):
                 if f.kind == "bifacial_actual" and f.params.get("archive_correct", True):
                     module_type = "bifacial"
+                if f.kind == "parallel_actual" and f.params.get("archive_correct", True):
+                    n_parallel = int(f.params.get("n_parallel", 2))
                 if f.kind == "wrong_profile":
                     nm = int(f.params.get("n_modules", nm))        # 真实串长少两块，但档案仍记 cfg.n_modules
+                if f.kind == "empty_input":
+                    nm_doc = None                                  # 空输入：档案没登记组件（平台把它当一路上报，电压=共 MPPT 兄弟路、电流 0）
                 if f.kind == "archived_shading":
                     known, exp_dev, note = 1, -round(f.params.get("depth", 0.3) * 0.25, 3), "备案：东侧广告牌上午遮挡"
                 if f.kind == "azimuth_actual" and f.params.get("archive_correct", True):
@@ -148,10 +154,11 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
             string_nmod[sid] = nm
             strings_rows.append({
                 "string_id": sid, "station_id": cfg.station_id, "inverter_id": inv, "mppt": (n - 1) // 2 + 1,
-                "pv_index": n, "n_modules": cfg.n_modules, "module_model": "SIM-550M", "module_wp": cfg.module_wp,
+                "pv_index": n, "n_modules": nm_doc, "module_model": "SIM-550M", "module_wp": cfg.module_wp,
                 "module_vmp": cfg.module_vmp, "module_imp": cfg.module_imp, "azimuth": az_doc, "tilt": tilt_doc,
                 "roof_area": cfg.roof_areas[k % len(cfg.roof_areas)], "known_shading": known,
                 "shading_expected_dev": exp_dev, "shading_note": note, "notes": "", "device_type": cfg.device_type, "module_type": module_type,
+                "n_parallel": n_parallel,
             })
     strings_df = pd.DataFrame(strings_rows)
     dc_kwp = cfg.strings_per_inverter * cfg.n_modules * cfg.module_wp / 1000.0
@@ -214,7 +221,10 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
                     if di < f.start_day or (f.end_day is not None and di >= f.end_day):
                         continue
                     p = f.params
-                    if f.kind == "bifacial_actual":
+                    if f.kind == "parallel_actual":
+                        # 一路 MPPT 接了两串并联（物理事实）：电流翻倍；档案 n_parallel 对不对由 archive_correct 决定
+                        I = I * p.get("n_parallel", 2)
+                    elif f.kind == "bifacial_actual":
                         # 双面组件：背面增益（晴天全额、多云一半、阴天散射为主也有一点）
                         I = I * (1.0 + (p.get("gain", 0.08)) * {"clear": 1.0, "cloudy": 0.6, "overcast": 0.4}[weathers[di]])
                     elif f.kind == "azimuth_actual":
@@ -226,6 +236,8 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
                             I = I / tracker_gain * geo_factor(cfg.azimuth, p.get("stuck_tilt", 0.0))
                     elif f.kind == "open_circuit":
                         I = np.zeros(n_t); V = np.where(G > 15, v_clamp * 1.18, 0.0)
+                    elif f.kind == "empty_input":
+                        I = np.zeros(n_t); V = v_clamp.copy()           # 共压：电压与同 MPPT 另一路一样，电流恒 0
                     elif f.kind in ("diode_bypass", "shading_fixed", "archived_shading"):
                         band = (minutes >= _hhmm(p["start"])) & (minutes < _hhmm(p["end"]))
                         depth = p.get("depth", 0.33) if weathers[di] != "overcast" else p.get("depth", 0.33) * 0.15

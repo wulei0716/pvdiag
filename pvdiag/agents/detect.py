@@ -28,6 +28,22 @@ from .base import Agent, AgentContext, AgentResult
 SEVERITY = {Grade.A.value: 0, Grade.B.value: 1, Grade.C.value: 2, Grade.D.value: 3, Grade.E.value: 4, Grade.ARCHIVED.value: 5}
 
 
+def _n_parallel_of(p) -> float:
+    """档案并联串数（一路 MPPT 接两串并联 → 2）；缺省 1"""
+    try:
+        v = p.get("n_parallel") if hasattr(p, "get") else None
+        v = float(v) if v is not None and not pd.isna(v) else 1.0
+        return v if v >= 1 else 1.0
+    except Exception:
+        return 1.0
+
+
+def _n_parallel(prof: pd.DataFrame) -> Dict[str, float]:
+    if "n_parallel" not in prof.columns:
+        return {}
+    return {sid: _n_parallel_of(row) for sid, row in prof.to_dict("index").items()}
+
+
 class DetectAgent(Agent):
     name = "detect"
     stage = "阶段4 异常检测（规则引擎）"
@@ -253,6 +269,11 @@ class DetectAgent(Agent):
                                               weather, dip_days, th, tracker_days)
             if grade is None:
                 continue
+            # 空输入：华为/阳光每 MPPT 两路，只接一路时另一路读到共压电压、电流恒 0。档案未登记组件数且同 MPPT 兄弟路正常 → 不是断线
+            if cause == Cause.OPEN_CIRCUIT.value and sig.zero_all_day and self._is_empty_input(sid, p, prof_rows, ft_rows, th):
+                grade, cause = Grade.E.value, Cause.DATA_ISSUE.value
+                notes = ["同 MPPT 另一路在正常发电、档案未登记组件数 → 判为空输入（共压读到电压、电流 0），不报断线；现场确有接线请补档案 n_modules"]
+                sig.notes.append(notes[0])
 
             # 冷启动（该串晴好天基线样本不足）：仅凭互比偏差不下 B 级结论——只做同日互比、进观察带
             if grade == Grade.B.value and int(b.get("cold_start", 0) or 0) == 1 and not (sig.dip_depth or sig.outage_hours or sig.inverter_level):
@@ -314,6 +335,7 @@ class DetectAgent(Agent):
         curves: Dict[str, List[np.ndarray]] = {}
         inv_of = prof["inverter_id"].to_dict()
         gkey, glevel = bl["group_key"].to_dict(), bl["group_level"].to_dict()
+        npar = _n_parallel(prof)
         for sid, row in ft.to_dict("index").items():
             if sid not in inv_of or sid not in gkey:
                 continue
@@ -321,10 +343,26 @@ class DetectAgent(Agent):
                 continue
             key = gkey[sid] if glevel[sid] == "group" else inv_of[sid]
             vec = np.array([np.nan if v is None else v for v in json.loads(row["i_profile_json"])], dtype=float)
-            curves.setdefault(key, []).append(vec)
+            curves.setdefault(key, []).append(vec / npar.get(sid, 1.0))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)      # 夜间槽全 NaN 属正常
             return {k: np.nanmedian(np.vstack(v), axis=0) for k, v in curves.items() if len(v) >= 3}
+
+    @staticmethod
+    def _is_empty_input(sid: str, p: Dict, prof_rows: Dict[str, Dict], ft_rows: Dict[str, Dict], th) -> bool:
+        nm = p.get("n_modules")
+        if nm is not None and not pd.isna(nm) and float(nm) > 0:
+            return False                                   # 档案说接了组件 → 0 电流就是真断线
+        mp = p.get("mppt")
+        if mp is None or pd.isna(mp):
+            return False
+        for osid, op in prof_rows.items():
+            if osid == sid or op.get("inverter_id") != p.get("inverter_id") or op.get("mppt") != mp:
+                continue
+            f = ft_rows.get(osid)
+            if f is not None and not f.get("zero_all_day") and not pd.isna(f.get("noon_median_i")) and f.get("noon_median_i", 0) >= th.zero_current_a:
+                return True
+        return False
 
     @staticmethod
     def _voltage_offsets(ft: pd.DataFrame, prof: pd.DataFrame, bl: pd.DataFrame) -> Dict[str, float]:
@@ -461,7 +499,7 @@ class DetectAgent(Agent):
             return sig, None, None
         key = b["group_key"] if b["group_level"] == "group" else p["inverter_id"]
         gcurve = group_curves.get(key)
-        vec = np.array([np.nan if v is None else v for v in json.loads(f["i_profile_json"])], dtype=float)
+        vec = np.array([np.nan if v is None else v for v in json.loads(f["i_profile_json"])], dtype=float) / _n_parallel_of(p)
         if gcurve is None or len(vec) != len(gcurve):
             return sig, None, None
         valid = (gcurve >= max(0.5, 0.15 * np.nanmax(gcurve))) & ~np.isnan(vec)

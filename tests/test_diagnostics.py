@@ -166,3 +166,34 @@ def test_power_only_devices_and_bifacial(tmp_path):
         b = store.query("SELECT dev_today, orient_exp_ratio FROM baselines WHERE string_id=? AND date=?", (s(1, 6), end.isoformat()))
         assert abs(b["orient_exp_ratio"].iloc[0] - 1.08) < 1e-6 and abs(b["dev_today"].iloc[0]) < 0.03, b.to_dict("records")
         assert susp[(susp["string_id"] != s(1, 3)) & susp["grade"].isin(["A", "B"])].empty
+
+
+def test_parallel_strings_normalized_by_profile(tmp_path):
+    """一路 MPPT 接两串并联（电流 2×）：档案登记 n_parallel=2 → 不报高、也不把同机单串拉成低发；档案没登记 → 单串恒显负偏差，多串被误报"""
+    s = lambda k, n: f"PA1-INV{k:02d}-pv{n}"
+    for correct in (True, False):
+        doubled = (1, 2, 3) if correct else (1, 2, 3, 4, 5)        # 联华式：双串占多数时，单串相对同机中位恒低一半
+        faults = [Fault("string", s(1, n), "parallel_actual", 0, {"n_parallel": 2, "archive_correct": correct}) for n in doubled]
+        cfg = SimConfig(station_id="PA1", n_inverters=1, strings_per_inverter=8, days=30, seed=41, start=date(2026, 9, 1), use_default_faults=False, faults=faults)
+        settings, store = _run(tmp_path / str(correct), cfg, days_back=6)
+        susp = store.query("SELECT string_id, grade FROM suspects WHERE scope='string' AND grade IN ('A','B')")
+        if correct:
+            assert susp.empty, susp.to_dict("records")
+            end = cfg.start + timedelta(days=cfg.days - 1)
+            b = store.query("SELECT string_id, dev_today FROM baselines WHERE date=?", (end.isoformat(),))
+            assert (b["dev_today"].abs() < 0.03).all(), b.to_dict("records")
+        else:
+            assert len(susp) >= 3, susp.to_dict("records")          # 档案缺并联数：3 条单串相对（双串为主的）中位恒低 → 误报，正是联华站那种失真
+
+
+def test_empty_mppt_input_not_open_circuit(tmp_path):
+    """华为/阳光一个 MPPT 两路输入只接一路：空的那路电压正常、电流恒 0。档案未登记组件且同 MPPT 兄弟路正常 → 不报断线 A；真断线（档案有组件）照报"""
+    s = lambda k, n: f"EI1-INV{k:02d}-pv{n}"
+    cfg = SimConfig(station_id="EI1", n_inverters=1, strings_per_inverter=8, days=20, seed=51, start=date(2026, 9, 1), use_default_faults=False,
+                    faults=[Fault("string", s(1, 2), "empty_input", 0), Fault("string", s(1, 6), "open_circuit", 10)])
+    settings, store = _run(tmp_path, cfg, days_back=5)
+    susp = store.query("SELECT string_id, grade, rule_cause FROM suspects WHERE scope='string'")
+    oc = susp[susp["string_id"] == s(1, 6)]
+    assert not oc.empty and oc["grade"].iloc[0] == "A" and oc["rule_cause"].iloc[0] == Cause.OPEN_CIRCUIT.value, susp.to_dict("records")
+    ei = susp[susp["string_id"] == s(1, 2)]
+    assert ei.empty or ei["grade"].iloc[0] not in ("A", "B"), ei.to_dict("records")
