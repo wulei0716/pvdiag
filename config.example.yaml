@@ -125,14 +125,20 @@ loss:
     跟踪支架卡滞: 400
 
 platforms:
-  huawei: { base_quota: 24, devices_per_unit: 100, batch_days: 4, token_ttl_minutes: 30 }
+  huawei: { base_quota: 24, devices_per_unit: 100, batch_days: 1, token_ttl_minutes: 30 }
   ginlong_pac_unit_divisor: 1000     # 锦浪 pac 单位 W → kW
   sungrow_token_ttl_hours: 48
   sungrow_same_day_available: false  # 阳光不返回当天数据 → 每日拉 T-1
 
-# 电站级平台凭证放在 stations 表的 extra_json.platform_config 中（建议由 DPAPI/EFS/钥匙串解密后注入，不落明文）：
-#   huawei:  { user_name, system_code, station_code, base_url }
-#   ginlong: { key_id, key_secret, plant_id }
-#   sungrow: { appkey, access_key, user_account, user_password, ps_id, points_map: { pac: "p24", strings: { 1: {i: "p5", u: "p6"} } } }
-#   csv:     { root: ./import }     # 对接 F:\Hermes 已有拉数脚本的落地文件
+# 电站级平台凭证放在 stations 表的 extra_json.platform_config（pvdiag platform register --station X --platform huawei --conf cfg.json 写入）。
+# 密钥建议不落明文：用 *_env 指向环境变量（如 system_code_env: PVDIAG_HW_XWZ3）。v0.5 起三家适配器按 2026-10 现网实测校准：
+#   huawei:  { user_name, system_code | system_code_env, station_code: "NE=xxx", base_url: https://cn.fusionsolar.huawei.com,
+#              history_api: fivemin(默认, getDevFiveMinutes 一天一次) | historykpi, min_interval_seconds: 65, tz_offset_hours: 8, id_style: name }
+#            配额 Σ⌈设备数/100⌉+24 次/日含登录（20 台 = 25 次）；设备名 devName → inverter_id "<站>-NB01"；null 路不输出、0.0 路保留
+#   sungrow: { appkey, secret_key, ps_id, redirect_uri: https://www.baidu.com/, points_map(默认 SG110CX 9 路 MPPT: 电压 p5,p7,p9,p45..p55 / 电流 p6,p8,p10,p46..p56, pac p24),
+#              window_hours: 3, pac_divisor: 1000 }
+#            OAuth 授权码：业主授权后 `pvdiag platform auth --station X --code XXXX` 换令牌（48h 滚动续期，存 platform_state）；通道=MPPT（channel_is_mppt）
+#   ginlong: { key_id, key_secret, plant_id, base_url: https://api.ginlong.com:13333 }   # 2 次/秒；签名 Content-Type 必须 application/json
+#   csv:     { root: ./import }     # 对接已有拉数脚本的落地文件
 #   任意平台可加 fallback_csv_root: ./import —— 云平台连续拉取失败时自动降级读本地落地文件（自愈）
+#   新站第一次拉到数据而档案为空 → 自动建档案骨架（string_id/inverter_id/pv_index/mppt）；组件数/朝向用 pvdiag platform hints（华为 MPPT 容量反推）或 import-profiles 补

@@ -15,8 +15,9 @@ def test_quota_planner_matches_spec():
     # 日限额 = Σ⌈设备数/100⌉ + 24；20 台 → 1 + 24 = 25
     q = QuotaPlanner(n_devices=20)
     assert q.daily_quota == 25
-    plan = q.plan_backfill(date(2026, 1, 1), date(2026, 3, 31))      # 90 天 / 4 天一批 = 23 批
-    assert plan["n_batches"] == 23
+    plan = q.plan_backfill(date(2026, 1, 1), date(2026, 3, 31))      # getDevFiveMinutes 一天一批 → 90 批，每日 23 批 → 4 个日历日
+    assert plan["n_batches"] == 90 and plan["batches_per_day"] == 23 and plan["calendar_days_needed"] == 4
+    assert QuotaPlanner(n_devices=20, batch_days=4).plan_backfill(date(2026, 1, 1), date(2026, 3, 31))["n_batches"] == 23   # historykpi 4 天一批
     assert plan["calendar_days_needed"] >= 1
     # 250 台 → 3 个调用/批，日限额 27
     q2 = QuotaPlanner(n_devices=250)
