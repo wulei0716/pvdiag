@@ -78,11 +78,16 @@ class BaselineAgent(Agent):
         else:
             f["limited"] = 0
 
+        # ---- 朝向物理归一（季节性）：同机各串朝向/倾角不同时，按晴空倾斜面辐照把中午电流折算到"参考朝向"再互比
+        #      （冬天东向比南向低 25%，夏天只低 6%——这是物理，不是故障；档案错了才是异常）
+        f["orient_exp_ratio"] = self._orientation_expectation(f, strings, ctx, station_id)
+        f["noon_norm"] = f["noon_median_i"] / f["orient_exp_ratio"]
+
         # ---- 群组中位数（三级回退：配置群组 → 整机 → 无）
         v = f[f["valid"]]
-        g1 = v.groupby(["date", "group_key"])["noon_median_i"].agg(["median", "count"]).rename(
+        g1 = v.groupby(["date", "group_key"])["noon_norm"].agg(["median", "count"]).rename(
             columns={"median": "g_med", "count": "g_n"})
-        g2 = v.groupby(["date", "inverter_id"])["noon_median_i"].agg(["median", "count"]).rename(
+        g2 = v.groupby(["date", "inverter_id"])["noon_norm"].agg(["median", "count"]).rename(
             columns={"median": "i_med", "count": "i_n"})
         f = f.merge(g1, left_on=["date", "group_key"], right_index=True, how="left")
         f = f.merge(g2, left_on=["date", "inverter_id"], right_index=True, how="left")
@@ -91,7 +96,7 @@ class BaselineAgent(Agent):
         f["group_level"] = np.where(use_group, "group", np.where(use_inv, "inverter", "none"))
         f["group_median_i"] = np.where(use_group, f["g_med"], np.where(use_inv, f["i_med"], np.nan))
         f["group_n"] = np.where(use_group, f["g_n"], np.where(use_inv, f["i_n"], 0)).astype(int)
-        f["ratio"] = f["noon_median_i"] / f["group_median_i"]
+        f["ratio"] = f["noon_norm"] / f["group_median_i"]
         f.loc[~f["valid"], "ratio"] = np.where(f.loc[~f["valid"], "zero_all_day"] == 1, 0.0, np.nan)  # 0 电流串 ratio=0
         f["dev"] = f["ratio"] - 1
         # ---- 群组当日噪声：有效串偏差的稳健标准差（1.4826×MAD）。云影在大电站各逆变器间不同步，
@@ -170,6 +175,7 @@ class BaselineAgent(Agent):
                 "n_clear_recent": n_clear_recent, "cold_start": cold,
                 "weather_tag": cur["weather_tag"], "limited": int(cur["limited"]),
                 "group_noise": None if pd.isna(cur.get("group_noise")) else float(cur["group_noise"]),
+                "orient_exp_ratio": float(cur["orient_exp_ratio"]) if pd.notna(cur.get("orient_exp_ratio")) else 1.0,
             })
         bl = pd.DataFrame(rows)
 
@@ -178,6 +184,37 @@ class BaselineAgent(Agent):
         return bl, ibl
 
     # ------------------------------------------------------------------ 工具
+    @staticmethod
+    def _orientation_expectation(f: pd.DataFrame, strings: pd.DataFrame, ctx: AgentContext, station_id: str) -> pd.Series:
+        """每行（串·日）的期望电流比 = 该串朝向 vs 同机参考朝向（众数）在当日中午窗口的晴空 POA 比；朝向缺失/相同 → 1.0"""
+        from ..solar import expected_noon_ratio
+        out = pd.Series(1.0, index=f.index)
+        if "azimuth" not in f.columns or f["azimuth"].isna().all() or f["tilt"].isna().all():
+            return out
+        st = ctx.store.query("SELECT lat FROM stations WHERE station_id=?", (station_id,))
+        lat = float(st["lat"].iloc[0]) if not st.empty and pd.notna(st["lat"].iloc[0]) else 30.0
+        # 同机参考朝向 = 该逆变器各串 (azimuth, tilt) 的众数
+        ref = {}
+        for inv, g in strings.dropna(subset=["azimuth", "tilt"]).groupby("inverter_id"):
+            pair = g.groupby(["azimuth", "tilt"]).size().idxmax()
+            ref[inv] = (float(pair[0]), float(pair[1]))
+        if not ref:
+            return out
+        az = f["azimuth"].to_numpy(dtype=float); tilt = f["tilt"].to_numpy(dtype=float)
+        inv_ids = f["inverter_id"].to_numpy(); dates = f["date"].to_numpy()
+        cache: Dict[tuple, float] = {}
+        vals = np.ones(len(f))
+        for i in range(len(f)):
+            r = ref.get(inv_ids[i])
+            if r is None or np.isnan(az[i]) or np.isnan(tilt[i]) or (az[i] == r[0] and tilt[i] == r[1]):
+                continue
+            key = (dates[i], az[i], tilt[i], r)
+            if key not in cache:
+                cache[key] = expected_noon_ratio(lat, date.fromisoformat(dates[i]), az[i], tilt[i], r[0], r[1],
+                                                 (ctx.settings.baseline.noon_start, ctx.settings.baseline.noon_end))
+            vals[i] = max(cache[key], 0.2)
+        return pd.Series(vals, index=f.index)
+
     @staticmethod
     def _segment_starts(strings: pd.DataFrame, events: pd.DataFrame, d: date) -> Dict[str, Optional[str]]:
         """每串的基线分段起点（最近一次清洗/维修/换串等事件日），一次算完"""

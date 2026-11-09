@@ -33,7 +33,8 @@ class RegionAgent(Agent):
         ctx.shared["region_artifacts"] = res.artifacts
         for t in station_trend:
             if t.get("suspect_soiling"):
-                res.alerts.append(f"{t['station_id']} 站级产出近 {t['days']} 天缓慢下滑 {t['slope_pct_per_day']:+.2f}%/天，疑全站积灰（互比看不出），建议安排清洗评估")
+                res.alerts.append(f"{t['station_id']} 站级（{t['basis']}）近 {t['days']} 天斜率 {t['slope_pct_per_day']:+.2f}%/天，积灰损失约 {t['soiling_loss_pct']}%"
+                                  f"（≈{t['lost_kwh_per_day']} kWh/天），{t['advice']}")
         res.summary = f"区域任务包 {len(packages)}，积灰疑点 {len(dust)}，清洗效果验证 {len(effects)}"
         return res
 
@@ -130,20 +131,58 @@ class RegionAgent(Agent):
 
     # ------------------------------------------------------------------ 站级积灰趋势（互比盲区提示）
     def station_soiling_trend(self, ctx: AgentContext, window_days: int = 45) -> List[Dict]:
+        """站级积灰/衰减量化（互比盲区：全站一起脏、一起衰减，互比看不出）
+
+        指标口径：
+        - 有辐照：PR_d = 日电量 / (日辐照 × 装机)；无辐照：用 中午功率/晴天峰值参考 近似（受季节日照影响，需去趋势）
+        - 清洁参考 = 最近一次降雨后头 2 个晴好天的中位（雨把灰冲掉），没有雨就用窗口内最高的 3 天
+        - 当前水平 = 最近 3 个晴好天中位 → 积灰损失% = 1 − 当前/清洁参考
+        - 日损电量 ≈ 积灰损失% × 近 7 个晴好天日均电量；清洗成本 = 装机 × cleaning_cost_per_kwp；回本天数 = 成本 / (日损 × 电价)
+        """
         start = (ctx.run_date - timedelta(days=window_days)).isoformat()
         out = []
+        price = ctx.settings.loss.tou_price.get("flat", ctx.settings.loss.default_price_yuan_per_kwh)
         for st in ctx.stations():
-            sd = ctx.store.station_daily(st, start, ctx.run_date)
-            sd = sd[(sd["weather_tag"] == "clear") & sd["noon_power"].notna() & sd["peak_ref"].notna()]
+            sd_all = ctx.store.station_daily(st, start, ctx.run_date)
+            sd = sd_all[(sd_all["weather_tag"] == "clear") & sd_all["noon_power"].notna() & sd_all["peak_ref"].notna()].copy()
             if len(sd) < 10:
                 continue
-            # 以季节性去趋势：用一阶多项式拟合 noon_power/peak_ref 相对变化；斜率明显为负 + 无雨天则疑积灰
-            y = (sd["noon_power"] / sd["peak_ref"]).to_numpy(dtype=float)
-            x = np.arange(len(y))
-            slope = float(np.polyfit(x, y, 1)[0]) * 100
-            rain_days = int(ctx.store.scalar("SELECT COUNT(*) FROM station_daily WHERE station_id=? AND rain=1 AND date BETWEEN ? AND ?",
-                                             (st, start, ctx.run_date.isoformat())) or 0)
-            out.append({"station_id": st, "days": int(len(sd)), "slope_pct_per_day": round(slope, 3), "rain_days": rain_days,
-                        "suspect_soiling": bool(slope < -0.25 and rain_days <= 2),
-                        "note": "季节性日照下降会贡献负斜率，建议结合辐照数据/站间互比确认"})
+            cap = ctx.store.scalar("SELECT capacity_kwp FROM stations WHERE station_id=?", (st,))
+            # 站级日电量（全部组串 I·V 积分）
+            e = ctx.store.query("SELECT f.date, SUM(f.day_energy_kwh) e FROM daily_features f JOIN strings s ON s.string_id=f.string_id "
+                                "WHERE s.station_id=? AND f.date BETWEEN ? AND ? GROUP BY f.date", (st, start, ctx.run_date.isoformat())).set_index("date")["e"]
+            sd["energy"] = sd["date"].map(e)
+            use_irr = "irradiance_kwh_m2" in sd.columns and sd["irradiance_kwh_m2"].notna().sum() >= 10 and cap
+            if use_irr:
+                sd["level"] = sd["energy"] / (sd["irradiance_kwh_m2"] * float(cap))        # PR
+                basis = "PR（电量/辐照/装机）"
+            else:
+                sd["level"] = sd["noon_power"] / sd["peak_ref"]
+                basis = "中午功率/晴天峰值参考（无辐照，含季节项）"
+            y = sd["level"].to_numpy(dtype=float)
+            slope = float(np.polyfit(np.arange(len(y)), y, 1)[0]) * 100
+            rain = sd_all[sd_all["rain"] == 1]["date"].tolist()
+            rain_days = len(rain)
+            if rain:
+                after = sd[sd["date"] > rain[-1]].head(2)
+                clean_ref = float(after["level"].median()) if len(after) >= 1 else float(np.sort(y)[-3:].mean())
+                ref_note = f"最近降雨 {rain[-1]} 后首个晴好天"
+            else:
+                clean_ref = float(np.sort(y)[-3:].mean()); ref_note = "窗口内最高 3 天（无降雨记录）"
+            current = float(sd["level"].tail(3).median())
+            soiling = max(0.0, 1 - current / clean_ref) if clean_ref > 0 else 0.0
+            daily_kwh = float(sd["energy"].tail(7).mean()) if sd["energy"].notna().any() else 0.0
+            lost_kwh_day = soiling * daily_kwh / max(1 - soiling, 0.5)
+            cost = float(cap or 0) * ctx.settings.loss.cleaning_cost_per_kwp
+            payback = cost / (lost_kwh_day * price) if lost_kwh_day * price > 0 else None
+            out.append({"station_id": st, "days": int(len(sd)), "basis": basis, "slope_pct_per_day": round(slope, 3), "rain_days": rain_days,
+                        "clean_ref": round(clean_ref, 4), "clean_ref_note": ref_note, "current": round(current, 4),
+                        "soiling_loss_pct": round(soiling * 100, 2), "lost_kwh_per_day": round(lost_kwh_day, 1),
+                        "lost_yuan_per_day": round(lost_kwh_day * price, 1), "cleaning_cost_yuan": round(cost, 0),
+                        "payback_days": None if payback is None else round(payback, 1),
+                        "suspect_soiling": bool(slope < -0.25 and rain_days <= 2) or soiling >= 0.05,
+                        "advice": ("建议全站清洗：回本约 %.0f 天" % payback) if payback is not None and payback <= 45 and soiling >= 0.03
+                                  else ("积灰 %.1f%%，暂不划算清洗（回本 %s 天）" % (soiling * 100, "∞" if payback is None else round(payback))) if soiling > 0
+                                  else "无积灰迹象",
+                        "note": "无辐照时季节性日照变化会混入斜率；有气象站/卫星辐照时自动改用 PR"})
         return out

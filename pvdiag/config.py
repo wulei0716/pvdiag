@@ -41,6 +41,7 @@ class Thresholds(BaseModel):
     outage_min_slots: int = 2               # 白天 ≥2 个半小时槽（1h）整段 0 输出而同机其它串正常 → 间歇停机/掉线签名
     outage_group_ratio: float = 0.30        # 判停机时要求群组曲线 ≥ 当日峰值 30%（排除清晨/傍晚）
     outage_rel_zero: float = 0.10           # 本串 ≤ 群组同时段 10% 即视为"整段为 0"（晴天散射光占比 10%~15%，遮挡不会更低；15 分钟边沿插值也不会）
+    tracker_side_ratio: float = 0.85        # 跟踪电站：清晨与傍晚相对群组比值都 ≤0.85 且中午 ≥0.93 → 支架卡滞签名
     outage_noon_skip_frac: float = 0.20     # 中午窗口 ≥20% 样本为 0 的日子不计入互比持续度（停机已有独立签名，别把它算成"低发"）
 
 
@@ -102,9 +103,10 @@ class LossCfg(BaseModel):
         "peak": 0.90, "flat": 0.60, "valley": 0.30
     })
     expected_fault_days_default: int = 30   # 未修复预计持续天数（优先级公式用）
+    cleaning_cost_per_kwp: float = 15.0     # 全站清洗单价（元/kWp），用于积灰清洗回本估算
     repair_cost_by_cause: Dict[str, float] = Field(default_factory=lambda: {
         "断线/未接": 300, "旁路二极管": 500, "遮挡": 400, "朝向差异": 0,
-        "MPPT异常": 1500, "组件衰减/积灰": 200, "数据问题": 50, "限发": 0, "间歇停机/掉线": 200, "未知": 300,
+        "MPPT异常": 1500, "组件衰减/积灰": 200, "数据问题": 50, "限发": 0, "间歇停机/掉线": 200, "跟踪支架卡滞": 400, "未知": 300,
     })
 
 

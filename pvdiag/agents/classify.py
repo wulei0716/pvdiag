@@ -25,7 +25,7 @@ FEATURES = ["dev_today", "dev_vs_own", "dev_roll7", "persist_days_5", "persist_d
             "zero_all_day", "stuck", "voltage_offset", "dip_depth", "dip_len_h", "dip_center_h", "outside_dip_ratio",
             "constant_offset", "ratio_mean", "ratio_std", "am_pm_skew", "overcast_dev", "known_shading",
             "inverter_level", "low_confidence", "n_clear_recent", "month", "grade_sev",
-            "outage_hours", "outage_days", "stale_run_min", "group_noise"]
+            "outage_hours", "outage_days", "stale_run_min", "group_noise", "tracker_stuck", "am_ratio", "pm_ratio"]
 
 GRADE_SEV = {Grade.A.value: 0, Grade.B.value: 1, Grade.C.value: 2, Grade.D.value: 3, Grade.E.value: 4, Grade.ARCHIVED.value: 5}
 
@@ -60,6 +60,8 @@ def build_features(susp: Dict, bl: Optional[pd.Series], sig: Signature, prof: Op
         "grade_sev": float(GRADE_SEV.get(susp.get("grade"), 4)),
         "outage_hours": float(sig.outage_hours or 0.0), "outage_days": float(sig.outage_days or 0),
         "stale_run_min": float(sig.stale_run_min or 0), "group_noise": sig.group_noise if sig.group_noise is not None else np.nan,
+        "tracker_stuck": float(sig.tracker_stuck), "am_ratio": sig.am_ratio if sig.am_ratio is not None else np.nan,
+        "pm_ratio": sig.pm_ratio if sig.pm_ratio is not None else np.nan,
     }
 
 
@@ -80,6 +82,8 @@ class RuleProxyModel:
                 conf = 0.80 if persist >= 5 else 0.70
             elif sig.outage_hours > 0:
                 conf = 0.85 if sig.outage_days >= 3 else 0.70
+            elif sig.tracker_stuck:
+                conf = 0.80 if persist >= 3 else 0.70
             elif sig.dip_depth is not None:
                 conf = 0.85 if persist >= 3 else 0.75
             elif sig.constant_offset:

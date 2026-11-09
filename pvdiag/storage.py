@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS baselines (
     group_median_i REAL, ratio_today REAL, baseline_ratio REAL, baseline_n INTEGER,
     dev_today REAL, dev_vs_own REAL, dev_roll7 REAL, persist_days_5 INTEGER, persist_days_3 INTEGER,
     first_breach_date TEXT, v_dev REAL, overcast_dev REAL, n_clear_recent INTEGER, cold_start INTEGER,
-    weather_tag TEXT, limited INTEGER, group_noise REAL, PRIMARY KEY (string_id, date)
+    weather_tag TEXT, limited INTEGER, group_noise REAL, orient_exp_ratio REAL, PRIMARY KEY (string_id, date)
 );
 CREATE INDEX IF NOT EXISTS idx_bl_date ON baselines(date);
 CREATE TABLE IF NOT EXISTS inverter_baselines (
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS inverter_baselines (
 );
 CREATE TABLE IF NOT EXISTS signatures (
     string_id TEXT, date TEXT, weather_tag TEXT, ratio_mean REAL, ratio_std REAL, am_pm_skew REAL,
-    dip_depth REAL, dip_start TEXT, dip_end TEXT, outside_dip_ratio REAL, voltage_offset REAL, outage_slots INTEGER,
+    dip_depth REAL, dip_start TEXT, dip_end TEXT, outside_dip_ratio REAL, voltage_offset REAL, outage_slots INTEGER, tracker_flag INTEGER,
     PRIMARY KEY (string_id, date)
 );
 CREATE TABLE IF NOT EXISTS suspects (
@@ -126,8 +126,8 @@ CREATE TABLE IF NOT EXISTS health_checks (
 # 老库升级：按表逐列补齐（SQLite 的 CREATE TABLE IF NOT EXISTS 不会加新列）
 _MIGRATIONS = {
     "daily_features": {"stale_run_min": "INTEGER", "noon_zero_frac": "REAL"},
-    "baselines": {"group_noise": "REAL"},
-    "signatures": {"outage_slots": "INTEGER"},
+    "baselines": {"group_noise": "REAL", "orient_exp_ratio": "REAL"},
+    "signatures": {"outage_slots": "INTEGER", "tracker_flag": "INTEGER"},
     "model_registry": {"status": "TEXT", "holdout_json": "TEXT"},
     "pipeline_runs": {"attempt": "INTEGER"},
 }

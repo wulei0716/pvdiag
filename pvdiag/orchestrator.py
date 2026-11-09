@@ -213,6 +213,12 @@ def render_markdown(r: Dict) -> str:
         for p in reg["packages"][:10]:
             L.append(f"- {p['station_id']} / {p['roof_area']}：{p['n_strings']} 串 {p['causes']}，损失 {p['loss_kwh_per_day']:.1f} kWh/天，优先级 {p['priority']}")
         L.append("")
+    if reg.get("station_trend"):
+        L.append("## 站级积灰 / 衰减量化（互比盲区）")
+        for t in reg["station_trend"]:
+            L.append(f"- {t['station_id']}：{t['basis']}，斜率 {t['slope_pct_per_day']:+.2f}%/天，清洁参考 {t['clean_ref']}（{t['clean_ref_note']}）→ 当前 {t['current']}，"
+                     f"积灰损失 {t['soiling_loss_pct']}% ≈ {t['lost_kwh_per_day']} kWh/天 ≈ {t['lost_yuan_per_day']} 元/天；清洗成本 {t['cleaning_cost_yuan']:.0f} 元，回本 {t['payback_days']} 天 → {t['advice']}")
+        L.append("")
     if reg.get("dust_candidates"):
         L.append("## 清洗建议（积灰签名）")
         for d in reg["dust_candidates"][:10]:

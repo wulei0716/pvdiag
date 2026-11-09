@@ -28,6 +28,7 @@ class Cause(str, Enum):
     DATA_ISSUE = "数据问题"
     CURTAILMENT = "限发"
     OUTAGE = "间歇停机/掉线"          # 白天整段 0 输出、边沿陡峭、同机其它串正常（公开数据 Kaggle Plant 2 的典型真实签名）
+    TRACKER = "跟踪支架卡滞"          # 跟踪电站：该串清晨/傍晚相对同机双侧偏低、中午正常（失去跟踪增益，回到固定倾角钟形）
     PROFILE_ERROR = "档案差异/串长"
     UNKNOWN = "未知"
     NORMAL = "正常(误报)"
@@ -157,6 +158,10 @@ class Signature(BaseModel):
     outage_hours: float = 0.0                 # 白天整段 0 输出（同机其它串正常）的小时数 → 间歇停机/掉线
     outage_days: int = 0                      # 近 7 个有数据日中出现停机签名的天数（含今天）
     stale_run_min: int = 0                    # 日间电流钉死不动的最长分钟数（半天钉死也能抓到）
+    tracker_stuck: bool = False               # 跟踪电站：清晨/傍晚双侧偏低、中午正常 → 支架卡滞
+    am_ratio: Optional[float] = None          # 7:30-10:30 相对群组比值中位
+    pm_ratio: Optional[float] = None          # 14:00-17:00 相对群组比值中位
+    orientation_fit: Optional[str] = None     # 曲线形状最像的朝向/倾角（核档案用）
     group_noise: Optional[float] = None       # 当日群组偏差稳健标准差（云影噪声水平）
     notes: List[str] = Field(default_factory=list)
 

@@ -48,7 +48,7 @@ class DetectAgent(Agent):
         res.metrics = {"suspects": len(all_susp), "by_grade": by_grade,
                        "new_cases": sum(1 for s in all_susp if s.get("_new"))}
         for s in all_susp:
-            s.pop("_new", None)
+            s.pop("_new", None); s.pop("_hard", None)
         res.artifacts = {"suspects": all_susp}
         ctx.shared["suspects_today"] = all_susp
         res.summary = f"嫌疑 {len(all_susp)} 条（新案例 {res.metrics['new_cases']}）：" + " ".join(f"{k}={v}" for k, v in sorted(by_grade.items()))
@@ -80,6 +80,10 @@ class DetectAgent(Agent):
                 c["status"] = a["status"]
                 # 分级只升不降；C（朝向/档案解释）是对偏差的"解释"，优先于 B 的"未知低发"
                 escalated = SEVERITY.get(c["grade"], 9) < SEVERITY.get(a["grade"], 9)
+                # 已被解释为朝向/档案差异（C）的案例：非晴好天"沿用持续低发"给出的 B 不能推翻解释，只有 A 级硬证据才升级
+                physics_c = a["grade"] == Grade.C.value and '"orientation_fit":"' in (a.get("signature_json") or "")
+                if physics_c and c["grade"] == Grade.B.value and not (c.get("_hard") or False):
+                    c["grade"], c["rule_cause"], escalated = Grade.C.value, a["rule_cause"], False
                 if c["grade"] != Grade.C.value and SEVERITY.get(a["grade"], 9) < SEVERITY.get(c["grade"], 9):
                     c["grade"] = a["grade"]
                     if c["rule_cause"] == Cause.UNKNOWN.value:
@@ -166,12 +170,16 @@ class DetectAgent(Agent):
             (station_id, today))
         prof = strings.set_index("string_id")
         bl = bl.set_index("string_id")
+        st_row = ctx.store.query("SELECT lat, extra_json FROM stations WHERE station_id=?", (station_id,))
+        st_extra = json.loads(st_row["extra_json"].iloc[0] or "{}") if not st_row.empty and st_row["extra_json"].iloc[0] else {}
+        mount = st_extra.get("mount", "fixed")
+        lat = float(st_row["lat"].iloc[0]) if not st_row.empty and pd.notna(st_row["lat"].iloc[0]) else 30.0
 
         group_curves = self._group_curves(ft, prof, bl)
         voff = self._voltage_offsets(ft, prof, bl)
         zero_streak, stuck_streak = self._zero_stuck_streaks(feats, ctx.store, station_id, d, th.stale_run_min)
         sig_hist = ctx.store.query(
-            "SELECT s.string_id, s.date, s.dip_depth, s.dip_start, s.dip_end, s.outside_dip_ratio, s.voltage_offset, s.weather_tag, s.outage_slots "
+            "SELECT s.string_id, s.date, s.dip_depth, s.dip_start, s.dip_end, s.outside_dip_ratio, s.voltage_offset, s.weather_tag, s.outage_slots, s.tracker_flag "
             "FROM signatures s JOIN strings p ON p.string_id=s.string_id WHERE p.station_id=? AND s.date BETWEEN ? AND ? ORDER BY s.date DESC",
             (station_id, (d - timedelta(days=15)).isoformat(), (d - timedelta(days=1)).isoformat()))
         hist_by: Dict[str, List[Dict]] = {sid: g.to_dict("records") for sid, g in sig_hist.groupby("string_id", sort=False)} if not sig_hist.empty else {}
@@ -193,8 +201,11 @@ class DetectAgent(Agent):
                 continue
             f = ft_rows.get(sid)
             h = hist_by.get(sid, [])
-            sig, skew = self._signature(sid, f, p, b, group_curves, inv_daily, th, cfg)
-            if sig.orientation_like and not np.isnan(dev_std.get(sid, np.nan)) and dev_std[sid] > th.orientation_max_drift:
+            geo = (lat, *self._ref_orientation(prof, p["inverter_id"]), d)
+            sig, skew, rcurve = self._signature(sid, f, p, b, group_curves, inv_daily, th, cfg, mount, geo)
+            if sig.tracker_stuck:
+                sig.notes.append(f"跟踪电站：清晨比值 {sig.am_ratio:.0%}、傍晚 {sig.pm_ratio:.0%}，中午正常 → 失去跟踪增益（支架卡滞/控制器停）")
+            if sig.orientation_like and not sig.orientation_fit and not np.isnan(dev_std.get(sid, np.nan)) and dev_std[sid] > th.orientation_max_drift:
                 sig.orientation_like = False      # 偏差在漂移 → 不是恒定的朝向差异（更像积灰/衰减）
                 sig.notes.append(f"晴好天偏差离散度 {dev_std[sid]:.1%} 偏大，不按朝向差异处理")
             v_off = voff.get(sid)
@@ -206,14 +217,16 @@ class DetectAgent(Agent):
                 sig.outage_days = sum(1 for r in h if r["date"] >= outage_cut and r.get("outage_slots") is not None
                                       and not pd.isna(r["outage_slots"]) and r["outage_slots"] >= th.outage_min_slots) + 1
             out_slots = int(round(sig.outage_hours * 60 / cfg.slot_minutes)) if sig.outage_hours else 0
+            tracker_days = sum(1 for r in h if r.get("weather_tag") == "clear" and r.get("tracker_flag") == 1) if sig.tracker_stuck else 0
             sig_rows.append({"string_id": sid, "date": today, "weather_tag": weather, "ratio_mean": sig.ratio_mean,
                              "ratio_std": sig.ratio_std, "am_pm_skew": skew, "dip_depth": sig.dip_depth,
                              "dip_start": sig.dip_start, "dip_end": sig.dip_end, "outside_dip_ratio": sig.outside_dip_ratio,
-                             "voltage_offset": v_off, "outage_slots": out_slots})
+                             "voltage_offset": v_off, "outage_slots": out_slots, "tracker_flag": int(sig.tracker_stuck)})
             grade, cause, notes = self._grade(b, sig, p, zero_streak.get(sid, 0), stuck_streak.get(sid, 0),
-                                              weather, dip_days, th)
+                                              weather, dip_days, th, tracker_days)
             if grade is None:
                 continue
+
             # 冷启动（该串晴好天基线样本不足）：仅凭互比偏差不下 B 级结论——只做同日互比、进观察带
             if grade == Grade.B.value and int(b.get("cold_start", 0) or 0) == 1 and not (sig.dip_depth or sig.outage_hours or sig.inverter_level):
                 grade = th.cold_start_cap_grade
@@ -232,7 +245,8 @@ class DetectAgent(Agent):
                 case_date = min(case_date, (d - timedelta(days=dip_days)).isoformat())
             persist = int(b["persist_days_5"]) if grade == Grade.B.value else int(b["persist_days_3"])
             persist = max(persist, dip_days + 1 if sig.dip_depth is not None else 0, streak)
-            out.append({
+            hard = bool(sig.dip_depth is not None or sig.outage_hours or sig.zero_all_day or sig.stuck or sig.voltage_offset is not None or sig.tracker_stuck)
+            out.append({"_hard": hard,
                 "suspect_id": f"{sid}@{case_date}", "string_id": sid, "inverter_id": p["inverter_id"],
                 "station_id": station_id, "date": today, "scope": "string", "grade": grade, "rule_cause": cause,
                 "dev_today": None if pd.isna(b["dev_today"]) else float(b["dev_today"]),
@@ -376,11 +390,21 @@ class DetectAgent(Agent):
         return runs
 
     # ------------------------------------------------------------------ 签名
+    @staticmethod
+    def _ref_orientation(prof: pd.DataFrame, inverter_id: str) -> Tuple[float, float]:
+        g = prof[(prof["inverter_id"] == inverter_id)].dropna(subset=["azimuth", "tilt"])
+        if g.empty:
+            return 180.0, 15.0
+        pair = g.groupby(["azimuth", "tilt"]).size().idxmax()
+        return float(pair[0]), float(pair[1])
+
     def _signature(self, sid: str, f: Optional[pd.Series], p: pd.Series, b: pd.Series,
-                   group_curves: Dict[str, np.ndarray], inv_daily: pd.DataFrame, th, cfg) -> Tuple[Signature, Optional[float]]:
+                   group_curves: Dict[str, np.ndarray], inv_daily: pd.DataFrame, th, cfg,
+                   mount: str = "fixed", geo: Optional[Tuple[float, float, float, date]] = None) -> Tuple[Signature, Optional[float], Optional[np.ndarray]]:
+        """geo = (lat, ref_azimuth, ref_tilt, date)：有它才做朝向物理拟合"""
         sig = Signature()
         if f is None:
-            return sig, None
+            return sig, None, None
         sig.zero_all_day = bool(f["zero_all_day"])
         sig.stuck = bool(f["stuck"])
         sig.limited = bool(b.get("limited", 0))
@@ -391,12 +415,12 @@ class DetectAgent(Agent):
         oc = b.get("overcast_dev")
         sig.overcast_dev = None if oc is None or pd.isna(oc) else float(oc)
         if sig.zero_all_day or sig.stuck:
-            return sig, None
+            return sig, None, None
         key = b["group_key"] if b["group_level"] == "group" else p["inverter_id"]
         gcurve = group_curves.get(key)
         vec = np.array([np.nan if v is None else v for v in json.loads(f["i_profile_json"])], dtype=float)
         if gcurve is None or len(vec) != len(gcurve):
-            return sig, None
+            return sig, None, None
         valid = (gcurve >= max(0.5, 0.15 * np.nanmax(gcurve))) & ~np.isnan(vec)
         if not inv_daily.empty and p["inverter_id"] in inv_daily.index:    # 剔除限发时段
             try:
@@ -406,7 +430,7 @@ class DetectAgent(Agent):
             except Exception:
                 pass
         if valid.sum() < 6:
-            return sig, None
+            return sig, None, None
         ratio = np.full(len(vec), np.nan)
         ratio[valid] = vec[valid] / gcurve[valid]
         # ---- 间歇停机/掉线：群组在发电（≥ 当日峰值 30%）而本串整段为 0 → 不是遮挡（遮挡不会到 0），单独成签名
@@ -422,9 +446,18 @@ class DetectAgent(Agent):
                 valid[a:z + 1] = False
             ratio[~valid] = np.nan
             if valid.sum() < 6:
-                return sig, None
+                return sig, None, None
         sig.ratio_mean = float(np.nanmean(ratio))
         sig.ratio_std = float(np.nanstd(ratio))
+        # ---- 跟踪电站：清晨/傍晚双侧偏低、中午正常 = 失去跟踪增益（卡滞）。固定电站不判（那是遮挡/朝向）
+        n_slots = len(ratio); per_h = 60 // cfg.slot_minutes
+        am = ratio[int(7.5 * per_h):int(10.5 * per_h)]; pm = ratio[int(14 * per_h):int(17 * per_h)]; noon = ratio[int(11.5 * per_h):int(13.5 * per_h)]
+        if np.sum(~np.isnan(am)) >= 2 and np.sum(~np.isnan(pm)) >= 2 and np.sum(~np.isnan(noon)) >= 2:
+            sig.am_ratio, sig.pm_ratio = float(np.nanmedian(am)), float(np.nanmedian(pm))
+            if mount == "tracker" and sig.am_ratio <= th.tracker_side_ratio and sig.pm_ratio <= th.tracker_side_ratio \
+                    and float(np.nanmedian(noon)) >= 0.93 and abs(sig.am_ratio - sig.pm_ratio) < 0.15:
+                sig.tracker_stuck = True
+                return sig, None, ratio          # 不再按"凹陷"解释
         # 分时段凹陷：比值 < dip_ratio 的连续槽段
         low = np.where(valid, ratio < th.dip_ratio, False)
         runs, k = [], 0
@@ -452,16 +485,30 @@ class DetectAgent(Agent):
         skew = float(np.nanmean(am) - np.nanmean(pm)) if len(am) >= 2 and len(pm) >= 2 else None
         if skew is not None and abs(skew) > 0.10:
             sig.notes.append(f"上下午比值倾斜 {skew:+.3f}（{'上午高' if skew > 0 else '下午高'}，疑东西向差异）")
+            # 物理校核：在朝向/倾角网格里找最像的曲线形状；若明显不是参考朝向且拟合得好 → 这是朝向差异不是遮挡
+            if geo is not None:
+                from ..solar import best_fit_orientation
+                lat, ref_az, ref_tilt, dd = geo
+                fit = best_fit_orientation(lat, dd, ratio, ref_az, ref_tilt, cfg.slot_minutes)
+                # 条件：拟合得好（rmse<0.05）、明显优于参考朝向（至少好 0.03）、朝向差 ≥30° 或倾角差 ≥10°（避免均匀低发被当成朝向）
+                if fit is not None and fit[2] < 0.05 and fit[3] - fit[2] >= 0.03 \
+                        and (abs(fit[0] - ref_az) >= 30 or abs(fit[1] - ref_tilt) >= 10):
+                    sig.orientation_fit = f"方位 {fit[0]:.0f}° 倾角 {fit[1]:.0f}°（档案 {p.get('azimuth')}°/{p.get('tilt')}°，参考 {ref_az:.0f}°/{ref_tilt:.0f}°，拟合误差 {fit[2]:.3f}）"
+                    sig.orientation_like = True
+                    sig.dip_depth, sig.dip_start, sig.dip_end, sig.outside_dip_ratio = None, None, None, None   # 东西向的"下午低"不是遮挡
+                    sig.notes.append("曲线形状最接近 " + sig.orientation_fit)
         sig.constant_offset = bool(sig.ratio_std < 0.03 and sig.ratio_mean <= 1 + th.normal_floor and not runs)
         dev = b.get("dev_today")
         if sig.overcast_dev is not None and dev is not None and not pd.isna(dev) and dev <= th.normal_floor:
             if abs(sig.overcast_dev) < th.orientation_overcast_abs and (sig.constant_offset or (skew is not None and abs(skew) > 0.10)):
                 sig.orientation_like = True
-        return sig, skew
+        if sig.orientation_fit and not (dev is not None and not pd.isna(dev) and dev <= th.normal_floor):
+            sig.orientation_like = False       # 中午偏差正常、只是形状像别的朝向：不报（可能是参考朝向选错了），留给复核员看注记
+        return sig, skew, ratio
 
     # ------------------------------------------------------------------ 分级
     def _grade(self, b: pd.Series, sig: Signature, p: pd.Series, zero_days: int, stuck_days: int,
-               weather: str, dip_days: int, th) -> Tuple[Optional[str], str, List[str]]:
+               weather: str, dip_days: int, th, tracker_days: int = 0) -> Tuple[Optional[str], str, List[str]]:
         notes: List[str] = []
         dev = b.get("dev_today")
         dev = None if dev is None or pd.isna(dev) else float(dev)
@@ -482,6 +529,12 @@ class DetectAgent(Agent):
             if sig.outage_days >= th.fault_persist_days:
                 return Grade.B.value, Cause.OUTAGE.value, notes
             return Grade.E.value, Cause.OUTAGE.value, notes
+        # ---- 跟踪支架卡滞（只在晴好天判：阴天没有跟踪增益可比）
+        if sig.tracker_stuck and weather == "clear":
+            notes.append(f"跟踪增益丢失：清晨 {sig.am_ratio:.0%} / 傍晚 {sig.pm_ratio:.0%}，已连续 {tracker_days + 1} 个晴好天")
+            if tracker_days + 1 >= th.fault_persist_days:
+                return Grade.B.value, Cause.TRACKER.value, notes
+            return Grade.E.value, Cause.TRACKER.value, notes
         # ---- 非晴好天只沿用已有持续低发判定
         if weather != "clear":
             if p5 >= th.fault_persist_days:
@@ -499,6 +552,10 @@ class DetectAgent(Agent):
                     return Grade.ARCHIVED.value, Cause.SHADING.value, notes
                 return None, "", notes
             notes.append(f"已备案遮挡串偏差 {dev:+.1%} 明显低于备案预期 {exp:+.1%}，疑新增问题")
+        # ---- 朝向差异（物理拟合确认）：优先于凹陷解释
+        if sig.orientation_like and sig.orientation_fit and dev is not None and dev <= th.normal_floor:
+            notes.append(f"晴天偏差 {dev:+.1%}，曲线形状与档案朝向不符，最像 {sig.orientation_fit} → 核排布图/更正档案，不派现场")
+            return Grade.C.value, Cause.ORIENTATION.value, notes
         # ---- 分时段凹陷（中午窗口可能完全正常，故独立判定）
         if sig.dip_depth is not None and sig.outside_dip_ratio is not None and sig.outside_dip_ratio >= th.dip_normal_outside:
             cause = Cause.BYPASS_DIODE.value if 0.25 <= sig.dip_depth <= 0.42 else Cause.SHADING.value
