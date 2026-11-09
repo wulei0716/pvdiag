@@ -79,6 +79,71 @@ def tracker_poa(lat_deg: float, doy: int, minutes: np.ndarray, axis_tilt_deg: fl
     return np.where(up, poa, 0.0)
 
 
+def dual_tracker_poa(lat_deg: float, doy: int, minutes: np.ndarray, max_tilt_deg: float = 85.0, lon_offset_min: float = 0.0) -> np.ndarray:
+    """双轴跟踪的 POA 近似：板面始终正对太阳（倾角 = 90°−h，受 max_tilt 限制；方位 = 太阳方位），
+    POA = DNI·cos θ + 各向同性散射 + 地面反射。晴天全天近似平顶，比单轴清晨/傍晚更高。"""
+    h, az = sun_position(lat_deg, doy, minutes, lon_offset_min)
+    up = h > 0
+    sin_h = np.clip(np.sin(h), 0, 1)
+    dni = np.where(up, 950.0 * np.power(sin_h, 0.15), 0.0)
+    ghi = dni * sin_h
+    dhi = 0.12 * ghi
+    beta = np.clip(np.pi / 2 - h, 0, math.radians(max_tilt_deg))
+    cos_theta = np.sin(h) * np.cos(beta) + np.cos(h) * np.sin(beta)        # 方位已对准：cos(az−γ)=1
+    poa = dni * np.clip(cos_theta, 0, None) + dhi * (1 + np.cos(beta)) / 2 + 0.2 * ghi * (1 - np.cos(beta)) / 2
+    return np.where(up, poa, 0.0)
+
+
+TRACKER_MOUNTS = ("tracker", "tracker_dual")
+
+
+def mount_poa(mount: str, lat_deg: float, doy: int, minutes: np.ndarray, azimuth_deg: float = 180.0, tilt_deg: float = 20.0,
+              lon_offset_min: float = 0.0) -> np.ndarray:
+    """按支架类型给出晴空 POA：fixed → 固定朝向；tracker → 水平单轴；tracker_dual → 双轴"""
+    if mount == "tracker":
+        return tracker_poa(lat_deg, doy, minutes, lon_offset_min=lon_offset_min)
+    if mount == "tracker_dual":
+        return dual_tracker_poa(lat_deg, doy, minutes, lon_offset_min=lon_offset_min)
+    return clear_sky_poa(lat_deg, doy, minutes, azimuth_deg, tilt_deg, lon_offset_min=lon_offset_min)
+
+
+def tracker_stuck_fit(mount: str, lat_deg: float, d: date, ratio_curve: np.ndarray, slot_minutes: int = 30,
+                      stuck_tilts: Iterable[float] = (0, 10, 20, 30), stuck_azimuth: float = 180.0,
+                      lon_offset_min: float = 0.0) -> Optional[Tuple[float, float, float]]:
+    """跟踪电站：把该串相对群组（都在跟踪）的全天比值曲线，与"卡在固定倾角"的物理期望曲线（固定 POA / 跟踪 POA）比形状。
+    返回 (最佳 rmse, 平直假设 rmse, 最像的卡滞倾角)；曲线有效槽不足返回 None。
+    单轴卡滞：清晨/傍晚丢增益、中午 ≈1；双轴卡滞：全天钟形且冬季中午也明显偏低——两者都由同一个期望曲线覆盖。"""
+    if mount not in TRACKER_MOUNTS:
+        return None
+    valid = ~np.isnan(ratio_curve)
+    if valid.sum() < 8:
+        return None
+    mins = np.arange(0, 24 * 60, 5)
+    doy = d.timetuple().tm_yday
+    track = mount_poa(mount, lat_deg, doy, mins, lon_offset_min=lon_offset_min)
+    n = (24 * 60) // slot_minutes
+    slot = mins // slot_minutes
+    flat_rmse = float(np.sqrt(np.mean((ratio_curve[valid] - np.median(ratio_curve[valid])) ** 2)))
+    best = None
+    for tilt in stuck_tilts:
+        fixed = clear_sky_poa(lat_deg, doy, mins, stuck_azimuth, float(tilt), lon_offset_min=lon_offset_min)
+        exp = np.full(n, np.nan)
+        for s in range(n):
+            sel = slot == s
+            b = track[sel].mean()
+            exp[s] = fixed[sel].mean() / b if b > 1.0 else np.nan
+        m = valid & ~np.isnan(exp)
+        if m.sum() < 8:
+            continue
+        scale = float(np.clip(np.median(ratio_curve[m] / exp[m]), 0.95, 1.05))
+        rmse = float(np.sqrt(np.mean((ratio_curve[m] - scale * exp[m]) ** 2)))
+        if best is None or rmse < best[0]:
+            best = (rmse, float(tilt))
+    if best is None:
+        return None
+    return (best[0], flat_rmse, best[1])
+
+
 def noon_window_minutes(start: str = "11:30", end: str = "13:30", step: int = 5) -> np.ndarray:
     h0, m0 = map(int, start.split(":")); h1, m1 = map(int, end.split(":"))
     return np.arange(h0 * 60 + m0, h1 * 60 + m1, step)

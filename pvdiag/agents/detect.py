@@ -22,6 +22,7 @@ import pandas as pd
 
 from ..features import slot_label
 from ..models import Cause, Grade, Signature, SuspectStatus
+from ..solar import TRACKER_MOUNTS, tracker_stuck_fit
 from .base import Agent, AgentContext, AgentResult
 
 SEVERITY = {Grade.A.value: 0, Grade.B.value: 1, Grade.C.value: 2, Grade.D.value: 3, Grade.E.value: 4, Grade.ARCHIVED.value: 5}
@@ -216,10 +217,16 @@ class DetectAgent(Agent):
             f = ft_rows.get(sid)
             h = hist_by.get(sid, [])
             ref = ref_orient.get(p["inverter_id"])
-            geo = (lat, ref[0], ref[1], d, lon_offset) if ref is not None else None          # 档案没有朝向 → 不做物理拟合
+            if ref is not None:
+                geo = (lat, ref[0], ref[1], d, lon_offset)
+            elif mount in TRACKER_MOUNTS and lat is not None:
+                geo = (lat, None, None, d, lon_offset)          # 跟踪电站档案常无固定朝向：只给纬度，够做卡滞曲线校核
+            else:
+                geo = None                                      # 档案没有朝向 → 不做朝向物理拟合
             sig, skew, rcurve = self._signature(sid, f, p, b, group_curves, inv_daily, th, cfg, mount, geo)
             if sig.tracker_stuck:
-                sig.notes.append(f"跟踪电站：清晨比值 {sig.am_ratio:.0%}、傍晚 {sig.pm_ratio:.0%}，中午正常 → 失去跟踪增益（支架卡滞/控制器停）")
+                sig.notes.insert(0, f"{'双轴' if mount == 'tracker_dual' else '单轴'}跟踪电站：清晨比值 {sig.am_ratio:.0%}、傍晚 {sig.pm_ratio:.0%}"
+                                    f"{'、中午正常' if mount == 'tracker' else ''} → 失去跟踪增益（支架卡滞/控制器停）")
             if sig.orientation_like and not sig.orientation_fit and not np.isnan(dev_std.get(sid, np.nan)) and dev_std[sid] > th.orientation_max_drift:
                 sig.orientation_like = False      # 偏差在漂移 → 不是恒定的朝向差异（更像积灰/衰减）
                 sig.notes.append(f"晴好天偏差离散度 {dev_std[sid]:.1%} 偏大，不按朝向差异处理")
@@ -488,10 +495,20 @@ class DetectAgent(Agent):
         am = w(7.5, 10.5); pm = w(14, 17); noon = w(11.5, 13.5)
         if np.sum(~np.isnan(am)) >= 2 and np.sum(~np.isnan(pm)) >= 2 and np.sum(~np.isnan(noon)) >= 2:
             sig.am_ratio, sig.pm_ratio = float(np.nanmedian(am)), float(np.nanmedian(pm))
-            if mount == "tracker" and sig.am_ratio <= th.tracker_side_ratio and sig.pm_ratio <= th.tracker_side_ratio \
-                    and float(np.nanmedian(noon)) >= 0.93 and abs(sig.am_ratio - sig.pm_ratio) < 0.15:
-                sig.tracker_stuck = True
-                return sig, None, ratio          # 不再按"凹陷"解释
+            noon_med = float(np.nanmedian(noon))
+            if mount in TRACKER_MOUNTS and sig.am_ratio <= th.tracker_side_ratio and sig.pm_ratio <= th.tracker_side_ratio \
+                    and abs(sig.am_ratio - sig.pm_ratio) < 0.15:
+                # 单轴卡滞：中午 ≈1（只丢清晨/傍晚增益）。双轴卡滞：中午也可能偏低（冬季固定 20° 面 vs 正对太阳差 15%），
+                # 所以双轴/有坐标时改用物理曲线校核：卡在固定倾角的期望曲线要比"全天平直"假设像得多
+                stuck = mount == "tracker" and noon_med >= 0.93
+                if not stuck and geo is not None and geo[0] is not None and noon_med >= 0.75 and noon_med - max(sig.am_ratio, sig.pm_ratio) >= 0.08:
+                    fit = tracker_stuck_fit(mount, geo[0], geo[3], ratio, cfg.slot_minutes, lon_offset_min=geo[4] if len(geo) > 4 else 0.0)
+                    if fit is not None and fit[0] < 0.06 and fit[1] - fit[0] >= 0.03:
+                        stuck = True
+                        sig.notes.append(f"曲线形状 ≈ 卡在约 {fit[2]:.0f}° 固定倾角（rmse {fit[0]:.3f}，平直假设 {fit[1]:.3f}）")
+                if stuck:
+                    sig.tracker_stuck = True
+                    return sig, None, ratio          # 不再按"凹陷"解释
         # 分时段凹陷：比值 < dip_ratio 的连续槽段
         low = np.where(valid, ratio < th.dip_ratio, False)
         runs, k = [], 0
@@ -520,7 +537,7 @@ class DetectAgent(Agent):
         if skew is not None and abs(skew) > 0.10:
             sig.notes.append(f"上下午比值倾斜 {skew:+.3f}（{'上午高' if skew > 0 else '下午高'}，疑东西向差异）")
             # 物理校核：在朝向/倾角网格里找最像的曲线形状；若明显不是参考朝向且拟合得好 → 这是朝向差异不是遮挡
-            if geo is not None:
+            if geo is not None and geo[1] is not None and geo[2] is not None:
                 from ..solar import best_fit_orientation
                 lat, ref_az, ref_tilt, dd = geo[0], geo[1], geo[2], geo[3]
                 fit = best_fit_orientation(lat, dd, ratio, ref_az, ref_tilt, cfg.slot_minutes, lon_offset_min=geo[4] if len(geo) > 4 else 0.0)

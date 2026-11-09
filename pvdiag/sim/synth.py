@@ -9,7 +9,7 @@
 可注入故障（string 级）：open_circuit / diode_bypass / shading_fixed / orientation / dust_local / stuck /
                         wrong_profile(串长档案错) / archived_shading(已备案遮挡) / degradation_step /
                         outage_intermittent(间歇停机，Kaggle Plant 2 真实签名) / stale_partial(半天钉死，NREL 标注签名) /
-                        azimuth_actual(实际朝向不同；archive_correct 决定档案是否如实) / tracker_stuck(跟踪支架卡滞，需 mount=tracker)
+                        azimuth_actual(实际朝向不同；archive_correct 决定档案是否如实) / tracker_stuck(跟踪支架卡滞，需 mount=tracker/tracker_dual)
 （inverter 级）：mppt_fault（整机低发）/ limit（限发）
 """
 from __future__ import annotations
@@ -56,7 +56,7 @@ class SimConfig:
     roof_areas: Tuple[str, ...] = ("A区屋面", "B区屋面", "C区屋面")
     use_default_faults: bool = True     # faults 为空时是否注入默认的 10 种故障（False = 纯健康电站）
     device_type: str = "string"         # string | optimizer | microinverter（档案字段；优化器/微逆不做电压异位判定）
-    mount: str = "fixed"                # fixed | tracker（水平单轴跟踪：清晨/傍晚增益，曲线平顶）
+    mount: str = "fixed"                # fixed | tracker（水平单轴：清晨/傍晚增益，曲线平顶）| tracker_dual（双轴：全天正对太阳，冬季中午也比固定面高）
     azimuth: float = 180.0
     tilt: float = 15.0
 
@@ -183,8 +183,8 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
             r = np.where(ref_poa > 1, poa / np.maximum(ref_poa, 1), 1.0)
             return 1.0 + geo_w * (r - 1.0)
         tracker_gain = None
-        if cfg.mount == "tracker":
-            tp = _solar.tracker_poa(cfg.lat_deg, doy, minutes)
+        if cfg.mount in _solar.TRACKER_MOUNTS:
+            tp = _solar.mount_poa(cfg.mount, cfg.lat_deg, doy, minutes)
             r = np.where(ref_poa > 1, tp / np.maximum(ref_poa, 1), 1.0)
             tracker_gain = np.clip(1.0 + geo_w * (r - 1.0), 0.2, 3.0)
         t_amb = 18 + 10 * math.sin(2 * math.pi * (d.timetuple().tm_yday - 100) / 365) + 6 * np.sin((minutes / 60 - 9) / 24 * 2 * math.pi)
@@ -221,7 +221,7 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
                         # 该串实际朝向/倾角与参考不同（物理事实）；档案对不对由 archive_correct 决定
                         I = I * geo_factor(p.get("azimuth", 90.0), p.get("tilt", cfg.tilt))
                     elif f.kind == "tracker_stuck":
-                        # 跟踪支架卡在水平位：失去清晨/傍晚增益，曲线回到固定倾角的钟形
+                        # 跟踪支架卡在固定位（默认水平，stuck_tilt 可指定）：失去跟踪增益，曲线回到固定倾角的钟形
                         if tracker_gain is not None:
                             I = I / tracker_gain * geo_factor(cfg.azimuth, p.get("stuck_tilt", 0.0))
                     elif f.kind == "open_circuit":

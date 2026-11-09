@@ -78,6 +78,20 @@ def test_tracker_stuck_detected_only_on_tracker_stations(tmp_path):
     assert not wo.empty and "跟踪" in wo["checklist_json"].iloc[0]
 
 
+def test_dual_axis_tracker_stuck_in_winter(tmp_path):
+    """双轴跟踪冬季卡滞：中午比值也掉到 0.85 左右，单轴的"中午≈1"规则不适用，要靠物理曲线校核认出来"""
+    s = lambda k, n: f"TR2-INV{k:02d}-pv{n}"
+    cfg = SimConfig(station_id="TR2", n_inverters=2, strings_per_inverter=8, days=45, seed=5, start=date(2026, 11, 20), mount="tracker_dual",
+                    faults=[Fault("string", s(2, 3), "tracker_stuck", 30, {"stuck_tilt": 20.0})], weather_probs=(0.7, 0.15, 0.15))
+    settings, store = _run(tmp_path, cfg, days_back=14)
+    susp = store.query("SELECT string_id, grade, rule_cause FROM suspects WHERE scope='string'")
+    hit = susp[susp["string_id"] == s(2, 3)]
+    assert not hit.empty and hit["rule_cause"].iloc[0] == Cause.TRACKER.value and hit["grade"].iloc[0] == "B", susp.to_dict("records")
+    assert susp[(susp["string_id"] != s(2, 3)) & susp["grade"].isin(["A", "B"])].empty
+    sj = store.scalar("SELECT signature_json FROM suspects WHERE string_id=?", (s(2, 3),)) or ""
+    assert "固定倾角" in sj, sj
+
+
 def test_station_soiling_quantified(tmp_path):
     """全站一起积灰（互比盲区）：站级指标应给出积灰损失与清洗回本估算"""
     s = lambda k, n: f"SO1-INV{k:02d}-pv{n}"
