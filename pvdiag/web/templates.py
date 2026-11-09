@@ -245,6 +245,11 @@ SUSPECT = r"""{% extends "base.html" %}{% set active='review' %}{% block title %
 <div class="grid cols-2" style="margin-top:16px">
 <section class="panel"><h2>判定</h2>
  <p class="why" style="margin:0 0 12px">{{ s.explanation or '尚无 AI 判定（等待下一次巡检）' }}</p>
+ <details {% if analysis and analysis.source != 'template' %}open{% endif %} style="margin:0 0 12px"><summary class="small muted" style="cursor:pointer">分析助手 <span class="chip {% if analysis.source.startswith('llm') %}ok{% else %}{% endif %}">{{ '大模型 ' ~ analysis.source[4:] if analysis.source.startswith('llm') else '模板（未配置大模型）' }}</span></summary>
+  <div class="small" style="white-space:pre-wrap;line-height:1.7;margin-top:8px">{{ analysis.text }}</div>
+  <form class="inline" method="post" action="/suspect/{{s.suspect_id}}/ask" style="margin-top:8px"><input type="text" name="question" placeholder="追问：损失多少 / 为什么这样判 / 同类历史 / 现场怎么办" style="min-width:320px" required><button class="sm">问</button></form>
+  {% for q in qa %}<div class="alert small" style="white-space:pre-wrap">{{ q.note }}</div>{% endfor %}
+ </details>
  <dl class="kv">
   <dt>规则原因</dt><dd>{{ s.rule_cause }}</dd>
   <dt>AI 原因</dt><dd><b>{{ s.ai_cause or '—' }}</b>{% if s.confidence is not none %} · 置信度 {{ (s.confidence*100)|num(0) }}%{% endif %} <span class="small muted">{{ s.model_version or '' }}</span></dd>

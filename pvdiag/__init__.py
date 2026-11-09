@@ -13,7 +13,10 @@ pvdiag · 组串发电量异常诊断智能体系统
 - sim         合成电站与故障注入（验证召回率/误报率）
 - public      公开数据（Kaggle 两站 / NREL 标注片段）下载、转换、基准评测、弱标注训练
 - health / notify  健康自检（pvdiag doctor）与关键事件推送
+- solar       晴空倾斜面/跟踪 POA 模型：季节性朝向归一、朝向网格拟合、跟踪卡滞
+- llm         LLM 分析助手（案卷 → 结论/依据/建议/不确定性；无 key 用模板）
+- sim/soak    连续运行压测（模拟复核员/主管/现场跑半年）
 - web         人工复核 Web 界面（FastAPI），含「自主运行」页
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -32,6 +32,8 @@ CHECKLIST: Dict[str, List[str]] = {
     Cause.CURTAILMENT.value: ["核对电网调度/逆变器限功率设置", "确认是否为 EMC 协议允许的限发，不计组件故障"],
     Cause.OUTAGE.value: ["查逆变器/采集器告警与离线日志，核对停机时段是否与工单一致", "查直流开关/保险丝是否跳脱、通讯链路是否中断",
                          "若为电网/调度停机或计划检修 → 登记事件并驳回；否则排查设备并回填实际原因"],
+    Cause.TRACKER.value: ["到现场看该排支架清晨/傍晚是否跟随太阳（与相邻排比较角度）", "查跟踪控制器告警、电机/减速机/限位、角度传感器",
+                          "手动复位或维修后观察次日清晨比值是否回到 ≥0.95"],
     Cause.ORIENTATION.value: ["核对排布图：该串朝向/倾角是否与档案一致", "更正档案后系统自动重分组，不派现场"],
     Cause.UNKNOWN.value: ["现场巡检该串组件、接线、阴影", "拍照回填，记录实际原因"],
 }
@@ -300,6 +302,35 @@ class WorkOrderAgent(Agent):
             r = store.query("SELECT scope, inverter_id FROM suspects WHERE suspect_id=?", (sid,))
             if not r.empty and r["scope"].iloc[0] == "inverter":
                 ProfileAgent.add_event(store, "inverter", r["inverter_id"].iloc[0], ev.value, done_date, f"{wo_id} {field_cause}")
+        # 现场回填是最可靠的标注：按实际原因给工单里每个嫌疑写一条复核记录（原因一致→confirm，不一致→modify，"正常/误报/无异常"→reject）
+        # 区域工单可能合并多个不同原因的嫌疑，一句"实际原因"不能套到每一条上：
+        #   单嫌疑工单 → 按原因写 confirm/modify；多嫌疑工单 → 只给"原因与现场一致"的嫌疑写 confirm；
+        #   "正常/误报/无异常" → 全部 reject；现场原因不在枚举里（自由文本）→ 不编造标注，只留在工单
+        normal_words = ("正常", "误报", "无异常", "未发现")
+        sids = json.loads(wo["suspect_ids_json"])
+        known_causes = [c.value for c in Cause]
+        is_normal = any(w in (field_cause or "") for w in normal_words)
+        for sid in sids:
+            r = store.query("SELECT rule_cause FROM suspects WHERE suspect_id=?", (sid,))
+            if r.empty or (store.scalar("SELECT COUNT(*) FROM reviews WHERE suspect_id=? AND reviewer='field'", (sid,)) or 0):
+                continue
+            rule_cause = r["rule_cause"].iloc[0]
+            if is_normal:
+                store.execute("INSERT INTO reviews (suspect_id, reviewer, decision, true_cause, reject_reason, note, reviewed_at) VALUES (?,?,?,?,?,?,?)",
+                              (sid, "field", "reject", Cause.NORMAL.value, "其他", f"{wo_id} 现场：{field_cause}", datetime.now().isoformat()))
+                continue
+            if field_cause not in known_causes:
+                continue
+            if field_cause == rule_cause:
+                decision = "confirm"
+            elif len(sids) == 1:
+                decision = "modify"
+            else:
+                continue
+            store.execute("INSERT INTO reviews (suspect_id, reviewer, decision, true_cause, reject_reason, note, reviewed_at) VALUES (?,?,?,?,?,?,?)",
+                          (sid, "field", decision, field_cause, None, f"{wo_id} 现场：{field_cause} / {field_action}", datetime.now().isoformat()))
+            if decision == "modify":
+                store.execute("UPDATE suspects SET rule_cause=? WHERE suspect_id=?", (field_cause, sid))
         # closed_at 记录"现场处理日"（而非录入时刻），复查以此为起点
         closed_at = datetime.combine(done_date, datetime.now().time()).isoformat()
         store.execute(

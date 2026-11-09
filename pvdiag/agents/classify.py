@@ -25,7 +25,7 @@ FEATURES = ["dev_today", "dev_vs_own", "dev_roll7", "persist_days_5", "persist_d
             "zero_all_day", "stuck", "voltage_offset", "dip_depth", "dip_len_h", "dip_center_h", "outside_dip_ratio",
             "constant_offset", "ratio_mean", "ratio_std", "am_pm_skew", "overcast_dev", "known_shading",
             "inverter_level", "low_confidence", "n_clear_recent", "month", "grade_sev",
-            "outage_hours", "outage_days", "stale_run_min", "group_noise"]
+            "outage_hours", "outage_days", "stale_run_min", "group_noise", "tracker_stuck", "am_ratio", "pm_ratio"]
 
 GRADE_SEV = {Grade.A.value: 0, Grade.B.value: 1, Grade.C.value: 2, Grade.D.value: 3, Grade.E.value: 4, Grade.ARCHIVED.value: 5}
 
@@ -60,6 +60,8 @@ def build_features(susp: Dict, bl: Optional[pd.Series], sig: Signature, prof: Op
         "grade_sev": float(GRADE_SEV.get(susp.get("grade"), 4)),
         "outage_hours": float(sig.outage_hours or 0.0), "outage_days": float(sig.outage_days or 0),
         "stale_run_min": float(sig.stale_run_min or 0), "group_noise": sig.group_noise if sig.group_noise is not None else np.nan,
+        "tracker_stuck": float(sig.tracker_stuck), "am_ratio": sig.am_ratio if sig.am_ratio is not None else np.nan,
+        "pm_ratio": sig.pm_ratio if sig.pm_ratio is not None else np.nan,
     }
 
 
@@ -80,6 +82,8 @@ class RuleProxyModel:
                 conf = 0.80 if persist >= 5 else 0.70
             elif sig.outage_hours > 0:
                 conf = 0.85 if sig.outage_days >= 3 else 0.70
+            elif sig.tracker_stuck:
+                conf = 0.80 if persist >= 3 else 0.70
             elif sig.dip_depth is not None:
                 conf = 0.85 if persist >= 3 else 0.75
             elif sig.constant_offset:
@@ -162,18 +166,20 @@ class ClassifyAgent(Agent):
         proxy = RuleProxyModel()
         verdicts: List[Dict] = []
         novelty = self._novelty_scores(ctx)
+        # 一次取齐当日基线/档案/签名，不在循环里逐条查库（万串级）
+        bl_rows = ctx.store.query("SELECT * FROM baselines WHERE date=?", (today,)).set_index("string_id").to_dict("index") if not susp.empty else {}
+        prof_rows = ctx.store.strings().set_index("string_id").to_dict("index") if not susp.empty else {}
+        skew_rows = ctx.store.query("SELECT string_id, am_pm_skew FROM signatures WHERE date=?", (today,)).set_index("string_id")["am_pm_skew"].to_dict() if not susp.empty else {}
         for s in susp.to_dict("records"):
             sig = Signature.model_validate_json(s["signature_json"]) if s.get("signature_json") else Signature()
-            bl, prof, sg = None, None, pd.DataFrame()
+            bl, prof, skew = None, None, None
             if s["scope"] == "string":
-                b = ctx.store.query("SELECT * FROM baselines WHERE string_id=? AND date=?", (s["string_id"], today))
-                bl = b.iloc[0] if not b.empty else None
-                p = ctx.store.query("SELECT * FROM strings WHERE string_id=?", (s["string_id"],))
-                prof = p.iloc[0] if not p.empty else None
-                sg = ctx.store.query("SELECT am_pm_skew FROM signatures WHERE string_id=? AND date=?", (s["string_id"], today))
+                bl = bl_rows.get(s["string_id"])
+                prof = prof_rows.get(s["string_id"])
+                skew = skew_rows.get(s["string_id"])
             feats = build_features(s, bl, sig, prof, ctx.run_date)
-            if s["scope"] == "string" and not sg.empty and pd.notna(sg["am_pm_skew"].iloc[0]):
-                feats["am_pm_skew"] = float(sg["am_pm_skew"].iloc[0])
+            if skew is not None and pd.notna(skew):
+                feats["am_pm_skew"] = float(skew)
             r_cause, r_conf, r_proba = proxy.predict(s, feats, sig)
             if model is not None:
                 m_cause, m_conf, m_proba = model.predict(feats)
@@ -462,8 +468,10 @@ class ClassifyAgent(Agent):
         X = df[cols].astype(float).fillna(0.0)
         try:
             from sklearn.ensemble import IsolationForest
-            iso = IsolationForest(n_estimators=150, contamination=0.02, random_state=42).fit(X.to_numpy())
-            sc = iso.decision_function(X.to_numpy())
+            Xn = X.to_numpy()
+            fit_X = Xn if len(Xn) <= 20000 else Xn[np.random.default_rng(42).choice(len(Xn), 20000, replace=False)]   # 万串级抽样拟合
+            iso = IsolationForest(n_estimators=100, contamination=0.02, random_state=42).fit(fit_X)
+            sc = iso.decision_function(Xn)
         except Exception:
             return {}
         df["score"] = sc

@@ -170,10 +170,23 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         # 上一条/下一条（按队列顺序）用于连续复核
         q = ReviewAgent.queue(store)["suspect_id"].tolist() if True else []
         nxt = q[q.index(suspect_id) + 1] if suspect_id in q and q.index(suspect_id) + 1 < len(q) else (q[0] if q and q[0] != suspect_id else None)
+        from ..llm import narrative
+        try:
+            analysis = narrative(settings, store, suspect_id)
+        except Exception as e:      # 助手失败不影响复核页
+            analysis = {"text": f"分析暂不可用：{e}", "source": "error"}
+        qa = store.query("SELECT note, reviewed_at FROM reviews WHERE suspect_id=? AND decision='note' ORDER BY reviewed_at DESC LIMIT 5", (suspect_id,))
         return render("suspect.html", s=s, sig=sig, chart_svg=line_chart(chart["labels"], chart["series"], chart["title"], "A"),
                       trend_svg=bar_chart(trend["labels"], trend["dev"], trend["weather"], "互比偏差 %（虚线 -3% / -5%）"),
-                      prof=prof, reviews=reviews.pipe(recs), loss=loss, causes=CAUSE_CHOICES, reasons=REJECT_REASONS,
-                      proba=json.loads(s.get("proba_json") or "{}"), wo=wo.pipe(recs), next_id=nxt)
+                      prof=prof, reviews=reviews[reviews["decision"] != "note"].pipe(recs) if not reviews.empty else [], loss=loss,
+                      causes=CAUSE_CHOICES, reasons=REJECT_REASONS,
+                      proba=json.loads(s.get("proba_json") or "{}"), wo=wo.pipe(recs), next_id=nxt, analysis=analysis, qa=qa.pipe(recs))
+
+    @app.post("/suspect/{suspect_id}/ask")
+    def suspect_ask(suspect_id: str, question: str = Form(...)):
+        from ..llm import ask
+        ask(settings, store, suspect_id, question.strip()[:300])
+        return RedirectResponse(f"/suspect/{suspect_id}", status_code=303)
 
     # ------------------------------------------------------------------ 工单
     @app.get("/workorders", response_class=HTMLResponse)

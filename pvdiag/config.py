@@ -41,6 +41,7 @@ class Thresholds(BaseModel):
     outage_min_slots: int = 2               # 白天 ≥2 个半小时槽（1h）整段 0 输出而同机其它串正常 → 间歇停机/掉线签名
     outage_group_ratio: float = 0.30        # 判停机时要求群组曲线 ≥ 当日峰值 30%（排除清晨/傍晚）
     outage_rel_zero: float = 0.10           # 本串 ≤ 群组同时段 10% 即视为"整段为 0"（晴天散射光占比 10%~15%，遮挡不会更低；15 分钟边沿插值也不会）
+    tracker_side_ratio: float = 0.85        # 跟踪电站：清晨与傍晚相对群组比值都 ≤0.85 且中午 ≥0.93 → 支架卡滞签名
     outage_noon_skip_frac: float = 0.20     # 中午窗口 ≥20% 样本为 0 的日子不计入互比持续度（停机已有独立签名，别把它算成"低发"）
 
 
@@ -59,6 +60,7 @@ class BaselineCfg(BaseModel):
     slot_minutes: int = 30               # 曲线签名向量粒度（半小时）
     daylight_start: str = "05:00"
     daylight_end: str = "19:30"
+    tz_meridian_deg: float = 120.0       # 时区中央经线（Asia/Shanghai = 120°E）：太阳几何用 stations.lon 换算时钟时间 → 太阳时
 
 
 class Confidence(BaseModel):
@@ -102,9 +104,10 @@ class LossCfg(BaseModel):
         "peak": 0.90, "flat": 0.60, "valley": 0.30
     })
     expected_fault_days_default: int = 30   # 未修复预计持续天数（优先级公式用）
+    cleaning_cost_per_kwp: float = 15.0     # 全站清洗单价（元/kWp），用于积灰清洗回本估算
     repair_cost_by_cause: Dict[str, float] = Field(default_factory=lambda: {
         "断线/未接": 300, "旁路二极管": 500, "遮挡": 400, "朝向差异": 0,
-        "MPPT异常": 1500, "组件衰减/积灰": 200, "数据问题": 50, "限发": 0, "间歇停机/掉线": 200, "未知": 300,
+        "MPPT异常": 1500, "组件衰减/积灰": 200, "数据问题": 50, "限发": 0, "间歇停机/掉线": 200, "跟踪支架卡滞": 400, "未知": 300,
     })
 
 
@@ -159,6 +162,17 @@ class AlertCfg(BaseModel):
     dedupe_hours: int = 24
 
 
+class LLMCfg(BaseModel):
+    """LLM 解释与复核助手（可选）：没有 key 就用模板文案，功能不缺；私有化部署可 enabled=false 彻底关闭出站。"""
+    enabled: bool = True
+    provider: str = "anthropic"
+    model: str = "claude-sonnet-4-5"
+    api_key_env: str = "ANTHROPIC_API_KEY"
+    base_url: str = "https://api.anthropic.com"
+    max_tokens: int = 700
+    timeout_seconds: int = 40
+
+
 class Settings(BaseModel):
     data_dir: Path = Path("./data")
     timezone: str = "Asia/Shanghai"
@@ -171,6 +185,7 @@ class Settings(BaseModel):
     autotune: AutotuneCfg = AutotuneCfg()
     ingest: IngestCfg = IngestCfg()
     alerts: AlertCfg = AlertCfg()
+    llm: LLMCfg = LLMCfg()
 
     # ---- 派生路径 ----
     @property
