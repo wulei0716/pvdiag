@@ -27,6 +27,11 @@ def test_solar_seasonal_expectation():
     curve = expected_profile_ratio(31.2, date(2026, 10, 15), 90, 15, 180, 15)
     fit = best_fit_orientation(31.2, date(2026, 10, 15), curve, 180, 15)
     assert fit[:2] == (90.0, 15.0) and fit[3] > fit[2] + 0.03
+    # 经度换算：乌鲁木齐（87°E，北京时间）时钟正午太阳还在东边 → 东向串中午期望比明显高于 120°E 的站
+    from pvdiag.solar import lon_offset_minutes
+    off = lon_offset_minutes(87.0, 120.0)
+    assert abs(off - 132) < 1e-6
+    assert expected_noon_ratio(43.8, date(2026, 10, 15), 90, 15, 180, 15, lon_offset_min=off) > expected_noon_ratio(43.8, date(2026, 10, 15), 90, 15, 180, 15) + 0.1
 
 
 def test_orientation_archive_correct_no_alarm_and_wrong_archive_flagged(tmp_path):

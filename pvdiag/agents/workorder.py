@@ -303,23 +303,34 @@ class WorkOrderAgent(Agent):
             if not r.empty and r["scope"].iloc[0] == "inverter":
                 ProfileAgent.add_event(store, "inverter", r["inverter_id"].iloc[0], ev.value, done_date, f"{wo_id} {field_cause}")
         # 现场回填是最可靠的标注：按实际原因给工单里每个嫌疑写一条复核记录（原因一致→confirm，不一致→modify，"正常/误报/无异常"→reject）
+        # 区域工单可能合并多个不同原因的嫌疑，一句"实际原因"不能套到每一条上：
+        #   单嫌疑工单 → 按原因写 confirm/modify；多嫌疑工单 → 只给"原因与现场一致"的嫌疑写 confirm；
+        #   "正常/误报/无异常" → 全部 reject；现场原因不在枚举里（自由文本）→ 不编造标注，只留在工单
         normal_words = ("正常", "误报", "无异常", "未发现")
-        for sid in json.loads(wo["suspect_ids_json"]):
+        sids = json.loads(wo["suspect_ids_json"])
+        known_causes = [c.value for c in Cause]
+        is_normal = any(w in (field_cause or "") for w in normal_words)
+        for sid in sids:
             r = store.query("SELECT rule_cause FROM suspects WHERE suspect_id=?", (sid,))
-            if r.empty:
+            if r.empty or (store.scalar("SELECT COUNT(*) FROM reviews WHERE suspect_id=? AND reviewer='field'", (sid,)) or 0):
                 continue
-            already = store.scalar("SELECT COUNT(*) FROM reviews WHERE suspect_id=? AND reviewer='field'", (sid,)) or 0
-            if already:
-                continue
-            if any(w in (field_cause or "") for w in normal_words):
+            rule_cause = r["rule_cause"].iloc[0]
+            if is_normal:
                 store.execute("INSERT INTO reviews (suspect_id, reviewer, decision, true_cause, reject_reason, note, reviewed_at) VALUES (?,?,?,?,?,?,?)",
                               (sid, "field", "reject", Cause.NORMAL.value, "其他", f"{wo_id} 现场：{field_cause}", datetime.now().isoformat()))
+                continue
+            if field_cause not in known_causes:
+                continue
+            if field_cause == rule_cause:
+                decision = "confirm"
+            elif len(sids) == 1:
+                decision = "modify"
             else:
-                known = field_cause if field_cause in [c.value for c in Cause] else r["rule_cause"].iloc[0]
-                decision = "confirm" if known == r["rule_cause"].iloc[0] else "modify"
-                store.execute("INSERT INTO reviews (suspect_id, reviewer, decision, true_cause, reject_reason, note, reviewed_at) VALUES (?,?,?,?,?,?,?)",
-                              (sid, "field", decision, known, None, f"{wo_id} 现场：{field_cause} / {field_action}", datetime.now().isoformat()))
-                store.execute("UPDATE suspects SET rule_cause=? WHERE suspect_id=? AND rule_cause=?", (known, sid, Cause.UNKNOWN.value))
+                continue
+            store.execute("INSERT INTO reviews (suspect_id, reviewer, decision, true_cause, reject_reason, note, reviewed_at) VALUES (?,?,?,?,?,?,?)",
+                          (sid, "field", decision, field_cause, None, f"{wo_id} 现场：{field_cause} / {field_action}", datetime.now().isoformat()))
+            if decision == "modify":
+                store.execute("UPDATE suspects SET rule_cause=? WHERE suspect_id=?", (field_cause, sid))
         # closed_at 记录"现场处理日"（而非录入时刻），复查以此为起点
         closed_at = datetime.combine(done_date, datetime.now().time()).isoformat()
         store.execute(

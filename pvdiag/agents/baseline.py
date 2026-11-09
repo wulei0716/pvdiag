@@ -187,12 +187,14 @@ class BaselineAgent(Agent):
     @staticmethod
     def _orientation_expectation(f: pd.DataFrame, strings: pd.DataFrame, ctx: AgentContext, station_id: str) -> pd.Series:
         """每行（串·日）的期望电流比 = 该串朝向 vs 同机参考朝向（众数）在当日中午窗口的晴空 POA 比；朝向缺失/相同 → 1.0"""
-        from ..solar import expected_noon_ratio
+        from ..solar import expected_noon_ratio, lon_offset_minutes
         out = pd.Series(1.0, index=f.index)
         if "azimuth" not in f.columns or f["azimuth"].isna().all() or f["tilt"].isna().all():
             return out
-        st = ctx.store.query("SELECT lat FROM stations WHERE station_id=?", (station_id,))
+        st = ctx.store.query("SELECT lat, lon FROM stations WHERE station_id=?", (station_id,))
         lat = float(st["lat"].iloc[0]) if not st.empty and pd.notna(st["lat"].iloc[0]) else 30.0
+        lon_off = lon_offset_minutes(float(st["lon"].iloc[0]) if not st.empty and pd.notna(st["lon"].iloc[0]) else None,
+                                     ctx.settings.baseline.tz_meridian_deg)
         # 同机参考朝向 = 该逆变器各串 (azimuth, tilt) 的众数
         ref = {}
         for inv, g in strings.dropna(subset=["azimuth", "tilt"]).groupby("inverter_id"):
@@ -211,7 +213,7 @@ class BaselineAgent(Agent):
             key = (dates[i], az[i], tilt[i], r)
             if key not in cache:
                 cache[key] = expected_noon_ratio(lat, date.fromisoformat(dates[i]), az[i], tilt[i], r[0], r[1],
-                                                 (ctx.settings.baseline.noon_start, ctx.settings.baseline.noon_end))
+                                                 (ctx.settings.baseline.noon_start, ctx.settings.baseline.noon_end), lon_off)
             vals[i] = max(cache[key], 0.2)
         return pd.Series(vals, index=f.index)
 

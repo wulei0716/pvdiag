@@ -83,10 +83,12 @@ class ReviewAgent(Agent):
     def stats(store, days: int = 30) -> Dict:
         since = (date.today() - timedelta(days=days)).isoformat()
         rv = store.query(
-            "SELECT r.decision, r.reject_reason, s.grade, s.rule_cause FROM reviews r JOIN suspects s ON s.suspect_id=r.suspect_id "
+            "SELECT r.suspect_id, r.decision, r.reject_reason, r.reviewed_at, s.grade, s.rule_cause FROM reviews r JOIN suspects s ON s.suspect_id=r.suspect_id "
             "WHERE r.decision IN ('confirm','modify','reject') AND r.reviewed_at>=?", (since,))
         if rv.empty:
             return {"n_reviewed": 0, "confirm_rate": None, "false_alarm_rate": None}
+        # 一个嫌疑可能既有复核员记录又有现场回填记录：按嫌疑去重，以最后一条为准（与训练集口径一致）
+        rv = rv.sort_values("reviewed_at").drop_duplicates(subset=["suspect_id"], keep="last")
         n = len(rv)
         confirmed = int(rv["decision"].isin(["confirm", "modify"]).sum())
         by_grade = {g: round(float((x["decision"] != "reject").mean()), 3) for g, x in rv.groupby("grade")}

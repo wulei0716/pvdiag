@@ -36,9 +36,17 @@ def sun_position(lat_deg: float, doy: int, minutes: np.ndarray, lon_offset_min: 
     return h, np.radians(az)
 
 
-def clear_sky_poa(lat_deg: float, doy: int, minutes: np.ndarray, azimuth_deg: float, tilt_deg: float, albedo: float = 0.2) -> np.ndarray:
-    """晴空下倾斜面辐照（相对单位），夜间为 0"""
-    h, az = sun_position(lat_deg, doy, minutes)
+def lon_offset_minutes(lon_deg: Optional[float], tz_meridian_deg: float = 120.0) -> float:
+    """时钟时间 − 当地太阳时（分钟）：经度每偏离时区中央经线 1° 差 4 分钟。lon 缺失 → 0（按中央经线）"""
+    if lon_deg is None or (isinstance(lon_deg, float) and math.isnan(lon_deg)):
+        return 0.0
+    return float((tz_meridian_deg - lon_deg) * 4.0)
+
+
+def clear_sky_poa(lat_deg: float, doy: int, minutes: np.ndarray, azimuth_deg: float, tilt_deg: float, albedo: float = 0.2,
+                  lon_offset_min: float = 0.0) -> np.ndarray:
+    """晴空下倾斜面辐照（相对单位），夜间为 0；minutes 为时钟分钟，lon_offset_min 把它换算到太阳时"""
+    h, az = sun_position(lat_deg, doy, minutes, lon_offset_min)
     up = h > 0
     sin_h = np.clip(np.sin(h), 0, 1)
     dni = np.where(up, 950.0 * np.power(sin_h, 0.15), 0.0)
@@ -51,15 +59,16 @@ def clear_sky_poa(lat_deg: float, doy: int, minutes: np.ndarray, azimuth_deg: fl
     return np.where(up, poa, 0.0)
 
 
-def tracker_poa(lat_deg: float, doy: int, minutes: np.ndarray, axis_tilt_deg: float = 0.0, max_angle_deg: float = 60.0) -> np.ndarray:
+def tracker_poa(lat_deg: float, doy: int, minutes: np.ndarray, axis_tilt_deg: float = 0.0, max_angle_deg: float = 60.0,
+                lon_offset_min: float = 0.0) -> np.ndarray:
     """水平南北轴单轴跟踪（东西转动）的 POA 近似：跟踪角 = clip(太阳方位在东西向的投影角, ±max)，再按对应倾斜面算"""
-    h, az = sun_position(lat_deg, doy, minutes)
+    h, az = sun_position(lat_deg, doy, minutes, lon_offset_min)
     up = h > 0
     sin_h = np.clip(np.sin(h), 0, 1)
     dni = np.where(up, 950.0 * np.power(sin_h, 0.15), 0.0)
     ghi = dni * sin_h
     dhi = 0.12 * ghi
-    # 太阳在东西-垂直平面内的投影角（朝东为负，朝西为正）
+    # 太阳在东西-垂直平面内的投影角（在东为正 → 面朝东；在西为负 → 面朝西）
     sx = np.cos(h) * np.sin(az)          # 东西分量（az 从北顺时针：东=90°→ sin=1）
     sz = np.sin(h)
     rot = np.clip(np.degrees(np.arctan2(sx, np.maximum(sz, 1e-6))), -max_angle_deg, max_angle_deg)
@@ -76,27 +85,27 @@ def noon_window_minutes(start: str = "11:30", end: str = "13:30", step: int = 5)
 
 
 def expected_noon_ratio(lat_deg: float, d: date, az_a: float, tilt_a: float, az_b: float, tilt_b: float,
-                        noon: Tuple[str, str] = ("11:30", "13:30")) -> float:
+                        noon: Tuple[str, str] = ("11:30", "13:30"), lon_offset_min: float = 0.0) -> float:
     """组串 A 相对参考朝向 B 在中午窗口的期望电流比（晴空）。朝向/倾角缺失时返回 1.0。"""
     for v in (az_a, tilt_a, az_b, tilt_b):
         if v is None or (isinstance(v, float) and math.isnan(v)):
             return 1.0
     mins = noon_window_minutes(*noon)
     doy = d.timetuple().tm_yday
-    pa = clear_sky_poa(lat_deg, doy, mins, az_a, tilt_a).mean()
-    pb = clear_sky_poa(lat_deg, doy, mins, az_b, tilt_b).mean()
+    pa = clear_sky_poa(lat_deg, doy, mins, az_a, tilt_a, lon_offset_min=lon_offset_min).mean()
+    pb = clear_sky_poa(lat_deg, doy, mins, az_b, tilt_b, lon_offset_min=lon_offset_min).mean()
     if pb <= 0:
         return 1.0
     return float(pa / pb)
 
 
 def expected_profile_ratio(lat_deg: float, d: date, az_a: float, tilt_a: float, az_b: float, tilt_b: float,
-                           slot_minutes: int = 30) -> np.ndarray:
+                           slot_minutes: int = 30, lon_offset_min: float = 0.0) -> np.ndarray:
     """A 相对 B 的全天（按半小时槽）期望比值曲线，用于把朝向差异从曲线签名里扣掉"""
     mins = np.arange(0, 24 * 60, 5)
     doy = d.timetuple().tm_yday
-    pa = clear_sky_poa(lat_deg, doy, mins, az_a, tilt_a)
-    pb = clear_sky_poa(lat_deg, doy, mins, az_b, tilt_b)
+    pa = clear_sky_poa(lat_deg, doy, mins, az_a, tilt_a, lon_offset_min=lon_offset_min)
+    pb = clear_sky_poa(lat_deg, doy, mins, az_b, tilt_b, lon_offset_min=lon_offset_min)
     n = (24 * 60) // slot_minutes
     out = np.full(n, np.nan)
     for s in range(n):
@@ -108,7 +117,7 @@ def expected_profile_ratio(lat_deg: float, d: date, az_a: float, tilt_a: float, 
 
 def best_fit_orientation(lat_deg: float, d: date, ratio_curve: np.ndarray, ref_az: float, ref_tilt: float,
                          slot_minutes: int = 30, azimuths: Iterable[float] = (90, 120, 150, 180, 210, 240, 270),
-                         tilts: Iterable[float] = (5, 10, 15, 20, 25, 30, 40)) -> Optional[Tuple[float, float, float]]:
+                         tilts: Iterable[float] = (5, 10, 15, 20, 25, 30, 40), lon_offset_min: float = 0.0) -> Optional[Tuple[float, float, float, float]]:
     """给定该串相对群组的全天比值曲线（48 槽，NaN 为无效），在朝向/倾角网格里找最像的一组 → (azimuth, tilt, rmse)。
     参考朝向本身也在网格里：若参考朝向最像，说明不是朝向问题。"""
     valid = ~np.isnan(ratio_curve)
@@ -121,7 +130,7 @@ def best_fit_orientation(lat_deg: float, d: date, ratio_curve: np.ndarray, ref_a
         grid.append((ref_az, ref_tilt))
     for az, tilt in grid:
         if True:
-            exp = expected_profile_ratio(lat_deg, d, az, tilt, ref_az, ref_tilt, slot_minutes)
+            exp = expected_profile_ratio(lat_deg, d, az, tilt, ref_az, ref_tilt, slot_minutes, lon_offset_min)
             m = valid & ~np.isnan(exp)
             if m.sum() < 8:
                 continue

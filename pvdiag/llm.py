@@ -56,7 +56,7 @@ def case_dossier(store: Store, suspect_id: str, settings: Optional[Settings] = N
                             for r in tr.to_dict("records")]
         ev = store.query("SELECT event_type, event_date, notes FROM events WHERE target_id=? ORDER BY event_date DESC LIMIT 5", (s["string_id"],))
         d["events"] = ev.to_dict("records")
-    rv = store.query("SELECT reviewer, decision, true_cause, reject_reason, note, reviewed_at FROM reviews WHERE suspect_id=? ORDER BY reviewed_at", (suspect_id,))
+    rv = store.query("SELECT reviewer, decision, true_cause, reject_reason, note, reviewed_at FROM reviews WHERE suspect_id=? AND decision!='note' ORDER BY reviewed_at", (suspect_id,))
     d["reviews"] = rv.to_dict("records")
     try:
         d["loss"] = LossAgent.case_loss(store, suspect_id)
@@ -150,8 +150,8 @@ def narrative(settings: Settings, store: Store, suspect_id: str, force: bool = F
         try:
             text = client.complete(SYSTEM_PROMPT, "案卷：\n" + json.dumps(d, ensure_ascii=False, default=str))
             out = {"text": text, "source": f"llm:{settings.llm.model}", "fp": fp, "at": datetime.now().isoformat()}
-        except Exception as e:
-            out = {"text": template_narrative(d) + f"\n（大模型调用失败：{e}）", "source": "template", "fp": fp, "at": datetime.now().isoformat()}
+        except Exception as e:      # 瞬时失败不缓存，下次打开再试
+            return {"text": template_narrative(d) + f"\n（大模型调用失败：{e}）", "source": "template", "fp": fp, "at": datetime.now().isoformat()}
     else:
         out = {"text": template_narrative(d), "source": "template", "fp": fp, "at": datetime.now().isoformat()}
     store.set_state(key, out)

@@ -159,16 +159,19 @@ class RegionAgent(Agent):
             else:
                 sd["level"] = sd["noon_power"] / sd["peak_ref"]
                 basis = "中午功率/晴天峰值参考（无辐照，含季节项）"
+            sd = sd[sd["level"].notna() & np.isfinite(sd["level"])]
+            if len(sd) < 10:
+                continue
             y = sd["level"].to_numpy(dtype=float)
             slope = float(np.polyfit(np.arange(len(y)), y, 1)[0]) * 100
             rain = sd_all[sd_all["rain"] == 1]["date"].tolist()
             rain_days = len(rain)
             if rain:
                 after = sd[sd["date"] > rain[-1]].head(2)
-                clean_ref = float(after["level"].median()) if len(after) >= 1 else float(np.sort(y)[-3:].mean())
+                clean_ref = float(after["level"].median()) if len(after) >= 1 else float(np.percentile(y, 90))
                 ref_note = f"最近降雨 {rain[-1]} 后首个晴好天"
             else:
-                clean_ref = float(np.sort(y)[-3:].mean()); ref_note = "窗口内最高 3 天（无降雨记录）"
+                clean_ref = float(np.percentile(y, 90)); ref_note = "窗口内 90 分位（无降雨记录；晴好天离散 3%~5% 会让它偏高）"
             current = float(sd["level"].tail(3).median())
             soiling = max(0.0, 1 - current / clean_ref) if clean_ref > 0 else 0.0
             daily_kwh = float(sd["energy"].tail(7).mean()) if sd["energy"].notna().any() else 0.0
@@ -180,7 +183,8 @@ class RegionAgent(Agent):
                         "soiling_loss_pct": round(soiling * 100, 2), "lost_kwh_per_day": round(lost_kwh_day, 1),
                         "lost_yuan_per_day": round(lost_kwh_day * price, 1), "cleaning_cost_yuan": round(cost, 0),
                         "payback_days": None if payback is None else round(payback, 1),
-                        "suspect_soiling": bool(slope < -0.25 and rain_days <= 2) or soiling >= 0.05,
+                        # 无辐照时季节项会混进斜率与"清洁参考"，只按老口径（斜率+无雨）触发；有 PR 才允许按积灰损失触发
+                        "suspect_soiling": bool(slope < -0.25 and rain_days <= 2) or (bool(use_irr) and soiling >= 0.05),
                         "advice": ("建议全站清洗：回本约 %.0f 天" % payback) if payback is not None and payback <= 45 and soiling >= 0.03
                                   else ("积灰 %.1f%%，暂不划算清洗（回本 %s 天）" % (soiling * 100, "∞" if payback is None else round(payback))) if soiling > 0
                                   else "无积灰迹象",

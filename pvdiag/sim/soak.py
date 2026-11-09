@@ -132,17 +132,17 @@ class SoakRunner:
                              "WHERE status IN ('open','reviewing') AND grade NOT IN ('已备案') ORDER BY CASE grade WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END, first_date")
         n = 0
         for s in q.to_dict("records"):
-            delay = (d - date.fromisoformat(s["date"])).days
+            delay = (d - date.fromisoformat(s["first_date"] or s["date"])).days     # suspects.date 每天刷新，不能用
             if delay < self.rng.randint(*self.cfg.review_delay_days):
                 continue
             if s["grade"] in ("D", "E") and self.rng.random() < 0.7:
                 continue                    # 观察级大多不复核
             target = s["string_id"] if s["scope"] == "string" else s["inverter_id"]
             tr = self.active_fault(target, s["first_date"], today)
-            truly_bad = tr is not None and tr["kind"] not in ("archived_shading",)
+            truly_bad = tr is not None and tr["kind"] in KIND_CAUSE
             wrong = self.rng.random() < self.cfg.reviewer_error
             if truly_bad != wrong:          # 真坏且没判错 / 不坏但判错 → 确认
-                cause = KIND_CAUSE[tr["kind"]].value if tr is not None else None
+                cause = KIND_CAUSE[tr["kind"]].value if truly_bad else None
                 ReviewAgent.confirm(self.store, s["suspect_id"], cause, "soak-reviewer", "")
             else:
                 ReviewAgent.reject(self.store, s["suspect_id"], self.rng.choice(["云影", "数据脏", "其他"]), "soak-reviewer", "")

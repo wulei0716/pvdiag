@@ -84,6 +84,12 @@ class DetectAgent(Agent):
                 physics_c = a["grade"] == Grade.C.value and '"orientation_fit":"' in (a.get("signature_json") or "")
                 if physics_c and c["grade"] == Grade.B.value and not (c.get("_hard") or False):
                     c["grade"], c["rule_cause"], escalated = Grade.C.value, a["rule_cause"], False
+                    try:        # 把物理拟合结论带到今天的签名里，否则下一个阴天保护就失效
+                        old_sig, new_sig = json.loads(a["signature_json"]), json.loads(c["signature_json"])
+                        new_sig["orientation_fit"], new_sig["orientation_like"] = old_sig.get("orientation_fit"), True
+                        c["signature_json"] = json.dumps(new_sig, ensure_ascii=False)
+                    except Exception:
+                        pass
                 if c["grade"] != Grade.C.value and SEVERITY.get(a["grade"], 9) < SEVERITY.get(c["grade"], 9):
                     c["grade"] = a["grade"]
                     if c["rule_cause"] == Cause.UNKNOWN.value:
@@ -170,8 +176,16 @@ class DetectAgent(Agent):
             (station_id, today))
         prof = strings.set_index("string_id")
         bl = bl.set_index("string_id")
-        st_row = ctx.store.query("SELECT lat, extra_json FROM stations WHERE station_id=?", (station_id,))
-        st_extra = json.loads(st_row["extra_json"].iloc[0] or "{}") if not st_row.empty and st_row["extra_json"].iloc[0] else {}
+        st_row = ctx.store.query("SELECT lat, lon, extra_json FROM stations WHERE station_id=?", (station_id,))
+        from ..solar import lon_offset_minutes
+        lon_offset = lon_offset_minutes(float(st_row["lon"].iloc[0]) if not st_row.empty and pd.notna(st_row["lon"].iloc[0]) else None,
+                                        cfg.tz_meridian_deg)
+        try:
+            st_extra = json.loads(st_row["extra_json"].iloc[0] or "{}") if not st_row.empty and st_row["extra_json"].iloc[0] else {}
+            st_extra = st_extra if isinstance(st_extra, dict) else {}
+        except Exception:
+            st_extra = {}
+        ref_orient = {inv: self._ref_orientation(prof, inv) for inv in prof["inverter_id"].unique()}      # 每机算一次
         mount = st_extra.get("mount", "fixed")
         lat = float(st_row["lat"].iloc[0]) if not st_row.empty and pd.notna(st_row["lat"].iloc[0]) else 30.0
 
@@ -201,7 +215,8 @@ class DetectAgent(Agent):
                 continue
             f = ft_rows.get(sid)
             h = hist_by.get(sid, [])
-            geo = (lat, *self._ref_orientation(prof, p["inverter_id"]), d)
+            ref = ref_orient.get(p["inverter_id"])
+            geo = (lat, ref[0], ref[1], d, lon_offset) if ref is not None else None          # 档案没有朝向 → 不做物理拟合
             sig, skew, rcurve = self._signature(sid, f, p, b, group_curves, inv_daily, th, cfg, mount, geo)
             if sig.tracker_stuck:
                 sig.notes.append(f"跟踪电站：清晨比值 {sig.am_ratio:.0%}、傍晚 {sig.pm_ratio:.0%}，中午正常 → 失去跟踪增益（支架卡滞/控制器停）")
@@ -217,7 +232,7 @@ class DetectAgent(Agent):
                 sig.outage_days = sum(1 for r in h if r["date"] >= outage_cut and r.get("outage_slots") is not None
                                       and not pd.isna(r["outage_slots"]) and r["outage_slots"] >= th.outage_min_slots) + 1
             out_slots = int(round(sig.outage_hours * 60 / cfg.slot_minutes)) if sig.outage_hours else 0
-            tracker_days = sum(1 for r in h if r.get("weather_tag") == "clear" and r.get("tracker_flag") == 1) if sig.tracker_stuck else 0
+            tracker_days = self._leading_flag_days(h, "tracker_flag") if sig.tracker_stuck else 0
             sig_rows.append({"string_id": sid, "date": today, "weather_tag": weather, "ratio_mean": sig.ratio_mean,
                              "ratio_std": sig.ratio_std, "am_pm_skew": skew, "dip_depth": sig.dip_depth,
                              "dip_start": sig.dip_start, "dip_end": sig.dip_end, "outside_dip_ratio": sig.outside_dip_ratio,
@@ -391,17 +406,32 @@ class DetectAgent(Agent):
 
     # ------------------------------------------------------------------ 签名
     @staticmethod
-    def _ref_orientation(prof: pd.DataFrame, inverter_id: str) -> Tuple[float, float]:
+    def _ref_orientation(prof: pd.DataFrame, inverter_id: str) -> Optional[Tuple[float, float]]:
+        """同机参考朝向 = (azimuth, tilt) 众数；档案没有朝向 → None（不做物理拟合）"""
         g = prof[(prof["inverter_id"] == inverter_id)].dropna(subset=["azimuth", "tilt"])
         if g.empty:
-            return 180.0, 15.0
+            return None
         pair = g.groupby(["azimuth", "tilt"]).size().idxmax()
         return float(pair[0]), float(pair[1])
 
+    @staticmethod
+    def _leading_flag_days(hist: List[Dict], col: str) -> int:
+        """此前连续多少个晴好天该标记为 1（hist 日期倒序；非晴好天跳过）"""
+        n = 0
+        for r in hist:
+            if r.get("weather_tag") != "clear":
+                continue
+            v = r.get(col)
+            if v is None or pd.isna(v) or int(v) != 1:
+                break
+            n += 1
+        return n
+
     def _signature(self, sid: str, f: Optional[pd.Series], p: pd.Series, b: pd.Series,
                    group_curves: Dict[str, np.ndarray], inv_daily: pd.DataFrame, th, cfg,
-                   mount: str = "fixed", geo: Optional[Tuple[float, float, float, date]] = None) -> Tuple[Signature, Optional[float], Optional[np.ndarray]]:
-        """geo = (lat, ref_azimuth, ref_tilt, date)：有它才做朝向物理拟合"""
+                   mount: str = "fixed", geo: Optional[Tuple] = None) -> Tuple[Signature, Optional[float], Optional[np.ndarray]]:
+        """geo = (lat, ref_azimuth, ref_tilt, date, lon_offset_min)：有它才做朝向物理拟合；lon_offset 把时钟窗口平移到太阳时"""
+        lon_off_slots = int(round((geo[4] if geo and len(geo) > 4 else 0.0) / cfg.slot_minutes))
         sig = Signature()
         if f is None:
             return sig, None, None
@@ -451,7 +481,8 @@ class DetectAgent(Agent):
         sig.ratio_std = float(np.nanstd(ratio))
         # ---- 跟踪电站：清晨/傍晚双侧偏低、中午正常 = 失去跟踪增益（卡滞）。固定电站不判（那是遮挡/朝向）
         n_slots = len(ratio); per_h = 60 // cfg.slot_minutes
-        am = ratio[int(7.5 * per_h):int(10.5 * per_h)]; pm = ratio[int(14 * per_h):int(17 * per_h)]; noon = ratio[int(11.5 * per_h):int(13.5 * per_h)]
+        w = lambda h0, h1: ratio[max(0, int(h0 * per_h) + lon_off_slots):min(n_slots, int(h1 * per_h) + lon_off_slots)]   # 按太阳时平移
+        am = w(7.5, 10.5); pm = w(14, 17); noon = w(11.5, 13.5)
         if np.sum(~np.isnan(am)) >= 2 and np.sum(~np.isnan(pm)) >= 2 and np.sum(~np.isnan(noon)) >= 2:
             sig.am_ratio, sig.pm_ratio = float(np.nanmedian(am)), float(np.nanmedian(pm))
             if mount == "tracker" and sig.am_ratio <= th.tracker_side_ratio and sig.pm_ratio <= th.tracker_side_ratio \
@@ -481,15 +512,15 @@ class DetectAgent(Agent):
             sig.outside_dip_ratio = float(np.nanmean(ratio[outside])) if outside.sum() >= 3 else None
         # 恒定偏差 / 上下午倾斜（东西朝向差异的签名）
         slots = np.arange(len(ratio))
-        am, pm = ratio[valid & (slots < 22)], ratio[valid & (slots >= 28)]
+        am, pm = ratio[valid & (slots < 22 + lon_off_slots)], ratio[valid & (slots >= 28 + lon_off_slots)]
         skew = float(np.nanmean(am) - np.nanmean(pm)) if len(am) >= 2 and len(pm) >= 2 else None
         if skew is not None and abs(skew) > 0.10:
             sig.notes.append(f"上下午比值倾斜 {skew:+.3f}（{'上午高' if skew > 0 else '下午高'}，疑东西向差异）")
             # 物理校核：在朝向/倾角网格里找最像的曲线形状；若明显不是参考朝向且拟合得好 → 这是朝向差异不是遮挡
             if geo is not None:
                 from ..solar import best_fit_orientation
-                lat, ref_az, ref_tilt, dd = geo
-                fit = best_fit_orientation(lat, dd, ratio, ref_az, ref_tilt, cfg.slot_minutes)
+                lat, ref_az, ref_tilt, dd = geo[0], geo[1], geo[2], geo[3]
+                fit = best_fit_orientation(lat, dd, ratio, ref_az, ref_tilt, cfg.slot_minutes, lon_offset_min=geo[4] if len(geo) > 4 else 0.0)
                 # 条件：拟合得好（rmse<0.05）、明显优于参考朝向（至少好 0.03）、朝向差 ≥30° 或倾角差 ≥10°（避免均匀低发被当成朝向）
                 if fit is not None and fit[2] < 0.05 and fit[3] - fit[2] >= 0.03 \
                         and (abs(fit[0] - ref_az) >= 30 or abs(fit[1] - ref_tilt) >= 10):

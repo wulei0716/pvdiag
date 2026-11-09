@@ -60,6 +60,7 @@ class BaselineCfg(BaseModel):
     slot_minutes: int = 30               # 曲线签名向量粒度（半小时）
     daylight_start: str = "05:00"
     daylight_end: str = "19:30"
+    tz_meridian_deg: float = 120.0       # 时区中央经线（Asia/Shanghai = 120°E）：太阳几何用 stations.lon 换算时钟时间 → 太阳时
 
 
 class Confidence(BaseModel):
