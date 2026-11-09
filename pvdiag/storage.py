@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS inverter_daily (
 );
 CREATE TABLE IF NOT EXISTS station_daily (
     station_id TEXT, date TEXT, noon_power REAL, peak_ref REAL, noon_cv REAL, weather_tag TEXT,
-    irradiance_kwh_m2 REAL, rain INTEGER, PRIMARY KEY (station_id, date)
+    irradiance_kwh_m2 REAL, rain INTEGER, irradiance_source TEXT, PRIMARY KEY (station_id, date)
 );
 CREATE TABLE IF NOT EXISTS baselines (
     string_id TEXT, date TEXT, segment_start TEXT, group_key TEXT, group_n INTEGER, group_level TEXT,
@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS health_checks (
 _MIGRATIONS = {
     "daily_features": {"stale_run_min": "INTEGER", "noon_zero_frac": "REAL"},
     "baselines": {"group_noise": "REAL", "orient_exp_ratio": "REAL"},
+    "station_daily": {"irradiance_source": "TEXT"},
     "signatures": {"outage_slots": "INTEGER", "tracker_flag": "INTEGER"},
     "model_registry": {"status": "TEXT", "holdout_json": "TEXT"},
     "pipeline_runs": {"attempt": "INTEGER"},

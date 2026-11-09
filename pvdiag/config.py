@@ -162,6 +162,27 @@ class AlertCfg(BaseModel):
     dedupe_hours: int = 24
 
 
+class IrradianceCfg(BaseModel):
+    """辐照源（按 providers 顺序回退）：
+    measured   平台/CSV 实测（含 Meteonorm 导出的小时文件：列 G_Gh）
+    nasa_power NASA POWER 日 GHI（ALLSKY_SFC_SW_DWN，kWh/m²/天，免费无 key，滞后数天）
+    meteonorm  Meteonorm REST API（需 METEONORM_TOKEN；小时 G_Gh 聚合成日）
+    openmeteo  Open-Meteo ERA5 再分析（免费无 key）
+    clearsky   晴空模型（永远可用，仅在晴好天作分母有意义）
+    出站的提供方都默认关闭（私有化部署不出站）；source=none 完全不填辐照。"""
+    source: str = "auto"                 # auto | none
+    providers: List[str] = Field(default_factory=lambda: ["measured", "nasa_power", "meteonorm", "openmeteo", "clearsky"])
+    nasa_power: bool = False
+    nasa_power_base_url: str = "https://power.larc.nasa.gov/api/temporal/daily/point"
+    meteonorm: bool = False
+    meteonorm_base_url: str = "https://api.meteonorm.com/v1"
+    meteonorm_token_env: str = "METEONORM_TOKEN"
+    openmeteo: bool = False
+    openmeteo_base_url: str = "https://archive-api.open-meteo.com"
+    timeout_seconds: int = 30
+    cache_days: int = 400                # 外部日辐照缓存在 platform_state，按站保留天数
+
+
 class LLMCfg(BaseModel):
     """LLM 解释与复核助手（可选）：没有 key 就用模板文案，功能不缺；私有化部署可 enabled=false 彻底关闭出站。"""
     enabled: bool = True
@@ -186,6 +207,7 @@ class Settings(BaseModel):
     ingest: IngestCfg = IngestCfg()
     alerts: AlertCfg = AlertCfg()
     llm: LLMCfg = LLMCfg()
+    irradiance: IrradianceCfg = IrradianceCfg()
 
     # ---- 派生路径 ----
     @property

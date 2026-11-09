@@ -54,6 +54,7 @@ class SimConfig:
     weather_probs: Tuple[float, float, float] = (0.55, 0.28, 0.17)   # clear, cloudy, overcast
     faults: List[Fault] = field(default_factory=list)
     roof_areas: Tuple[str, ...] = ("A区屋面", "B区屋面", "C区屋面")
+    use_default_faults: bool = True     # faults 为空时是否注入默认的 10 种故障（False = 纯健康电站）
     mount: str = "fixed"                # fixed | tracker（水平单轴跟踪：清晨/傍晚增益，曲线平顶）
     azimuth: float = 180.0
     tilt: float = 15.0
@@ -113,7 +114,7 @@ def _day_irradiance(rng: np.random.Generator, weather: str, elev: np.ndarray) ->
 def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
     """返回 dict: stations, inverters, strings(档案), events, samples_strings, samples_inverters, weather, truth"""
     rng = np.random.default_rng(cfg.seed)
-    faults = cfg.faults or default_faults(cfg)
+    faults = cfg.faults or (default_faults(cfg) if cfg.use_default_faults else [])
     inv_ids = [f"{cfg.station_id}-INV{k:02d}" for k in range(1, cfg.n_inverters + 1)]
     minutes = np.arange(0, 24 * 60, 5)
     n_t = len(minutes)

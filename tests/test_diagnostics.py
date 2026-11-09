@@ -96,3 +96,35 @@ def test_station_soiling_quantified(tmp_path):
     # 互比看不出：全站同步积灰时不应有一堆 A/B 嫌疑
     susp = store.query("SELECT grade FROM suspects WHERE scope='string' AND grade IN ('A','B')")
     assert len(susp) <= 2
+
+
+def test_station_compare_flags_whole_station_underperformance(tmp_path):
+    """同区域 3 站：其中 1 站所有逆变器整机 -10%（互比盲区）→ 站间 PR 互比应标出该站；辐照无实测时用晴空模型"""
+    from pvdiag.agents.base import AgentContext
+    from pvdiag.agents.ingest import IngestAgent
+    from pvdiag.agents.profile import ProfileAgent
+    from pvdiag.config import Settings
+    from pvdiag.sim import simulate
+    from pvdiag.storage import Store
+    settings = Settings(data_dir=tmp_path / "data"); settings.ensure_dirs()
+    store = Store(settings.db_path, settings.samples_dir)
+    start = date(2026, 9, 1)
+    for k in range(1, 4):
+        sid = f"RG{k}"
+        faults = [Fault("inverter", f"{sid}-INV{j:02d}", "mppt_fault", 20, {"factor": 0.90}) for j in (1, 2)] if k == 3 else []
+        cfg = SimConfig(station_id=sid, n_inverters=2, strings_per_inverter=8, days=40, seed=20, start=start, faults=faults, use_default_faults=False,   # 同 seed = 同天气序列（同区域）
+                        weather_probs=(0.8, 0.15, 0.05))
+        data = simulate(cfg)
+        ProfileAgent.import_stations(store, data["stations"]); ProfileAgent.import_inverters(store, data["inverters"]); ProfileAgent.import_strings(store, data["strings"])
+        ctx = AgentContext(settings=settings, store=store, run_date=start + timedelta(days=39))
+        IngestAgent().ingest_frames(ctx, sid, data["samples_strings"], data["samples_inverters"])
+    end = start + timedelta(days=39)
+    assert store.scalar("SELECT COUNT(*) FROM station_daily WHERE irradiance_source='clearsky'") > 0
+    DailyPipeline(settings, store=store, ingest=False).backfill(end - timedelta(days=6), end)
+    import json
+    rep = json.loads((settings.reports_dir / end.isoformat() / "report.json").read_text(encoding="utf-8"))
+    cmp_ = {r["station_id"]: r for r in rep["region"]["station_compare"]}
+    assert set(cmp_) == {"RG1", "RG2", "RG3"}, cmp_
+    assert cmp_["RG3"]["flag"] and cmp_["RG3"]["dev"] < -0.05, cmp_["RG3"]
+    assert not cmp_["RG1"]["flag"] and not cmp_["RG2"]["flag"]
+    assert any("站间互比" in a["message"] for a in rep["alerts"])

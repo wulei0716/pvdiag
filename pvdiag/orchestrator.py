@@ -213,6 +213,12 @@ def render_markdown(r: Dict) -> str:
         for p in reg["packages"][:10]:
             L.append(f"- {p['station_id']} / {p['roof_area']}：{p['n_strings']} 串 {p['causes']}，损失 {p['loss_kwh_per_day']:.1f} kWh/天，优先级 {p['priority']}")
         L.append("")
+    if reg.get("station_compare"):
+        L.append("## 站间互比（同区域各站 PR）")
+        for s_ in reg["station_compare"]:
+            L.append(f"- {s_['station_id']}（{s_['region']}，{s_['n_peers']} 站，辐照 {s_['source']}）：PR {s_['pr']} vs 区域中位 {s_['region_median_pr']}，"
+                     f"偏差 {s_['dev']:+.1%}（30 天中位 {s_['dev_30d_median']:+.1%}），连续 {s_['persist_days']} 个晴好天" + ("　**⚠ 全站低发**" if s_['flag'] else ""))
+        L.append("")
     if reg.get("station_trend"):
         L.append("## 站级积灰 / 衰减量化（互比盲区）")
         for t in reg["station_trend"]:

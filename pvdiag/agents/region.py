@@ -28,8 +28,15 @@ class RegionAgent(Agent):
         dust = self.dust_candidates(ctx)
         effects = self.cleaning_effects(ctx)
         station_trend = self.station_soiling_trend(ctx)
-        res.metrics = {"packages": len(packages), "dust_candidates": len(dust), "cleaning_events_verified": len(effects)}
-        res.artifacts = {"packages": packages, "dust_candidates": dust, "cleaning_effects": effects, "station_trend": station_trend}
+        station_compare = self.station_compare(ctx)
+        res.metrics = {"packages": len(packages), "dust_candidates": len(dust), "cleaning_events_verified": len(effects),
+                       "station_compare_flags": sum(1 for s in station_compare if s.get("flag"))}
+        res.artifacts = {"packages": packages, "dust_candidates": dust, "cleaning_effects": effects, "station_trend": station_trend,
+                         "station_compare": station_compare}
+        for s in station_compare:
+            if s.get("flag"):
+                res.alerts.append(f"{s['station_id']} 站间互比：PR 低于同区域（{s['region']}，{s['n_peers']} 站）中位 {s['dev']:+.1%}，"
+                                  f"已连续 {s['persist_days']} 个晴好天 → 全站性问题（集体积灰/限发/计量/逆变器效率），互比看不出，请核站级")
         ctx.shared["region_artifacts"] = res.artifacts
         for t in station_trend:
             if t.get("suspect_soiling"):
@@ -128,6 +135,58 @@ class RegionAgent(Agent):
                         "dev_before": round(b, 4), "dev_after": round(a, 4), "gain_pct": round((a - b) * 100, 2),
                         "verdict": "偏差归零" if a > ctx.settings.thresholds.normal_floor else "仍低发"})
         return out
+
+    # ------------------------------------------------------------------ 站间互比（全站性问题：同区域各站 PR 互比）
+    def station_compare(self, ctx: AgentContext, window_days: int = 30, min_peers: int = 3) -> List[Dict]:
+        """同一 region 内各站按晴好天 PR（日电量 / 日辐照 / 装机）互比，连续 ≥fault_persist_days 个晴好天低于区域中位 ≥fault_floor → 全站低发。
+        辐照来源可以是实测 / 再分析 / 晴空模型——同区域同一天用同一来源才可比，这里要求来源一致。"""
+        th = ctx.settings.thresholds
+        start = (ctx.run_date - timedelta(days=window_days)).isoformat()
+        stations = ctx.store.stations()
+        if stations.empty or "region" not in stations.columns:
+            return []
+        sd = ctx.store.query("SELECT station_id, date, weather_tag, irradiance_kwh_m2, irradiance_source FROM station_daily "
+                             "WHERE date BETWEEN ? AND ? AND weather_tag='clear' AND irradiance_kwh_m2 IS NOT NULL AND irradiance_kwh_m2>0",
+                             (start, ctx.run_date.isoformat()))
+        if sd.empty:
+            return []
+        e = ctx.store.query("SELECT s.station_id, f.date, SUM(f.day_energy_kwh) e FROM daily_features f JOIN strings s ON s.string_id=f.string_id "
+                            "WHERE f.date BETWEEN ? AND ? GROUP BY s.station_id, f.date", (start, ctx.run_date.isoformat()))
+        cap = stations.set_index("station_id")["capacity_kwp"]
+        region = stations.set_index("station_id")["region"].fillna("")
+        x = sd.merge(e, on=["station_id", "date"], how="inner")
+        x["cap"] = x["station_id"].map(cap)
+        x = x[x["cap"].notna() & (x["cap"] > 0) & x["e"].notna()]
+        if x.empty:
+            return []
+        x["pr"] = x["e"] / (x["irradiance_kwh_m2"] * x["cap"])
+        x["region"] = x["station_id"].map(region)
+        out = []
+        for (reg, d, src), g in x.groupby(["region", "date", "irradiance_source"]):
+            if len(g) < min_peers:
+                continue
+            med = g["pr"].median()
+            for r in g.itertuples():
+                out.append({"station_id": r.station_id, "region": reg, "date": d, "pr": float(r.pr), "region_median_pr": float(med),
+                            "dev": float(r.pr / med - 1), "n_peers": int(len(g)), "source": src})
+        if not out:
+            return []
+        df = pd.DataFrame(out).sort_values("date")
+        result = []
+        for sid, g in df.groupby("station_id"):
+            devs = g["dev"].to_numpy(dtype=float)
+            n = 0
+            for v in devs[::-1]:
+                if v <= th.fault_floor:
+                    n += 1
+                else:
+                    break
+            last = g.iloc[-1]
+            result.append({"station_id": sid, "region": last["region"], "date": last["date"], "pr": round(float(last["pr"]), 4),
+                           "region_median_pr": round(float(last["region_median_pr"]), 4), "dev": round(float(last["dev"]), 4),
+                           "dev_30d_median": round(float(np.median(devs)), 4), "persist_days": int(n), "n_peers": int(last["n_peers"]),
+                           "source": last["source"], "flag": bool(n >= th.fault_persist_days)})
+        return sorted(result, key=lambda r: r["dev"])
 
     # ------------------------------------------------------------------ 站级积灰趋势（互比盲区提示）
     def station_soiling_trend(self, ctx: AgentContext, window_days: int = 45) -> List[Dict]:

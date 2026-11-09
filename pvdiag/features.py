@@ -209,7 +209,7 @@ def tag_weather(noon_power: float, noon_cv: float, peak_ref: float, cfg: Baselin
 
 def compute_station_daily(station_id: str, day: date, inv_daily: pd.DataFrame, noon_cv: float,
                           history: pd.DataFrame, capacity_kwp: Optional[float], cfg: BaselineCfg,
-                          irradiance_kwh_m2: Optional[float] = None) -> Dict:
+                          irradiance_kwh_m2: Optional[float] = None, irradiance_source: str = "measured") -> Dict:
     """history: 该站此前 station_daily（含 noon_power 列），用于晴天峰值参考。"""
     online = inv_daily[inv_daily["offline_flag"] == 0] if not inv_daily.empty else inv_daily
     noon_power = float(online["pac_noon_median"].sum()) if not online.empty else np.nan
@@ -227,7 +227,8 @@ def compute_station_daily(station_id: str, day: date, inv_daily: pd.DataFrame, n
         peak_ref = max(peak_ref, noon_power) if (hist.empty or len(hist) < 10) else peak_ref
     tag = tag_weather(noon_power, noon_cv, peak_ref, cfg)
     # 有气象站辐照时用它校正：日辐照 < 50% 近期晴天参考 → 阴雨；< 75% 且判了 clear → 降为 cloudy（仅在有 ≥10 天辐照历史时启用）
-    if irradiance_kwh_m2 is not None and not np.isnan(irradiance_kwh_m2) and not hist.empty \
+    # 晴空模型给的是理论上限，不能拿来判阴天；只有实测/再分析辐照参与天气校正
+    if irradiance_source in ("measured", "openmeteo") and irradiance_kwh_m2 is not None and not np.isnan(irradiance_kwh_m2) and not hist.empty \
             and "irradiance_kwh_m2" in hist.columns and hist["irradiance_kwh_m2"].notna().sum() >= 10:
         irr_ref = float(np.nanpercentile(hist["irradiance_kwh_m2"].to_numpy(dtype=float), 95))
         if irr_ref > 0 and tag != "nodata":
@@ -237,4 +238,5 @@ def compute_station_daily(station_id: str, day: date, inv_daily: pd.DataFrame, n
                 tag = "cloudy"
     rain = int(tag == "overcast" and (np.isnan(noon_power) or noon_power < 0.2 * peak_ref))
     return {"station_id": station_id, "date": day.isoformat(), "noon_power": noon_power, "peak_ref": peak_ref,
-            "noon_cv": noon_cv, "weather_tag": tag, "irradiance_kwh_m2": irradiance_kwh_m2, "rain": rain}
+            "noon_cv": noon_cv, "weather_tag": tag, "irradiance_kwh_m2": irradiance_kwh_m2, "rain": rain,
+            "irradiance_source": irradiance_source if irradiance_kwh_m2 is not None else None}

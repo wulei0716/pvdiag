@@ -7,7 +7,7 @@
 目录约定（可在 station.extra.csv 中覆盖列映射）：
     <root>/<station_id>/strings/*.csv|parquet     列: string_id, ts, current_a, voltage_v
     <root>/<station_id>/inverters/*.csv|parquet   列: inverter_id, ts, pac_kw, status
-    <root>/<station_id>/irradiance/*.csv          列: ts, ghi_w_m2 (可选)
+    <root>/<station_id>/irradiance/*.csv          列: ts, ghi_w_m2 (可选)；也接受 Meteonorm 导出的小时文件（y,m,dm,h,G_Gh）
 
 也支持"宽表"（华为导出常见）：每行一个逆变器时刻，列 pv1_i, pv1_u, ... pv36_i, pv36_u → 自动拆成长表。
 """
@@ -73,6 +73,12 @@ class CsvAdapter(PlatformAdapter):
             df = df.rename(columns=self.colmap)
             if sub == "strings":
                 df = self._maybe_melt_wide(df)
+            if sub == "irradiance" and "ts" not in df.columns:
+                from ..irradiance import meteonorm_csv_to_ghi            # Meteonorm 导出（y,m,dm,h,G_Gh…）自动识别
+                conv = meteonorm_csv_to_ghi(df)
+                if conv is None:
+                    continue
+                df = conv
             frames.append(df)
         if not frames:
             return pd.DataFrame()
