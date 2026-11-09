@@ -19,6 +19,7 @@
   pvdiag public fetch|load|list                          公开数据：下载（GitHub 镜像+sha256）/ 转成电站入库 / 列表
   pvdiag bench [--dataset kaggle|nrel|train|all]         公开数据基准评测（召回/误报/停机识别/钉死/限发/弱标注训练）
   pvdiag soak --days 180 --stations 2                    连续运行压测：模拟复核员/主管/现场，看自调参/模型/门控长期行为
+  pvdiag explain <suspect_id> [--ask "问题"]              LLM 分析助手：案卷 → 结论/依据/建议/不确定性；无 key 时模板文案
 """
 from __future__ import annotations
 
@@ -368,6 +369,17 @@ def cmd_soak(args):
     print("报告：", p)
 
 
+def cmd_explain(args):
+    from .llm import narrative, ask
+    s = _settings(args)
+    store = Store(s.db_path, s.samples_dir)
+    if args.ask:
+        r = ask(s, store, args.suspect_id, args.ask)
+    else:
+        r = narrative(s, store, args.suspect_id, force=args.force)
+    print(f"[{r['source']}]\n{r['text']}")
+
+
 def main(argv=None):
     # 全局选项既可放在子命令前，也可放在子命令后
     common = argparse.ArgumentParser(add_help=False)
@@ -408,6 +420,7 @@ def main(argv=None):
     p = add("model"); p.add_argument("action", choices=["list", "promote", "demote"]); p.add_argument("version", nargs="?"); p.set_defaults(fn=cmd_model)
     p = add("public"); p.add_argument("action", choices=["list", "fetch", "load"]); p.add_argument("name", nargs="?")
     p.add_argument("--plant", type=int); p.add_argument("--public-dir"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_public)
+    p = add("explain"); p.add_argument("suspect_id"); p.add_argument("--ask"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_explain)
     p = add("soak"); p.add_argument("--days", type=int, default=180); p.add_argument("--stations", type=int, default=2)
     p.add_argument("--inverters", type=int, default=3); p.add_argument("--strings", type=int, default=12); p.add_argument("--seed", type=int, default=1)
     p.add_argument("--fault-rate", type=float, default=0.004); p.add_argument("--reviewer-error", type=float, default=0.08); p.add_argument("--out")

@@ -20,6 +20,7 @@ thresholds:
   cold_start_cap_grade: D    # 冷启动（晴好天基线样本不足）只凭互比偏差最高给 D
   outage_min_slots: 2        # 白天 ≥1h 整段 0 输出而同机其它串正常 → 间歇停机/掉线
   outage_rel_zero: 0.10      # ≤ 群组同时段 10% 视为"整段为 0"
+  tracker_side_ratio: 0.85   # 跟踪电站（stations.extra.mount=tracker）：清晨/傍晚相对群组都 ≤0.85 且中午正常 → 支架卡滞
 
 baseline:
   noon_start: "11:30"
@@ -77,6 +78,13 @@ ingest:                      # 数据接入自愈
   escalate_after_failures: 3 # 连续失败 ≥3 次升级 error 并推送
   stale_data_alert_days: 2
 
+llm:                         # LLM 分析助手（可选）：复核页"分析助手"面板 + 追问；无 key 时自动用模板文案
+  enabled: true              # 私有化/内网部署可设 false 彻底关闭出站
+  model: claude-sonnet-4-5
+  api_key_env: ANTHROPIC_API_KEY   # 从环境变量读 key，不落配置文件
+  base_url: https://api.anthropic.com
+  max_tokens: 700
+
 alerts:                      # 关键事件推送（管道 error / 自检 fail / 门控开合 / 模型上线降级 / 参数生效回滚）
   enabled: true
   wecom_webhook: null        # 为空沿用 dispatch.wecom_webhook；都为空写 data/outbox/alerts/<date>.md
@@ -91,6 +99,7 @@ loss:
     valley: [[0, 7], [19, 24]]
   tou_price: { peak: 0.90, flat: 0.60, valley: 0.30 }
   expected_fault_days_default: 30
+  cleaning_cost_per_kwp: 15        # 全站清洗单价（元/kWp），站级积灰回本估算用
   repair_cost_by_cause:
     断线/未接: 300
     旁路二极管: 500
@@ -99,6 +108,7 @@ loss:
     MPPT异常: 1500
     数据问题: 50
     间歇停机/掉线: 200
+    跟踪支架卡滞: 400
 
 platforms:
   huawei: { base_quota: 24, devices_per_unit: 100, batch_days: 4, token_ttl_minutes: 30 }

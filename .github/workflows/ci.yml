@@ -50,6 +50,25 @@ jobs:
             bench/bench_report.md
             bench/bench_report.json
 
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e ".[web,dev]"
+      - name: 连续运行压测（120 天 · 2 站，模拟复核员/主管/现场）
+        run: pvdiag soak --days 120 --stations 2 --out ./soak
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soak-report
+          path: |
+            soak/soak_report.md
+            soak/soak_report.json
+
   docker:
     runs-on: ubuntu-latest
     steps:

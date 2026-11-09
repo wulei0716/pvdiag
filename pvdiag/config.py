@@ -161,6 +161,17 @@ class AlertCfg(BaseModel):
     dedupe_hours: int = 24
 
 
+class LLMCfg(BaseModel):
+    """LLM 解释与复核助手（可选）：没有 key 就用模板文案，功能不缺；私有化部署可 enabled=false 彻底关闭出站。"""
+    enabled: bool = True
+    provider: str = "anthropic"
+    model: str = "claude-sonnet-4-5"
+    api_key_env: str = "ANTHROPIC_API_KEY"
+    base_url: str = "https://api.anthropic.com"
+    max_tokens: int = 700
+    timeout_seconds: int = 40
+
+
 class Settings(BaseModel):
     data_dir: Path = Path("./data")
     timezone: str = "Asia/Shanghai"
@@ -173,6 +184,7 @@ class Settings(BaseModel):
     autotune: AutotuneCfg = AutotuneCfg()
     ingest: IngestCfg = IngestCfg()
     alerts: AlertCfg = AlertCfg()
+    llm: LLMCfg = LLMCfg()
 
     # ---- 派生路径 ----
     @property
