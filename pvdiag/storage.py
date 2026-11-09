@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS inverters (
 CREATE TABLE IF NOT EXISTS strings (
     string_id TEXT PRIMARY KEY, station_id TEXT, inverter_id TEXT, mppt INTEGER, pv_index INTEGER,
     n_modules INTEGER, module_model TEXT, module_wp REAL, module_vmp REAL, module_imp REAL,
-    azimuth REAL, tilt REAL, roof_area TEXT, known_shading INTEGER DEFAULT 0,
+    azimuth REAL, tilt REAL, roof_area TEXT, known_shading INTEGER DEFAULT 0, device_type TEXT, module_type TEXT,
     shading_expected_dev REAL, shading_note TEXT, group_key TEXT, notes TEXT, updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_strings_inv ON strings(inverter_id);
@@ -128,6 +128,7 @@ _MIGRATIONS = {
     "daily_features": {"stale_run_min": "INTEGER", "noon_zero_frac": "REAL"},
     "baselines": {"group_noise": "REAL", "orient_exp_ratio": "REAL"},
     "station_daily": {"irradiance_source": "TEXT"},
+    "strings": {"device_type": "TEXT", "module_type": "TEXT"},
     "signatures": {"outage_slots": "INTEGER", "tracker_flag": "INTEGER"},
     "model_registry": {"status": "TEXT", "holdout_json": "TEXT"},
     "pipeline_runs": {"attempt": "INTEGER"},

@@ -321,7 +321,10 @@ class DetectAgent(Agent):
         """中午电压 vs 同机（同群组）中位电压的相对偏差"""
         if ft.empty:
             return {}
-        x = ft[["noon_median_v", "zero_all_day", "stuck"]].join(prof[["inverter_id"]], how="inner")
+        cols = ["inverter_id"] + (["device_type"] if "device_type" in prof.columns else [])
+        x = ft[["noon_median_v", "zero_all_day", "stuck"]].join(prof[cols], how="inner")
+        if "device_type" in x.columns:
+            x = x[x["device_type"].fillna("string") == "string"]          # 优化器/微逆：电压不可互比，不判电压异位
         x = x[(x["zero_all_day"] == 0) & (x["stuck"] == 0) & x["noon_median_v"].notna() & (x["noon_median_v"] > 0)]
         out = {}
         for inv, g in x.groupby("inverter_id"):

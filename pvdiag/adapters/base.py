@@ -2,6 +2,7 @@
 
 统一输出：
 - 组串 5 分钟明细：string_id, ts, current_a, voltage_v
+  优化器 / 微型逆变器只有功率时给 power_w：有电压则 I = P/U，否则按 100V 虚拟电压折算（互比只看比值，绝对量纲不影响）
 - 逆变器 5 分钟明细：inverter_id, ts, pac_kw, status
 - 设备清单：inverter_id, name, model, rated_ac_kw, n_strings
 """
@@ -12,9 +13,11 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 STRING_COLS = ["string_id", "ts", "current_a", "voltage_v"]
+POWER_ONLY_VIRTUAL_V = 100.0          # 只有功率的设备（优化器/微逆）折算电流用的虚拟电压：I = P / 100V
 INVERTER_COLS = ["inverter_id", "ts", "pac_kw", "status"]
 
 
@@ -57,6 +60,19 @@ class PlatformAdapter(ABC):
     def normalize_strings(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame(columns=STRING_COLS)
+        df = df.copy()
+        if "power_w" in df.columns:                      # 优化器/微逆：功率 → 等效电流
+            p = pd.to_numeric(df["power_w"], errors="coerce")
+            v = pd.to_numeric(df["voltage_v"], errors="coerce") if "voltage_v" in df.columns else pd.Series(np.nan, index=df.index)
+            if "current_a" not in df.columns:
+                df["current_a"] = np.nan
+            cur = pd.to_numeric(df["current_a"], errors="coerce")
+            v_eff = v.where(v > 0, POWER_ONLY_VIRTUAL_V)
+            df["current_a"] = cur.where(cur.notna(), p / v_eff)
+            df["voltage_v"] = v.where(v > 0, POWER_ONLY_VIRTUAL_V)
+        for c in ("current_a", "voltage_v"):
+            if c not in df.columns:
+                df[c] = np.nan
         df = df[STRING_COLS].copy()
         df["ts"] = pd.to_datetime(df["ts"]).dt.floor("5min")   # 时钟漂移对齐到 5 分钟格
         df["current_a"] = pd.to_numeric(df["current_a"], errors="coerce")

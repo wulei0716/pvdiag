@@ -65,8 +65,8 @@ class BaselineAgent(Agent):
             "SELECT i.* FROM inverter_daily i JOIN inverters v ON v.inverter_id=i.inverter_id "
             "WHERE v.station_id=? AND i.date BETWEEN ? AND ?", (station_id, lookback.isoformat(), d.isoformat()))
 
-        f = feats.merge(strings[["string_id", "inverter_id", "group_key", "azimuth", "tilt", "known_shading"]],
-                        on="string_id", how="left")
+        keep = ["string_id", "inverter_id", "group_key", "azimuth", "tilt", "known_shading"] + [c for c in ("module_type", "device_type") if c in strings.columns]
+        f = feats.merge(strings[keep], on="string_id", how="left")
         f["weather_tag"] = f["date"].map(weather["weather_tag"]) if not weather.empty else "nodata"
         stale = f["stale_run_min"].fillna(0) >= th.stale_run_min if "stale_run_min" in f.columns else pd.Series(False, index=f.index)
         f["valid"] = (f["noon_median_i"] >= th.zero_current_a) & (f["stuck"] == 0) & (f["zero_all_day"] == 0) & f["noon_median_i"].notna() & (~stale)
@@ -81,6 +81,14 @@ class BaselineAgent(Agent):
         # ---- 朝向物理归一（季节性）：同机各串朝向/倾角不同时，按晴空倾斜面辐照把中午电流折算到"参考朝向"再互比
         #      （冬天东向比南向低 25%，夏天只低 6%——这是物理，不是故障；档案错了才是异常）
         f["orient_exp_ratio"] = self._orientation_expectation(f, strings, ctx, station_id)
+        # 双面组件混装：相对同机多数组件类型按背面增益归一（双面串天然高 ~8%，不是别人低）
+        if "module_type" in f.columns and f["module_type"].notna().any():
+            mt = f["module_type"].fillna("mono")
+            ref_bif = strings.groupby("inverter_id")["module_type"].agg(lambda s: (s.fillna("mono") == "bifacial").mean() > 0.5) if "module_type" in strings.columns else None
+            is_ref_bif = f["inverter_id"].map(ref_bif).fillna(False).astype(bool) if ref_bif is not None else pd.Series(False, index=f.index)
+            g = th.bifacial_gain
+            factor = np.where((mt == "bifacial") & ~is_ref_bif, g, np.where((mt != "bifacial") & is_ref_bif, 1.0 / g, 1.0))
+            f["orient_exp_ratio"] = f["orient_exp_ratio"] * factor
         f["noon_norm"] = f["noon_median_i"] / f["orient_exp_ratio"]
 
         # ---- 群组中位数（三级回退：配置群组 → 整机 → 无）

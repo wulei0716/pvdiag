@@ -55,6 +55,7 @@ class SimConfig:
     faults: List[Fault] = field(default_factory=list)
     roof_areas: Tuple[str, ...] = ("A区屋面", "B区屋面", "C区屋面")
     use_default_faults: bool = True     # faults 为空时是否注入默认的 10 种故障（False = 纯健康电站）
+    device_type: str = "string"         # string | optimizer | microinverter（档案字段；优化器/微逆不做电压异位判定）
     mount: str = "fixed"                # fixed | tracker（水平单轴跟踪：清晨/傍晚增益，曲线平顶）
     azimuth: float = 180.0
     tilt: float = 15.0
@@ -134,7 +135,10 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
             nm = cfg.n_modules
             known, exp_dev, note = 0, None, ""
             az_doc, tilt_doc = cfg.azimuth, cfg.tilt
+            module_type = "mono"
             for f in sf_by_string.get(sid, []):
+                if f.kind == "bifacial_actual" and f.params.get("archive_correct", True):
+                    module_type = "bifacial"
                 if f.kind == "wrong_profile":
                     nm = int(f.params.get("n_modules", nm))        # 真实串长少两块，但档案仍记 cfg.n_modules
                 if f.kind == "archived_shading":
@@ -147,7 +151,7 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
                 "pv_index": n, "n_modules": cfg.n_modules, "module_model": "SIM-550M", "module_wp": cfg.module_wp,
                 "module_vmp": cfg.module_vmp, "module_imp": cfg.module_imp, "azimuth": az_doc, "tilt": tilt_doc,
                 "roof_area": cfg.roof_areas[k % len(cfg.roof_areas)], "known_shading": known,
-                "shading_expected_dev": exp_dev, "shading_note": note, "notes": "",
+                "shading_expected_dev": exp_dev, "shading_note": note, "notes": "", "device_type": cfg.device_type, "module_type": module_type,
             })
     strings_df = pd.DataFrame(strings_rows)
     dc_kwp = cfg.strings_per_inverter * cfg.n_modules * cfg.module_wp / 1000.0
@@ -210,7 +214,10 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
                     if di < f.start_day or (f.end_day is not None and di >= f.end_day):
                         continue
                     p = f.params
-                    if f.kind == "azimuth_actual":
+                    if f.kind == "bifacial_actual":
+                        # 双面组件：背面增益（晴天全额、多云一半、阴天散射为主也有一点）
+                        I = I * (1.0 + (p.get("gain", 0.08)) * {"clear": 1.0, "cloudy": 0.6, "overcast": 0.4}[weathers[di]])
+                    elif f.kind == "azimuth_actual":
                         # 该串实际朝向/倾角与参考不同（物理事实）；档案对不对由 archive_correct 决定
                         I = I * geo_factor(p.get("azimuth", 90.0), p.get("tilt", cfg.tilt))
                     elif f.kind == "tracker_stuck":

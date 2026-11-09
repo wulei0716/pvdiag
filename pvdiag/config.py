@@ -42,6 +42,7 @@ class Thresholds(BaseModel):
     outage_group_ratio: float = 0.30        # 判停机时要求群组曲线 ≥ 当日峰值 30%（排除清晨/傍晚）
     outage_rel_zero: float = 0.10           # 本串 ≤ 群组同时段 10% 即视为"整段为 0"（晴天散射光占比 10%~15%，遮挡不会更低；15 分钟边沿插值也不会）
     tracker_side_ratio: float = 0.85        # 跟踪电站：清晨与傍晚相对群组比值都 ≤0.85 且中午 ≥0.93 → 支架卡滞签名
+    bifacial_gain: float = 1.08             # 双面组件相对单面的背面增益（同机混装时互比归一用；按场地反射率调）
     outage_noon_skip_frac: float = 0.20     # 中午窗口 ≥20% 样本为 0 的日子不计入互比持续度（停机已有独立签名，别把它算成"低发"）
 
 

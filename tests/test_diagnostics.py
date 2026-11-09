@@ -2,6 +2,7 @@
 from datetime import date, timedelta
 
 import numpy as np
+import pandas as pd
 
 from pvdiag.models import Cause
 from pvdiag.orchestrator import DailyPipeline
@@ -128,3 +129,26 @@ def test_station_compare_flags_whole_station_underperformance(tmp_path):
     assert cmp_["RG3"]["flag"] and cmp_["RG3"]["dev"] < -0.05, cmp_["RG3"]
     assert not cmp_["RG1"]["flag"] and not cmp_["RG2"]["flag"]
     assert any("站间互比" in a["message"] for a in rep["alerts"])
+
+
+def test_power_only_devices_and_bifacial(tmp_path):
+    """优化器/微逆：只有功率 → 等效电流；电压不可互比 → 不判电压异位。双面组件：档案登记后按增益归一不报高/不拉低别人"""
+    from pvdiag.adapters.base import PlatformAdapter, POWER_ONLY_VIRTUAL_V
+    df = pd.DataFrame({"string_id": ["X-pv1", "X-pv1"], "ts": ["2026-09-01 12:00", "2026-09-01 12:05"], "power_w": [400.0, 410.0]})
+    n = PlatformAdapter.normalize_strings(df)
+    assert abs(n["current_a"].iloc[0] - 400.0 / POWER_ONLY_VIRTUAL_V) < 1e-9 and n["voltage_v"].iloc[0] == POWER_ONLY_VIRTUAL_V
+    # 同一串长档案错（电压 -9%）：组串型 → A 级档案差异；优化器型 → 不判电压异位
+    s = lambda k, n: f"OP1-INV{k:02d}-pv{n}"
+    for dev_type, expect_profile_error in (("string", True), ("optimizer", False)):
+        cfg = SimConfig(station_id="OP1", n_inverters=1, strings_per_inverter=8, days=40, seed=31, start=date(2026, 9, 1), device_type=dev_type,
+                        faults=[Fault("string", s(1, 3), "wrong_profile", 0, {"n_modules": 20}),
+                                Fault("string", s(1, 6), "bifacial_actual", 0, {"gain": 0.08, "archive_correct": True})])
+        settings, store = _run(tmp_path / dev_type, cfg, days_back=8)
+        susp = store.query("SELECT string_id, grade, rule_cause FROM suspects WHERE scope='string'")
+        has_pe = not susp[(susp["string_id"] == s(1, 3)) & (susp["rule_cause"] == Cause.PROFILE_ERROR.value)].empty
+        assert has_pe == expect_profile_error, (dev_type, susp.to_dict("records"))
+        # 双面串归一后偏差应接近 0（没有归一会 +8%），且不把别人拉成低发
+        end = cfg.start + timedelta(days=cfg.days - 1)
+        b = store.query("SELECT dev_today, orient_exp_ratio FROM baselines WHERE string_id=? AND date=?", (s(1, 6), end.isoformat()))
+        assert abs(b["orient_exp_ratio"].iloc[0] - 1.08) < 1e-6 and abs(b["dev_today"].iloc[0]) < 0.03, b.to_dict("records")
+        assert susp[(susp["string_id"] != s(1, 3)) & susp["grade"].isin(["A", "B"])].empty
