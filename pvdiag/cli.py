@@ -40,6 +40,8 @@ def _settings(args, with_overrides: bool = True) -> Settings:
     s = Settings.load(args.config)
     if getattr(args, "data_dir", None):
         s.data_dir = Path(args.data_dir)
+    if getattr(args, "workers", None) is not None:
+        s.runtime.workers = int(args.workers)
     s.ensure_dirs()
     if with_overrides:
         from .agents.tuning import apply_overrides
@@ -347,8 +349,54 @@ def cmd_bench(args):
         from .public.bench import bench_train
         rep["train"] = bench_train(work, s, public_root=args.public_dir)
         print("Train:", json.dumps({k: rep["train"][k] for k in ("n_labels", "promoted", "exam")}, ensure_ascii=False, default=str))
+    if args.dataset in ("real", "all"):
+        from .public.bench import bench_real
+        r = bench_real(work, s, real_root=args.real_dir)
+        if r:
+            rep["real"] = r
+            print("Real:", json.dumps(r["summary"], ensure_ascii=False, default=str))
+        elif args.dataset == "real":
+            print("Real 跳过：没有 PVDIAG_REAL_DIR/manifest.json（真实站数据不入库，放在本地目录）")
     p = write_report(rep, out)
     print("报告：", p)
+
+
+def cmd_daily(args):
+    """日电量模式：import（巡检报告 xlsx / 长表 csv → 档案+日电量+天气）；diagnose（同机/同通道日电量互比 → suspects）"""
+    from . import daily_energy as de
+    s = _settings(args)
+    store = Store(s.db_path, s.samples_dir)
+    if args.action == "import":
+        p = Path(args.file)
+        if p.suffix.lower() in (".xlsx", ".xls"):
+            b = de.read_report_xlsx(p, args.station, args.platform or "", inputs_per_mppt=args.inputs_per_mppt)
+        else:
+            b = de.read_long_csv(p, args.station, args.platform or "", inputs_per_mppt=args.inputs_per_mppt)
+        r = de.load_into_store(store, b)
+        sd = b.station_daily
+        print(f"{args.station} ← {p.name}：{r['strings']} 路（新增档案 {r['new_strings']}），日电量 {r['energy_rows']} 行，{r['days']} 天"
+              f"（晴好 {int((sd['weather_tag'] == 'clear').sum())} 天）；状态 {b.strings['status'].value_counts().to_dict()}")
+        print(f"诊断：pvdiag daily diagnose --station {args.station} --start {sd['date'].min()} --end {sd['date'].max()}")
+    elif args.action == "diagnose":
+        sd = store.station_daily(args.station, args.start or "2000-01-01", args.end or "2100-01-01")
+        if sd.empty:
+            print("该站没有日电量/天气数据，先 import"); return
+        start, end = date.fromisoformat(sd["date"].min()), date.fromisoformat(sd["date"].max())
+        r = de.diagnose(store, args.station, start, end, s.thresholds, group_mode=args.group, write=not args.dry_run)
+        st = r["strings"]
+        print(f"{args.station} {start}~{end}：晴好 {len(r['clear_days'])} 天，分组 {r['group_mode']}，通道三态 {r['state_counts']}")
+        g = st[st["grade"].notna()].sort_values("mean_dev")
+        print(f"嫌疑 {len(g)} 条：{g['grade'].value_counts().to_dict()}" + ("（--dry-run 未写库）" if args.dry_run else ""))
+        if not g.empty:
+            cols = ["string_id", "grade", "cause", "mean_dev", "over_dev", "low_days", "n_clear_eval", "lost_kwh"]
+            print(g[cols].round(3).to_string(index=False))
+        par = [x for x, c in zip(st["string_id"], st["state"]) if c == "connected" and x not in set(g["string_id"])
+               and st.set_index("string_id").at[x, "n_clear_eval"] == 0]
+        if par:
+            print("疑双串并联/档案缺并联数（未参与互比）：", "、".join(par))
+        if args.out:
+            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+            st.to_csv(args.out, index=False, encoding="utf-8-sig"); print("逐串统计：", args.out)
 
 
 def cmd_soak(args):
@@ -386,6 +434,7 @@ def main(argv=None):
     common.add_argument("--config", default=argparse.SUPPRESS)
     common.add_argument("--data-dir", default=argparse.SUPPRESS)
     common.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
+    common.add_argument("--workers", type=int, default=argparse.SUPPRESS, help="按站并行进程数（1 串行，0 = CPU 核数）")
     ap = argparse.ArgumentParser("pvdiag", description="组串发电量异常诊断智能体系统", parents=[common])
     ap.set_defaults(config="config.yaml", data_dir=None, verbose=False)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -421,12 +470,16 @@ def main(argv=None):
     p = add("public"); p.add_argument("action", choices=["list", "fetch", "load"]); p.add_argument("name", nargs="?")
     p.add_argument("--plant", type=int); p.add_argument("--public-dir"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_public)
     p = add("explain"); p.add_argument("suspect_id"); p.add_argument("--ask"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_explain)
+    p = add("daily"); p.add_argument("action", choices=["import", "diagnose"]); p.add_argument("--station", required=True)
+    p.add_argument("--file"); p.add_argument("--platform"); p.add_argument("--inputs-per-mppt", type=int, default=2)
+    p.add_argument("--start"); p.add_argument("--end"); p.add_argument("--group", choices=["auto", "inverter", "channel"], default="auto")
+    p.add_argument("--dry-run", action="store_true"); p.add_argument("--out"); p.set_defaults(fn=cmd_daily)
     p = add("soak"); p.add_argument("--days", type=int, default=180); p.add_argument("--stations", type=int, default=2)
     p.add_argument("--inverters", type=int, default=3); p.add_argument("--strings", type=int, default=12); p.add_argument("--seed", type=int, default=1)
     p.add_argument("--fault-rate", type=float, default=0.004); p.add_argument("--reviewer-error", type=float, default=0.08); p.add_argument("--out")
     p.set_defaults(fn=cmd_soak)
-    p = add("bench"); p.add_argument("--dataset", choices=["kaggle", "nrel", "train", "all"], default="all"); p.add_argument("--out")
-    p.add_argument("--public-dir"); p.set_defaults(fn=cmd_bench)
+    p = add("bench"); p.add_argument("--dataset", choices=["kaggle", "nrel", "train", "real", "all"], default="all"); p.add_argument("--out")
+    p.add_argument("--public-dir"); p.add_argument("--real-dir"); p.set_defaults(fn=cmd_bench)
 
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")

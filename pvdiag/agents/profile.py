@@ -63,6 +63,11 @@ class ProfileAgent(Agent):
         for c in ("shading_expected_dev", "shading_note", "notes", "module_model", "roof_area"):
             if c not in df.columns:
                 df[c] = None
+        # 设备类型：string（组串，默认）| optimizer（组件级优化器）| microinverter（微逆）；组件：mono（默认）| bifacial（双面）
+        df["device_type"] = df["device_type"].fillna("string") if "device_type" in df.columns else "string"
+        df["module_type"] = df["module_type"].fillna("mono") if "module_type" in df.columns else "mono"
+        # 并联串数：一路 MPPT 接了两串并联时填 2（电流翻倍不是别人低）；默认 1
+        df["n_parallel"] = pd.to_numeric(df["n_parallel"], errors="coerce").fillna(1).clip(lower=1).astype(int) if "n_parallel" in df.columns else 1
         df["group_key"] = df.apply(make_group_key, axis=1)
         df["updated_at"] = datetime.now().isoformat()
         return store.upsert_df("strings", df)
@@ -105,6 +110,8 @@ class ProfileAgent(Agent):
         if not feats.empty:
             m = strings.merge(feats, on="string_id", how="inner")
             m = m[m["noon_median_v"].notna() & (m["noon_median_v"] > 0)]
+            if "device_type" in m.columns:
+                m = m[m["device_type"].fillna("string") == "string"]       # 优化器/微逆的电压不可互比
             for inv, g in m.groupby("inverter_id"):
                 if len(g) < 3:
                     continue

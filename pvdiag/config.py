@@ -42,6 +42,7 @@ class Thresholds(BaseModel):
     outage_group_ratio: float = 0.30        # 判停机时要求群组曲线 ≥ 当日峰值 30%（排除清晨/傍晚）
     outage_rel_zero: float = 0.10           # 本串 ≤ 群组同时段 10% 即视为"整段为 0"（晴天散射光占比 10%~15%，遮挡不会更低；15 分钟边沿插值也不会）
     tracker_side_ratio: float = 0.85        # 跟踪电站：清晨与傍晚相对群组比值都 ≤0.85 且中午 ≥0.93 → 支架卡滞签名
+    bifacial_gain: float = 1.08             # 双面组件相对单面的背面增益（同机混装时互比归一用；按场地反射率调）
     outage_noon_skip_frac: float = 0.20     # 中午窗口 ≥20% 样本为 0 的日子不计入互比持续度（停机已有独立签名，别把它算成"低发"）
 
 
@@ -162,6 +163,27 @@ class AlertCfg(BaseModel):
     dedupe_hours: int = 24
 
 
+class IrradianceCfg(BaseModel):
+    """辐照源（按 providers 顺序回退）：
+    measured   平台/CSV 实测（含 Meteonorm 导出的小时文件：列 G_Gh）
+    nasa_power NASA POWER 日 GHI（ALLSKY_SFC_SW_DWN，kWh/m²/天，免费无 key，滞后数天）
+    meteonorm  Meteonorm REST API（需 METEONORM_TOKEN；小时 G_Gh 聚合成日）
+    openmeteo  Open-Meteo ERA5 再分析（免费无 key）
+    clearsky   晴空模型（永远可用，仅在晴好天作分母有意义）
+    出站的提供方都默认关闭（私有化部署不出站）；source=none 完全不填辐照。"""
+    source: str = "auto"                 # auto | none
+    providers: List[str] = Field(default_factory=lambda: ["measured", "nasa_power", "meteonorm", "openmeteo", "clearsky"])
+    nasa_power: bool = False
+    nasa_power_base_url: str = "https://power.larc.nasa.gov/api/temporal/daily/point"
+    meteonorm: bool = False
+    meteonorm_base_url: str = "https://api.meteonorm.com/v1"
+    meteonorm_token_env: str = "METEONORM_TOKEN"
+    openmeteo: bool = False
+    openmeteo_base_url: str = "https://archive-api.open-meteo.com"
+    timeout_seconds: int = 30
+    cache_days: int = 400                # 外部日辐照缓存在 platform_state，按站保留天数
+
+
 class LLMCfg(BaseModel):
     """LLM 解释与复核助手（可选）：没有 key 就用模板文案，功能不缺；私有化部署可 enabled=false 彻底关闭出站。"""
     enabled: bool = True
@@ -173,9 +195,16 @@ class LLMCfg(BaseModel):
     timeout_seconds: int = 40
 
 
+class RuntimeCfg(BaseModel):
+    """运行规模：万串级多站时按站并行算基线/诊断（每站独立进程只读库，结果回主进程统一落库）"""
+    workers: int = 1                        # 1 = 串行；N>1 或 0（=CPU 核数）按站并行。可用环境变量 PVDIAG_WORKERS 覆盖
+    parallel_min_stations: int = 2          # 站数少于此值不起进程池（省启动开销）
+
+
 class Settings(BaseModel):
     data_dir: Path = Path("./data")
     timezone: str = "Asia/Shanghai"
+    runtime: RuntimeCfg = RuntimeCfg()
     thresholds: Thresholds = Thresholds()
     baseline: BaselineCfg = BaselineCfg()
     confidence: Confidence = Confidence()
@@ -186,6 +215,7 @@ class Settings(BaseModel):
     ingest: IngestCfg = IngestCfg()
     alerts: AlertCfg = AlertCfg()
     llm: LLMCfg = LLMCfg()
+    irradiance: IrradianceCfg = IrradianceCfg()
 
     # ---- 派生路径 ----
     @property

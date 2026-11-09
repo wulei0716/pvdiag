@@ -272,6 +272,58 @@ def bench_train(workdir: Path, settings: Optional[Settings] = None, public_root=
 
 
 # ---------------------------------------------------------------------------- 报告
+# ---------------------------------------------------------------------------- 真实电站（日电量巡检表，数据不入库）
+def bench_real(workdir: Path, settings: Optional[Settings] = None, real_root=None) -> Optional[Dict]:
+    """真实电站日电量基准：PVDIAG_REAL_DIR/manifest.json 列出各站文件与参考判定，逐站跑日电量诊断比对。
+    manifest 结构：{"stations": [{"station_id": "...", "file": "xxx.xlsx", "platform": "huawei",
+                   "expected": {"severe": ["NB01-pv16", ...], "mild": [...], "healthy_examples": [...]},
+                   "reference_states": {"zero_current": 136, "unconnected": 12}}]}
+    真实站文件含客户信息，只放本地目录，不进仓库。"""
+    import os
+    from .. import daily_energy as de
+    root = Path(real_root or os.environ.get("PVDIAG_REAL_DIR", "")) if (real_root or os.environ.get("PVDIAG_REAL_DIR")) else None
+    if root is None or not (root / "manifest.json").exists():
+        return None
+    man = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    settings = settings or Settings()
+    s = settings.model_copy(deep=True); s.data_dir = workdir / "real"; s.ensure_dirs()
+    store = Store(s.db_path, s.samples_dir)
+    out: Dict = {"stations": {}, "summary": {}}
+    tot_sev = hit_sev = 0; fa_healthy = 0; n_healthy = 0
+    for st in man.get("stations", []):
+        sid = st["station_id"]
+        f = root / st["file"]
+        if not f.exists():
+            out["stations"][sid] = {"error": f"文件缺失 {f.name}"}; continue
+        b = de.read_report_xlsx(f, sid, st.get("platform", ""), inputs_per_mppt=st.get("inputs_per_mppt", 2)) if f.suffix.lower().startswith(".xls") \
+            else de.read_long_csv(f, sid, st.get("platform", ""))
+        de.load_into_store(store, b)
+        sd = b.station_daily
+        r = de.diagnose(store, sid, date.fromisoformat(sd["date"].min()), date.fromisoformat(sd["date"].max()), s.thresholds, write=False)
+        stats = r["strings"].set_index("string_id")
+        exp = st.get("expected", {})
+        def full(x): return x if x.startswith(sid + "-") else f"{sid}-{x}"
+        sev = [full(x) for x in exp.get("severe", [])]
+        got_sev = [x for x in sev if x in stats.index and stats.at[x, "grade"] in ("A", "B", "C")]
+        healthy = [full(x) for x in exp.get("healthy_examples", [])]
+        fa = [x for x in healthy if x in stats.index and stats.at[x, "grade"] in ("A", "B")]
+        tot_sev += len(sev); hit_sev += len(got_sev); n_healthy += len(healthy); fa_healthy += len(fa)
+        graded = stats[stats["grade"].notna()]
+        out["stations"][sid] = {
+            "days": int(sd["date"].nunique()), "clear_days": len(r["clear_days"]), "group_mode": r["group_mode"],
+            "state_counts": r["state_counts"], "reference_states": st.get("reference_states"),
+            "severe_expected": sev, "severe_recalled": got_sev,
+            "severe_detail": {x: {"grade": stats.at[x, "grade"], "cause": stats.at[x, "cause"], "mean_dev": round(float(stats.at[x, "mean_dev"]), 3)}
+                              for x in sev if x in stats.index},
+            "healthy_false_alarm": fa, "graded_counts": graded["grade"].value_counts().to_dict(),
+            "top": graded.sort_values("mean_dev").head(12).reset_index()[["string_id", "grade", "cause", "mean_dev", "over_dev", "low_days", "n_clear_eval", "lost_kwh"]]
+                   .round(3).to_dict("records"),
+        }
+    store.close()
+    out["summary"] = {"stations": len(out["stations"]), "severe_recall": f"{hit_sev}/{tot_sev}", "healthy_false_alarm_ab": f"{fa_healthy}/{n_healthy}"}
+    return out
+
+
 def write_report(report: Dict, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "bench_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
@@ -311,6 +363,23 @@ def render_markdown(rep: Dict) -> str:
               f"- 考试方式 {ex.get('method')}：挑战者 {ex.get('challenger')} · 规则代理 {ex.get('rule_proxy')}",
               f"- 结果：{'已上线 ' + str(t.get('version')) if t.get('promoted') else '未上线（' + '；'.join(t.get('rejected_because') or ['标注不足']) + '）'}",
               f"- 特征重要性 Top：{t.get('feature_importance')}", ""]
+    if "real" in rep:
+        r = rep["real"]
+        L += ["## 真实电站（日电量巡检表 → 日电量模式；数据不入库）", "",
+              f"- 站数 {r['summary']['stations']}，参考严重低发召回（A/B/C）：**{r['summary']['severe_recall']}**，参考健康串 A/B 误报：**{r['summary']['healthy_false_alarm_ab']}**", ""]
+        for sid, v in r["stations"].items():
+            if "error" in v:
+                L += [f"### {sid}：{v['error']}", ""]; continue
+            L += [f"### {sid}（{v['days']} 天，晴好 {v['clear_days']} 天，分组 {v['group_mode']}）", "",
+                  f"- 通道三态：{v['state_counts']}（报告口径 {v['reference_states']}）",
+                  f"- 参考严重低发 {len(v['severe_expected'])} 条 → 召回 {len(v['severe_recalled'])}：{v['severe_detail']}",
+                  f"- 分级分布 {v['graded_counts']}；参考健康串误报 {v['healthy_false_alarm']}", "",
+                  "| 组串 | 分级 | 原因 | 晴好偏差 | 阴天偏差 | 低发天数 | 晴好天数 | 少发 kWh |", "|---|---|---|---|---|---|---|---|"]
+            for t in v["top"]:
+                L.append(f"| {t['string_id']} | {t['grade']} | {t['cause']} | {t['mean_dev']:+.1%} | {t['over_dev']:+.1%} | {t['low_days']} | {t['n_clear_eval']} | {t['lost_kwh']} |"
+                         if pd.notna(t.get("over_dev")) else
+                         f"| {t['string_id']} | {t['grade']} | {t['cause']} | {t['mean_dev']:+.1%} | - | {t['low_days']} | {t['n_clear_eval']} | {t['lost_kwh']} |")
+            L.append("")
     if "synth" in rep:
         s = rep["synth"]
         L += ["## 合成电站（10 种注入故障）", "", f"- 召回 {s['recall']}，健康串 A/B 误报 {s['false_alarm_ab']}，原因分型正确 {s['cause_correct']}", ""]

@@ -22,9 +22,26 @@ import pandas as pd
 
 from ..features import slot_label
 from ..models import Cause, Grade, Signature, SuspectStatus
+from ..solar import TRACKER_MOUNTS, tracker_stuck_fit
 from .base import Agent, AgentContext, AgentResult
 
 SEVERITY = {Grade.A.value: 0, Grade.B.value: 1, Grade.C.value: 2, Grade.D.value: 3, Grade.E.value: 4, Grade.ARCHIVED.value: 5}
+
+
+def _n_parallel_of(p) -> float:
+    """档案并联串数（一路 MPPT 接两串并联 → 2）；缺省 1"""
+    try:
+        v = p.get("n_parallel") if hasattr(p, "get") else None
+        v = float(v) if v is not None and not pd.isna(v) else 1.0
+        return v if v >= 1 else 1.0
+    except Exception:
+        return 1.0
+
+
+def _n_parallel(prof: pd.DataFrame) -> Dict[str, float]:
+    if "n_parallel" not in prof.columns:
+        return {}
+    return {sid: _n_parallel_of(row) for sid, row in prof.to_dict("index").items()}
 
 
 class DetectAgent(Agent):
@@ -34,8 +51,12 @@ class DetectAgent(Agent):
     def run(self, ctx: AgentContext) -> AgentResult:
         res = AgentResult(agent=self.name)
         all_susp: List[Dict] = []
-        for sid in ctx.stations():
-            all_susp.extend(self.detect_station(ctx, sid, ctx.run_date))
+        from ..parallel import map_stations
+        sids = ctx.stations()
+        for susp, sig_rows in map_stations(ctx.settings, ctx, self.detect_station, sids, ctx.run_date):
+            all_susp.extend(susp)
+            if sig_rows:
+                ctx.store.upsert_df("signatures", pd.DataFrame(sig_rows))      # 写只在主进程做
         all_susp = self._reconcile_cases(ctx, all_susp)
         if all_susp:
             ctx.store.upsert_df("suspects", pd.DataFrame(all_susp))
@@ -157,13 +178,14 @@ class DetectAgent(Agent):
         return best[0]
 
     # ------------------------------------------------------------------ 单站
-    def detect_station(self, ctx: AgentContext, station_id: str, d: date) -> List[Dict]:
+    def detect_station(self, ctx: AgentContext, station_id: str, d: date) -> Tuple[List[Dict], List[Dict]]:
+        """单站诊断（只读库）：返回 (嫌疑候选, 签名行)；落库由 run() 在主进程统一做，便于按站并行"""
         th, cfg = ctx.settings.thresholds, ctx.settings.baseline
         today = d.isoformat()
         strings = ctx.store.strings(station_id)
         bl = ctx.store.baselines(station_id, d, d)
         if bl.empty or strings.empty:
-            return []
+            return [], []
         feats = ctx.store.daily_features(station_id, d - timedelta(days=10), d)
         ft = feats[feats["date"] == today].set_index("string_id")
         weather_row = ctx.store.station_daily(station_id, d, d)
@@ -216,10 +238,16 @@ class DetectAgent(Agent):
             f = ft_rows.get(sid)
             h = hist_by.get(sid, [])
             ref = ref_orient.get(p["inverter_id"])
-            geo = (lat, ref[0], ref[1], d, lon_offset) if ref is not None else None          # 档案没有朝向 → 不做物理拟合
+            if ref is not None:
+                geo = (lat, ref[0], ref[1], d, lon_offset)
+            elif mount in TRACKER_MOUNTS and lat is not None:
+                geo = (lat, None, None, d, lon_offset)          # 跟踪电站档案常无固定朝向：只给纬度，够做卡滞曲线校核
+            else:
+                geo = None                                      # 档案没有朝向 → 不做朝向物理拟合
             sig, skew, rcurve = self._signature(sid, f, p, b, group_curves, inv_daily, th, cfg, mount, geo)
             if sig.tracker_stuck:
-                sig.notes.append(f"跟踪电站：清晨比值 {sig.am_ratio:.0%}、傍晚 {sig.pm_ratio:.0%}，中午正常 → 失去跟踪增益（支架卡滞/控制器停）")
+                sig.notes.insert(0, f"{'双轴' if mount == 'tracker_dual' else '单轴'}跟踪电站：清晨比值 {sig.am_ratio:.0%}、傍晚 {sig.pm_ratio:.0%}"
+                                    f"{'、中午正常' if mount == 'tracker' else ''} → 失去跟踪增益（支架卡滞/控制器停）")
             if sig.orientation_like and not sig.orientation_fit and not np.isnan(dev_std.get(sid, np.nan)) and dev_std[sid] > th.orientation_max_drift:
                 sig.orientation_like = False      # 偏差在漂移 → 不是恒定的朝向差异（更像积灰/衰减）
                 sig.notes.append(f"晴好天偏差离散度 {dev_std[sid]:.1%} 偏大，不按朝向差异处理")
@@ -241,6 +269,11 @@ class DetectAgent(Agent):
                                               weather, dip_days, th, tracker_days)
             if grade is None:
                 continue
+            # 空输入：华为/阳光每 MPPT 两路，只接一路时另一路读到共压电压、电流恒 0。档案未登记组件数且同 MPPT 兄弟路正常 → 不是断线
+            if cause == Cause.OPEN_CIRCUIT.value and sig.zero_all_day and self._is_empty_input(sid, p, prof_rows, ft_rows, th):
+                grade, cause = Grade.E.value, Cause.DATA_ISSUE.value
+                notes = ["同 MPPT 另一路在正常发电、档案未登记组件数 → 判为空输入（共压读到电压、电流 0），不报断线；现场确有接线请补档案 n_modules"]
+                sig.notes.append(notes[0])
 
             # 冷启动（该串晴好天基线样本不足）：仅凭互比偏差不下 B 级结论——只做同日互比、进观察带
             if grade == Grade.B.value and int(b.get("cold_start", 0) or 0) == 1 and not (sig.dip_depth or sig.outage_hours or sig.inverter_level):
@@ -270,8 +303,6 @@ class DetectAgent(Agent):
                 "archived_shading": int(archived), "status": SuspectStatus.OPEN.value,
                 "created_at": pd.Timestamp.now().isoformat(),
             })
-        if sig_rows:
-            ctx.store.upsert_df("signatures", pd.DataFrame(sig_rows))
 
         # ---- 整机级嫌疑（机间互比兜底整机问题）
         for r in inv_bl.itertuples():
@@ -296,7 +327,7 @@ class DetectAgent(Agent):
                     "signature_json": sig.model_dump_json(), "low_confidence": 0, "archived_shading": 0,
                     "status": SuspectStatus.OPEN.value, "created_at": pd.Timestamp.now().isoformat(),
                 })
-        return out
+        return out, sig_rows
 
     # ------------------------------------------------------------------ 工具
     @staticmethod
@@ -304,6 +335,7 @@ class DetectAgent(Agent):
         curves: Dict[str, List[np.ndarray]] = {}
         inv_of = prof["inverter_id"].to_dict()
         gkey, glevel = bl["group_key"].to_dict(), bl["group_level"].to_dict()
+        npar = _n_parallel(prof)
         for sid, row in ft.to_dict("index").items():
             if sid not in inv_of or sid not in gkey:
                 continue
@@ -311,17 +343,36 @@ class DetectAgent(Agent):
                 continue
             key = gkey[sid] if glevel[sid] == "group" else inv_of[sid]
             vec = np.array([np.nan if v is None else v for v in json.loads(row["i_profile_json"])], dtype=float)
-            curves.setdefault(key, []).append(vec)
+            curves.setdefault(key, []).append(vec / npar.get(sid, 1.0))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)      # 夜间槽全 NaN 属正常
             return {k: np.nanmedian(np.vstack(v), axis=0) for k, v in curves.items() if len(v) >= 3}
+
+    @staticmethod
+    def _is_empty_input(sid: str, p: Dict, prof_rows: Dict[str, Dict], ft_rows: Dict[str, Dict], th) -> bool:
+        nm = p.get("n_modules")
+        if nm is not None and not pd.isna(nm) and float(nm) > 0:
+            return False                                   # 档案说接了组件 → 0 电流就是真断线
+        mp = p.get("mppt")
+        if mp is None or pd.isna(mp):
+            return False
+        for osid, op in prof_rows.items():
+            if osid == sid or op.get("inverter_id") != p.get("inverter_id") or op.get("mppt") != mp:
+                continue
+            f = ft_rows.get(osid)
+            if f is not None and not f.get("zero_all_day") and not pd.isna(f.get("noon_median_i")) and f.get("noon_median_i", 0) >= th.zero_current_a:
+                return True
+        return False
 
     @staticmethod
     def _voltage_offsets(ft: pd.DataFrame, prof: pd.DataFrame, bl: pd.DataFrame) -> Dict[str, float]:
         """中午电压 vs 同机（同群组）中位电压的相对偏差"""
         if ft.empty:
             return {}
-        x = ft[["noon_median_v", "zero_all_day", "stuck"]].join(prof[["inverter_id"]], how="inner")
+        cols = ["inverter_id"] + (["device_type"] if "device_type" in prof.columns else [])
+        x = ft[["noon_median_v", "zero_all_day", "stuck"]].join(prof[cols], how="inner")
+        if "device_type" in x.columns:
+            x = x[x["device_type"].fillna("string") == "string"]          # 优化器/微逆：电压不可互比，不判电压异位
         x = x[(x["zero_all_day"] == 0) & (x["stuck"] == 0) & x["noon_median_v"].notna() & (x["noon_median_v"] > 0)]
         out = {}
         for inv, g in x.groupby("inverter_id"):
@@ -448,7 +499,7 @@ class DetectAgent(Agent):
             return sig, None, None
         key = b["group_key"] if b["group_level"] == "group" else p["inverter_id"]
         gcurve = group_curves.get(key)
-        vec = np.array([np.nan if v is None else v for v in json.loads(f["i_profile_json"])], dtype=float)
+        vec = np.array([np.nan if v is None else v for v in json.loads(f["i_profile_json"])], dtype=float) / _n_parallel_of(p)
         if gcurve is None or len(vec) != len(gcurve):
             return sig, None, None
         valid = (gcurve >= max(0.5, 0.15 * np.nanmax(gcurve))) & ~np.isnan(vec)
@@ -485,10 +536,20 @@ class DetectAgent(Agent):
         am = w(7.5, 10.5); pm = w(14, 17); noon = w(11.5, 13.5)
         if np.sum(~np.isnan(am)) >= 2 and np.sum(~np.isnan(pm)) >= 2 and np.sum(~np.isnan(noon)) >= 2:
             sig.am_ratio, sig.pm_ratio = float(np.nanmedian(am)), float(np.nanmedian(pm))
-            if mount == "tracker" and sig.am_ratio <= th.tracker_side_ratio and sig.pm_ratio <= th.tracker_side_ratio \
-                    and float(np.nanmedian(noon)) >= 0.93 and abs(sig.am_ratio - sig.pm_ratio) < 0.15:
-                sig.tracker_stuck = True
-                return sig, None, ratio          # 不再按"凹陷"解释
+            noon_med = float(np.nanmedian(noon))
+            if mount in TRACKER_MOUNTS and sig.am_ratio <= th.tracker_side_ratio and sig.pm_ratio <= th.tracker_side_ratio \
+                    and abs(sig.am_ratio - sig.pm_ratio) < 0.15:
+                # 单轴卡滞：中午 ≈1（只丢清晨/傍晚增益）。双轴卡滞：中午也可能偏低（冬季固定 20° 面 vs 正对太阳差 15%），
+                # 所以双轴/有坐标时改用物理曲线校核：卡在固定倾角的期望曲线要比"全天平直"假设像得多
+                stuck = mount == "tracker" and noon_med >= 0.93
+                if not stuck and geo is not None and geo[0] is not None and noon_med >= 0.75 and noon_med - max(sig.am_ratio, sig.pm_ratio) >= 0.08:
+                    fit = tracker_stuck_fit(mount, geo[0], geo[3], ratio, cfg.slot_minutes, lon_offset_min=geo[4] if len(geo) > 4 else 0.0)
+                    if fit is not None and fit[0] < 0.06 and fit[1] - fit[0] >= 0.03:
+                        stuck = True
+                        sig.notes.append(f"曲线形状 ≈ 卡在约 {fit[2]:.0f}° 固定倾角（rmse {fit[0]:.3f}，平直假设 {fit[1]:.3f}）")
+                if stuck:
+                    sig.tracker_stuck = True
+                    return sig, None, ratio          # 不再按"凹陷"解释
         # 分时段凹陷：比值 < dip_ratio 的连续槽段
         low = np.where(valid, ratio < th.dip_ratio, False)
         runs, k = [], 0
@@ -517,7 +578,7 @@ class DetectAgent(Agent):
         if skew is not None and abs(skew) > 0.10:
             sig.notes.append(f"上下午比值倾斜 {skew:+.3f}（{'上午高' if skew > 0 else '下午高'}，疑东西向差异）")
             # 物理校核：在朝向/倾角网格里找最像的曲线形状；若明显不是参考朝向且拟合得好 → 这是朝向差异不是遮挡
-            if geo is not None:
+            if geo is not None and geo[1] is not None and geo[2] is not None:
                 from ..solar import best_fit_orientation
                 lat, ref_az, ref_tilt, dd = geo[0], geo[1], geo[2], geo[3]
                 fit = best_fit_orientation(lat, dd, ratio, ref_az, ref_tilt, cfg.slot_minutes, lon_offset_min=geo[4] if len(geo) > 4 else 0.0)

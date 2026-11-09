@@ -172,6 +172,8 @@ class IngestAgent(Agent):
         capacity = float(st["capacity_kwp"].iloc[0]) if not st.empty and pd.notna(st["capacity_kwp"].iloc[0]) else None
         inv = ctx.store.inverters(station_id)
         rated = {r.inverter_id: r.rated_ac_kw for r in inv.itertuples() if pd.notna(r.rated_ac_kw)} if not inv.empty else {}
+        from ..irradiance import resolve_daily_irradiance
+        irr_resolved = resolve_daily_irradiance(ctx.settings, ctx.store, station_id, sorted(days), irr_by_day)
         for d in sorted(days):
             s = ctx.store.read_samples("string", station_id, d)
             i = ctx.store.read_samples("inverter", station_id, d)
@@ -185,8 +187,8 @@ class IngestAgent(Agent):
                 inv_daily = compute_inverter_daily(i, d, cfg, rated)
             inv_daily = self._unflag_frozen_limited(sf, inv_daily, ctx.store.strings(station_id), th.stale_run_min)
             hist = ctx.store.station_daily(station_id, d - timedelta(days=cfg.peak_lookback_days + 5), d)
-            row = compute_station_daily(station_id, d, inv_daily, station_noon_cv(i, d, cfg), hist, capacity, cfg,
-                                        (irr_by_day or {}).get(d))
+            irr_val, irr_src = irr_resolved.get(d, (None, "none"))
+            row = compute_station_daily(station_id, d, inv_daily, station_noon_cv(i, d, cfg), hist, capacity, cfg, irr_val, irr_src)
             ctx.store.upsert_df("daily_features", sf)
             ctx.store.upsert_df("inverter_daily", inv_daily)
             ctx.store.upsert_df("station_daily", pd.DataFrame([row]))

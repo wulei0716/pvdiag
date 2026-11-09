@@ -9,7 +9,7 @@
 可注入故障（string 级）：open_circuit / diode_bypass / shading_fixed / orientation / dust_local / stuck /
                         wrong_profile(串长档案错) / archived_shading(已备案遮挡) / degradation_step /
                         outage_intermittent(间歇停机，Kaggle Plant 2 真实签名) / stale_partial(半天钉死，NREL 标注签名) /
-                        azimuth_actual(实际朝向不同；archive_correct 决定档案是否如实) / tracker_stuck(跟踪支架卡滞，需 mount=tracker)
+                        azimuth_actual(实际朝向不同；archive_correct 决定档案是否如实) / tracker_stuck(跟踪支架卡滞，需 mount=tracker/tracker_dual)
 （inverter 级）：mppt_fault（整机低发）/ limit（限发）
 """
 from __future__ import annotations
@@ -54,7 +54,9 @@ class SimConfig:
     weather_probs: Tuple[float, float, float] = (0.55, 0.28, 0.17)   # clear, cloudy, overcast
     faults: List[Fault] = field(default_factory=list)
     roof_areas: Tuple[str, ...] = ("A区屋面", "B区屋面", "C区屋面")
-    mount: str = "fixed"                # fixed | tracker（水平单轴跟踪：清晨/傍晚增益，曲线平顶）
+    use_default_faults: bool = True     # faults 为空时是否注入默认的 10 种故障（False = 纯健康电站）
+    device_type: str = "string"         # string | optimizer | microinverter（档案字段；优化器/微逆不做电压异位判定）
+    mount: str = "fixed"                # fixed | tracker（水平单轴：清晨/傍晚增益，曲线平顶）| tracker_dual（双轴：全天正对太阳，冬季中午也比固定面高）
     azimuth: float = 180.0
     tilt: float = 15.0
 
@@ -113,7 +115,7 @@ def _day_irradiance(rng: np.random.Generator, weather: str, elev: np.ndarray) ->
 def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
     """返回 dict: stations, inverters, strings(档案), events, samples_strings, samples_inverters, weather, truth"""
     rng = np.random.default_rng(cfg.seed)
-    faults = cfg.faults or default_faults(cfg)
+    faults = cfg.faults or (default_faults(cfg) if cfg.use_default_faults else [])
     inv_ids = [f"{cfg.station_id}-INV{k:02d}" for k in range(1, cfg.n_inverters + 1)]
     minutes = np.arange(0, 24 * 60, 5)
     n_t = len(minutes)
@@ -133,9 +135,18 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
             nm = cfg.n_modules
             known, exp_dev, note = 0, None, ""
             az_doc, tilt_doc = cfg.azimuth, cfg.tilt
+            module_type = "mono"
+            n_parallel = 1
+            nm_doc = cfg.n_modules
             for f in sf_by_string.get(sid, []):
+                if f.kind == "bifacial_actual" and f.params.get("archive_correct", True):
+                    module_type = "bifacial"
+                if f.kind == "parallel_actual" and f.params.get("archive_correct", True):
+                    n_parallel = int(f.params.get("n_parallel", 2))
                 if f.kind == "wrong_profile":
                     nm = int(f.params.get("n_modules", nm))        # 真实串长少两块，但档案仍记 cfg.n_modules
+                if f.kind == "empty_input":
+                    nm_doc = None                                  # 空输入：档案没登记组件（平台把它当一路上报，电压=共 MPPT 兄弟路、电流 0）
                 if f.kind == "archived_shading":
                     known, exp_dev, note = 1, -round(f.params.get("depth", 0.3) * 0.25, 3), "备案：东侧广告牌上午遮挡"
                 if f.kind == "azimuth_actual" and f.params.get("archive_correct", True):
@@ -143,10 +154,11 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
             string_nmod[sid] = nm
             strings_rows.append({
                 "string_id": sid, "station_id": cfg.station_id, "inverter_id": inv, "mppt": (n - 1) // 2 + 1,
-                "pv_index": n, "n_modules": cfg.n_modules, "module_model": "SIM-550M", "module_wp": cfg.module_wp,
+                "pv_index": n, "n_modules": nm_doc, "module_model": "SIM-550M", "module_wp": cfg.module_wp,
                 "module_vmp": cfg.module_vmp, "module_imp": cfg.module_imp, "azimuth": az_doc, "tilt": tilt_doc,
                 "roof_area": cfg.roof_areas[k % len(cfg.roof_areas)], "known_shading": known,
-                "shading_expected_dev": exp_dev, "shading_note": note, "notes": "",
+                "shading_expected_dev": exp_dev, "shading_note": note, "notes": "", "device_type": cfg.device_type, "module_type": module_type,
+                "n_parallel": n_parallel,
             })
     strings_df = pd.DataFrame(strings_rows)
     dc_kwp = cfg.strings_per_inverter * cfg.n_modules * cfg.module_wp / 1000.0
@@ -178,8 +190,8 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
             r = np.where(ref_poa > 1, poa / np.maximum(ref_poa, 1), 1.0)
             return 1.0 + geo_w * (r - 1.0)
         tracker_gain = None
-        if cfg.mount == "tracker":
-            tp = _solar.tracker_poa(cfg.lat_deg, doy, minutes)
+        if cfg.mount in _solar.TRACKER_MOUNTS:
+            tp = _solar.mount_poa(cfg.mount, cfg.lat_deg, doy, minutes)
             r = np.where(ref_poa > 1, tp / np.maximum(ref_poa, 1), 1.0)
             tracker_gain = np.clip(1.0 + geo_w * (r - 1.0), 0.2, 3.0)
         t_amb = 18 + 10 * math.sin(2 * math.pi * (d.timetuple().tm_yday - 100) / 365) + 6 * np.sin((minutes / 60 - 9) / 24 * 2 * math.pi)
@@ -209,15 +221,23 @@ def simulate(cfg: SimConfig) -> Dict[str, pd.DataFrame]:
                     if di < f.start_day or (f.end_day is not None and di >= f.end_day):
                         continue
                     p = f.params
-                    if f.kind == "azimuth_actual":
+                    if f.kind == "parallel_actual":
+                        # 一路 MPPT 接了两串并联（物理事实）：电流翻倍；档案 n_parallel 对不对由 archive_correct 决定
+                        I = I * p.get("n_parallel", 2)
+                    elif f.kind == "bifacial_actual":
+                        # 双面组件：背面增益（晴天全额、多云一半、阴天散射为主也有一点）
+                        I = I * (1.0 + (p.get("gain", 0.08)) * {"clear": 1.0, "cloudy": 0.6, "overcast": 0.4}[weathers[di]])
+                    elif f.kind == "azimuth_actual":
                         # 该串实际朝向/倾角与参考不同（物理事实）；档案对不对由 archive_correct 决定
                         I = I * geo_factor(p.get("azimuth", 90.0), p.get("tilt", cfg.tilt))
                     elif f.kind == "tracker_stuck":
-                        # 跟踪支架卡在水平位：失去清晨/傍晚增益，曲线回到固定倾角的钟形
+                        # 跟踪支架卡在固定位（默认水平，stuck_tilt 可指定）：失去跟踪增益，曲线回到固定倾角的钟形
                         if tracker_gain is not None:
                             I = I / tracker_gain * geo_factor(cfg.azimuth, p.get("stuck_tilt", 0.0))
                     elif f.kind == "open_circuit":
                         I = np.zeros(n_t); V = np.where(G > 15, v_clamp * 1.18, 0.0)
+                    elif f.kind == "empty_input":
+                        I = np.zeros(n_t); V = v_clamp.copy()           # 共压：电压与同 MPPT 另一路一样，电流恒 0
                     elif f.kind in ("diode_bypass", "shading_fixed", "archived_shading"):
                         band = (minutes >= _hhmm(p["start"])) & (minutes < _hhmm(p["end"]))
                         depth = p.get("depth", 0.33) if weathers[di] != "overcast" else p.get("depth", 0.33) * 0.15
