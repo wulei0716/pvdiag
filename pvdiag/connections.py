@@ -20,3 +20,39 @@ def input_evidence(store, station_id: str, d: date, zero_current_a: float = 0.5)
     inferred = profiles["string_id"].isin(unused_by_history - last_production.keys()) & ~documented
     unused = set(profiles.loc[inferred | (profiles["connection_status"] == "unused"), "string_id"])
     return unused, last_production
+
+
+def zero_output_context(store, station_id: str, day: str, zero_current_a: float):
+    """Summarize same-inverter voltage and repeated zero channels by model."""
+    frame = store.query(
+        "SELECT t.string_id, t.inverter_id, t.pv_index, i.model, f.zero_all_day, f.stuck, "
+        "f.noon_median_v, f.noon_median_i, f.noon_low_current_v, f.noon_low_current_v_n "
+        "FROM daily_features f JOIN strings t USING(string_id) JOIN inverters i USING(inverter_id) "
+        "WHERE t.station_id=? AND f.date=? AND COALESCE(t.connection_status,'unknown')!='unused'",
+        (station_id, day),
+    )
+    if frame.empty:
+        return {}
+    producing = frame[(frame.noon_median_i >= zero_current_a) & (frame.stuck == 0)
+                      & (frame.zero_all_day == 0) & (frame.noon_median_v > 0)]
+    peers = producing.groupby("inverter_id").noon_median_v.agg(["median", "count"])
+    sampled = frame[(frame.stuck == 0) & frame.model.notna() & frame.model.ne("")].copy()
+    sampled["zero_inverter"] = sampled.inverter_id.where(sampled.zero_all_day == 1)
+    patterns = sampled.groupby(["model", "pv_index"]).agg(
+        reporting=("inverter_id", "nunique"), zero=("zero_inverter", "nunique"))
+    result = {}
+    for row in frame[(frame.zero_all_day == 1) & (frame.stuck == 0)].itertuples():
+        evidence = {}
+        if row.inverter_id in peers.index and row.noon_low_current_v_n >= 3:
+            peer = peers.loc[row.inverter_id]
+            if peer["count"] >= 2 and row.noon_low_current_v >= 0:
+                evidence["voltage_ratio"] = round(float(row.noon_low_current_v / peer["median"]), 3)
+                evidence["voltage_peer_count"] = int(peer["count"])
+        key = (row.model, row.pv_index)
+        if key in patterns.index and patterns.loc[key, "reporting"] >= 2:
+            pattern = patterns.loc[key]
+            evidence["same_model_channel_zero"] = int(pattern["zero"])
+            evidence["same_model_channel_reporting"] = int(pattern["reporting"])
+        if evidence:
+            result[row.string_id] = evidence
+    return result

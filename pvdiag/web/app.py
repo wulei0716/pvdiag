@@ -65,7 +65,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return HTMLResponse(env.get_template(name).render(**kw))
 
     def latest_date() -> Optional[str]:
-        return store.scalar("SELECT MAX(date) FROM baselines")
+        return store.scalar("SELECT MAX(date) FROM daily_features")
 
     def report_json(d: str) -> Dict:
         p = settings.reports_dir / d / "report.json"
@@ -105,7 +105,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             return render("strings.html", heat=[], date=None, station=station or "", dates=[])
         sids = [station] if station else store.stations()["station_id"].tolist()
         heat = [station_heatmap(store, s, d, settings.thresholds.zero_current_a) for s in sids]
-        dates = store.query("SELECT DISTINCT date FROM baselines ORDER BY date DESC LIMIT 14")["date"].tolist()
+        dates = store.query("SELECT DISTINCT date FROM daily_features ORDER BY date DESC LIMIT 14")["date"].tolist()
         return render("strings.html", heat=heat, date=d, station=station or "", dates=dates)
 
     @app.get("/string/{string_id}", response_class=HTMLResponse)
@@ -114,7 +114,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if p.empty:
             raise HTTPException(404, "组串不存在")
         prof = p.iloc[0].to_dict()
-        d = d or store.scalar("SELECT MAX(date) FROM baselines WHERE string_id=?", (string_id,)) or latest_date()
+        d = d or store.scalar("SELECT MAX(date) FROM daily_features WHERE string_id=?", (string_id,)) or latest_date()
         b = store.query("SELECT * FROM baselines WHERE string_id=? AND date=?", (string_id, d))
         bl = b.iloc[0].to_dict() if not b.empty else {}
         case = store.query("SELECT s.*, v.cause ai_cause, v.confidence, v.action FROM suspects s LEFT JOIN verdicts v ON v.suspect_id=s.suspect_id "
@@ -328,7 +328,7 @@ def station_heatmap(store: Store, station_id: str, d: Optional[str], zero_curren
             max_pv = max(max_pv, pv)
             dev = float(bl.loc[s.string_id, "dev_today"]) if (not bl.empty and s.string_id in bl.index and pd.notna(bl.loc[s.string_id, "dev_today"])) else None
             zero = bool(ft.loc[s.string_id, "zero_all_day"]) if (not ft.empty and s.string_id in ft.index) else False
-            nodata = (bl.empty or s.string_id not in bl.index)
+            nodata = ft.empty or s.string_id not in ft.index
             grade = cause = None
             if not active.empty and s.string_id in active.index:
                 grade, cause = active.loc[s.string_id, "grade"], active.loc[s.string_id, "rule_cause"]
@@ -344,7 +344,9 @@ def station_heatmap(store: Store, station_id: str, d: Optional[str], zero_curren
     return {"station_id": station_id, "name": (st["name"].iloc[0] if not st.empty else station_id) or station_id,
             "capacity_kwp": float(st["capacity_kwp"].iloc[0]) if not st.empty and pd.notna(st["capacity_kwp"].iloc[0]) else None,
             "weather": weather.iloc[0].to_dict() if not weather.empty else {}, "n_strings": int(len(prof)), "n_cases": n_cases,
-            "n_unused": len(unused), "n_dead": n_dead, "svg": heatmap(rows, max_pv), "inverters": [{"inverter_id": x["inverter_id"], "n": len(x["cells"])} for x in rows]}
+            "n_sampled": int(prof["string_id"].isin(ft.index).sum()),
+            "n_cold": int(bl.loc[bl.index.isin(prof["string_id"]), "cold_start"].sum()) if not bl.empty else 0,
+            "n_baselined": int(prof["string_id"].isin(bl.index).sum()), "n_unused": len(unused), "n_dead": n_dead, "svg": heatmap(rows, max_pv), "inverters": [{"inverter_id": x["inverter_id"], "n": len(x["cells"])} for x in rows]}
 
 
 def curve_chart(store: Store, sid: str, d: str, inverter_id: str) -> Dict:

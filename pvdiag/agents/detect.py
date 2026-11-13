@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from ..features import slot_label
-from ..connections import input_evidence
+from ..connections import input_evidence, zero_output_context
 from ..models import Cause, Grade, Signature, SuspectStatus
 from ..solar import TRACKER_MOUNTS, tracker_stuck_fit
 from .base import Agent, AgentContext, AgentResult
@@ -234,6 +234,7 @@ class DetectAgent(Agent):
         outage_cut = (d - timedelta(days=7)).isoformat()
         prof_rows = prof.to_dict("index"); ft_rows = ft.to_dict("index")
         unused_inputs, last_production = input_evidence(ctx.store, station_id, d, th.zero_current_a)
+        zero_context = zero_output_context(ctx.store, station_id, today, th.zero_current_a)
         producing_inverters = {
             prof_rows[sid]["inverter_id"] for sid, f in ft_rows.items()
             if sid in prof_rows and not f["stuck"] and f["noon_median_i"] >= th.zero_current_a
@@ -287,6 +288,12 @@ class DetectAgent(Agent):
                              "voltage_offset": v_off, "outage_slots": out_slots, "tracker_flag": int(sig.tracker_stuck)})
             grade, cause, notes = self._grade(b, sig, p, zero_streak.get(sid, 0), stuck_streak.get(sid, 0),
                                               weather, dip_days, th, tracker_days)
+            evidence = zero_context.get(sid, {})
+            if "voltage_ratio" in evidence:
+                sig.notes.append(f"低电流电压为同机 {evidence['voltage_peer_count']} 路发电通道电压中位数的 {evidence['voltage_ratio']:.0%}")
+            if evidence.get("same_model_channel_zero", 0) >= 2:
+                sig.notes.append(f"同型号同通道号在 {evidence['same_model_channel_reporting']} 台有采样的逆变器中有 "
+                                 f"{evidence['same_model_channel_zero']} 台为零，优先核对接线布局和测点映射")
             if grade is None:
                 continue
             connection_review = False
@@ -295,6 +302,9 @@ class DetectAgent(Agent):
                 expected = f.get("n_daytime_expected") or 0
                 sufficient = expected > 0 and f["n_missing"] <= expected * 0.2
                 producing_peer = p["inverter_id"] in producing_inverters
+                low_v = f.get("noon_low_current_v")
+                if pd.notna(low_v):
+                    sig.notes.append(f"中午低电流时电压中位数 {low_v:.1f} V（{f['noon_low_current_v_n']} 个有效电压点）")
                 if not ((documented or sid in last_production) and sufficient
                         and producing_peer and not inverter.get("offline_flag")):
                     connection_review = True

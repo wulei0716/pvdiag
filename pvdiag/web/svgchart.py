@@ -141,8 +141,10 @@ def hbar_chart(rows: List[Dict], value_key: str = "value", label_key: str = "lab
 
 def dev_color(dev: Optional[float], zero: bool = False, nodata: bool = False) -> str:
     """热力图配色：偏差 → 语义色"""
-    if nodata or dev is None:
+    if nodata:
         return "var(--c-cell-na)"
+    if dev is None:
+        return "var(--c-cell-sampled)"
     if zero or dev <= -0.5:
         return "var(--c-cell-dead)"
     if dev <= -0.15:
@@ -181,7 +183,7 @@ def heatmap(inverters: List[Dict], max_pv: int, cell: int = 22, gap: int = 4, la
             elif g in ("C", "D", "E"):
                 stroke = ' stroke="var(--c-ink)" stroke-width="1.5" stroke-dasharray="3 2"'
             dev = info.get("dev")
-            tip = f'{info["string_id"]}  偏差 {dev:+.1%}' if dev is not None else f'{info["string_id"]}  无数据'
+            tip = f'{info["string_id"]}  偏差 {dev:+.1%}' if dev is not None else f'{info["string_id"]}  {"无数据" if info.get("nodata") else "已采样，待建立基线"}'
             if g:
                 tip += f'  [{g}] {info.get("cause") or ""}'
             href = f'/string/{escape(info["string_id"])}'
