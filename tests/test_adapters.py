@@ -211,5 +211,6 @@ def test_ginlong_signature_and_inverter_day_flow(monkeypatch):
     res = a.fetch(date(2026, 11, 10), date(2026, 11, 10))
     assert res.calls_used == 1 and seen[-1][1] == {"sn": "SN001", "money": "CNY", "time": "2026-11-10", "timeZone": "8"}
     assert res.inverters["inverter_id"].iloc[0] == "QCGL-1号逆变器" and abs(res.inverters["pac_kw"].iloc[0] - 85.6) < 1e-9
+    assert a._safe("逆变器NB01-AH05") == "NB01-AH05" and a._safe("NB08-AH06") == "NB08-AH06"      # 去掉"逆变器"前缀统一命名
     assert res.inverters["ts"].iloc[0] == pd.Timestamp("2026-11-10 12:00:00")
     assert set(res.strings["string_id"]) == {"QCGL-1号逆变器-pv1", "QCGL-1号逆变器-pv2"}          # iPv3 为 None 不输出

@@ -35,7 +35,8 @@ class GinlongAdapter(PlatformAdapter):
         self.key_secret = ((os.environ.get(env) if env else None) or self.config.get("key_secret") or self.config.get("api_secret") or "").encode()
         self.plant_id = self.config.get("plant_id") or self.config.get("station_id_remote")      # 不填则取该账号下全部逆变器
         self.id_style = self.config.get("id_style", "name")                                       # name | sn
-        self._safe = lambda x: re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff-]", "", re.sub(r"\s+", "", str(x or ""))) or "INV"
+        # 平台里的设备名常混着"逆变器NB01-AH05"/"NB08-AH06"两种写法 → 去掉"逆变器"前缀统一成 NBxx-AHxx
+        self._safe = lambda x: re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff-]", "", re.sub(r"^(逆变器|inverter)", "", re.sub(r"\s+", "", str(x or "")), flags=re.I)) or "INV"
         self.pac_divisor = float(self.config.get("pac_divisor", 1000.0))
         self.timeout = int(self.config.get("timeout", 60))
         self.max_strings = int(self.config.get("max_strings", 32))
