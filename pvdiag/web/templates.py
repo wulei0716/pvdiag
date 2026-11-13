@@ -8,14 +8,14 @@ BASE = r"""<!doctype html>
   --bg:#eef1f5;--panel:#ffffff;--panel2:#f5f7fa;--line:#d9dfe8;--ink:#17202b;--muted:#5f6b7a;--dim:#a9b3c0;
   --acc:#b85c1f;--acc-ink:#ffffff;--focus:#2d6cdf;
   --c-fault:#c0392b;--c-low:#d7860f;--c-orient:#6a4fcf;--c-ok:#1e8a5a;--c-clear:#1f8a8a;--c-cloudy:#e0a526;--c-sky:#2d6cdf;--c-ink:#17202b;--c-muted:#5f6b7a;--c-dim:#b6bfca;
-  --c-cell-ok:#d2e7db;--c-cell-watch:#ffe3a3;--c-cell-low:#f7b267;--c-cell-bad:#e8734a;--c-cell-dead:#9b2226;--c-cell-na:#e3e8ee;
+  --c-cell-ok:#d2e7db;--c-cell-watch:#ffe3a3;--c-cell-low:#f7b267;--c-cell-bad:#e8734a;--c-cell-dead:#9b2226;--c-cell-sampled:#87b9ed;--c-cell-na:#e3e8ee;
   --shadow:0 1px 2px rgba(23,32,43,.06);
 }
 @media (prefers-color-scheme:dark){:root{
   --bg:#0f141a;--panel:#161c25;--panel2:#1c242e;--line:#2a3441;--ink:#e6ebf2;--muted:#9aa5b5;--dim:#5a6678;
   --acc:#e08a4a;--acc-ink:#1a1208;--focus:#6ea0ff;
   --c-fault:#ef6b5c;--c-low:#f0a640;--c-orient:#a68cff;--c-ok:#3fb27f;--c-clear:#3fb0b0;--c-cloudy:#e9bd4e;--c-sky:#6ea0ff;--c-ink:#e6ebf2;--c-muted:#9aa5b5;--c-dim:#4a5566;
-  --c-cell-ok:#234b3a;--c-cell-watch:#6b5416;--c-cell-low:#9a5a1a;--c-cell-bad:#a8402a;--c-cell-dead:#8a1e24;--c-cell-na:#262f3b;
+  --c-cell-ok:#234b3a;--c-cell-watch:#6b5416;--c-cell-low:#9a5a1a;--c-cell-bad:#a8402a;--c-cell-dead:#8a1e24;--c-cell-sampled:#3976ad;--c-cell-na:#262f3b;
   --shadow:none;
 }}
 *{box-sizing:border-box}
@@ -134,12 +134,12 @@ INDEX = r"""{% extends "base.html" %}{% set active='index' %}{% block title %}�
  <section class="panel">
   <div class="station-head"><h3>{{ h.name }}</h3>
    <span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}{% if h.weather.get('noon_power') %} · 中午 {{ h.weather.noon_power|num(0) }} kW / 峰值参考 {{ h.weather.peak_ref|num(0) }} kW{% endif %}</span>
-   <span class="muted small">{{ h.n_strings }} 串 · 在办案例 {{ h.n_cases }}{% if h.n_dead %} · 0 电流 {{ h.n_dead }}{% endif %}</span>
+   <span class="muted small">{{ h.n_sampled }}/{{ h.n_strings }} 路有采样{% if h.n_cold %} · 冷启动 {{ h.n_cold }} 路{% elif h.n_sampled and not h.n_baselined %} · 待建立基线{% endif %}{% if h.n_unused %} · 空端口 {{ h.n_unused }}{% endif %} · 在办案例 {{ h.n_cases }}{% if h.n_dead %} · 0 电流 {{ h.n_dead }}{% endif %}</span>
    <a class="small" style="margin-left:auto" href="/strings?station={{h.station_id}}">放大 →</a></div>
   {{ h.svg|safe }}
  </section>
  {% else %}<section class="panel"><p class="empty">还没有巡检数据。导入档案并运行 <code>pvdiag run</code> 后这里会显示每个电站的组串热力图。</p></section>{% endfor %}
- <div class="legend"><span><i style="background:var(--c-cell-ok)"></i>正常 &gt;-3%</span><span><i style="background:var(--c-cell-watch)"></i>-3%~-5%</span><span><i style="background:var(--c-cell-low)"></i>-5%~-15%</span><span><i style="background:var(--c-cell-bad)"></i>&lt;-15%</span><span><i style="background:var(--c-cell-dead)"></i>0 电流</span><span><i style="background:var(--c-cell-na)"></i>无数据</span><span><i class="ring"></i>A 级在办</span><span><i class="ringb"></i>B 级在办</span><span>点格子看单串详情</span></div>
+ <div class="legend"><span><i style="background:var(--c-cell-ok)"></i>正常 &gt;-3%</span><span><i style="background:var(--c-cell-watch)"></i>-3%~-5%</span><span><i style="background:var(--c-cell-low)"></i>-5%~-15%</span><span><i style="background:var(--c-cell-bad)"></i>&lt;-15%</span><span><i style="background:var(--c-cell-dead)"></i>0 电流</span><span><i style="background:var(--c-cell-sampled)"></i>已采样 · 待基线</span><span><i style="background:var(--c-cell-na)"></i>无数据</span><span><i class="ring"></i>A 级在办</span><span><i class="ringb"></i>B 级在办</span><span>点格子看单串详情</span></div>
 
  <section class="panel"><h2>损失台账 <span class="hint">未修复案例累计电费，驱动派单优先级</span></h2>
   <div class="grid cols-2"><div><div class="small muted" style="margin-bottom:6px">按电站</div>{{ loss_svg|safe }}</div><div><div class="small muted" style="margin-bottom:6px">按案例（前 8）</div>{{ case_svg|safe }}</div></div>
@@ -175,10 +175,10 @@ STRINGS = r"""{% extends "base.html" %}{% set active='strings' %}{% block title 
   <form class="inline" method="get"><input type="hidden" name="station" value="{{station}}"><select name="d" onchange="this.form.submit()">{% for x in dates %}<option {% if x==date %}selected{% endif %}>{{x}}</option>{% endfor %}</select></form>
  </div></div>
 {% for h in heat %}<section class="panel" style="margin-bottom:16px">
- <div class="station-head"><h3>{{ h.name }}</h3><span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}</span><span class="muted small">{{ h.n_strings }} 串 · {{ h.inverters|length }} 台逆变器 · 在办案例 {{ h.n_cases }}</span></div>
+ <div class="station-head"><h3>{{ h.name }}</h3><span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}</span><span class="muted small">{{ h.n_sampled }}/{{ h.n_strings }} 路有采样{% if h.n_cold %} · 冷启动 {{ h.n_cold }} 路{% elif h.n_sampled and not h.n_baselined %} · 待建立基线{% endif %}{% if h.n_unused %} · 空端口 {{ h.n_unused }}{% endif %} · {{ h.inverters|length }} 台逆变器 · 在办案例 {{ h.n_cases }}</span></div>
  {{ h.svg|safe }}
 </section>{% else %}<section class="panel"><p class="empty">无数据</p></section>{% endfor %}
-<div class="legend"><span><i style="background:var(--c-cell-ok)"></i>正常</span><span><i style="background:var(--c-cell-watch)"></i>-3%~-5%</span><span><i style="background:var(--c-cell-low)"></i>-5%~-15%</span><span><i style="background:var(--c-cell-bad)"></i>&lt;-15%</span><span><i style="background:var(--c-cell-dead)"></i>0 电流</span><span><i style="background:var(--c-cell-na)"></i>无数据</span><span><i class="ring"></i>A 级</span><span><i class="ringb"></i>B 级</span><span>虚线框 = C/D/E 观察</span></div>
+<div class="legend"><span><i style="background:var(--c-cell-ok)"></i>正常</span><span><i style="background:var(--c-cell-watch)"></i>-3%~-5%</span><span><i style="background:var(--c-cell-low)"></i>-5%~-15%</span><span><i style="background:var(--c-cell-bad)"></i>&lt;-15%</span><span><i style="background:var(--c-cell-dead)"></i>0 电流</span><span><i style="background:var(--c-cell-sampled)"></i>已采样 · 待基线</span><span><i style="background:var(--c-cell-na)"></i>无数据</span><span><i class="ring"></i>A 级</span><span><i class="ringb"></i>B 级</span><span>虚线框 = C/D/E 观察</span></div>
 {% endblock %}"""
 
 STRING = r"""{% extends "base.html" %}{% set active='strings' %}{% block title %}{{ prof.string_id }}{% endblock %}{% block body %}

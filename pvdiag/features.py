@@ -86,6 +86,7 @@ def compute_string_daily(samples: pd.DataFrame, day: date, cfg: BaselineCfg, th:
         day_g = g[g["is_day"] & g["i"].notna()]
         core = g[g["is_core"] & g["i"].notna()]
         noon_valid = noon[noon["i"] >= th.zero_current_a]
+        noon_low = noon[noon["i"].notna() & (noon["i"] < th.zero_current_a)]
         day_max_i = float(np.nanmax(g["i"].to_numpy())) if g["i"].notna().any() else np.nan
         energy = float(np.nansum((g["i_clean"] * g["v"].fillna(0)).to_numpy()) * (5 / 60) / 1000.0)
         core_std = float(core["i"].std()) if len(core) >= 20 else np.nan
@@ -97,8 +98,11 @@ def compute_string_daily(samples: pd.DataFrame, day: date, cfg: BaselineCfg, th:
             "n_missing": int(max(0, expected_daytime - len(day_g))),
             "noon_median_i": float(noon["i_clean"].median()) if len(noon) else np.nan,
             "noon_median_v": float(noon_valid["v"].median()) if len(noon_valid) else np.nan,
+            "noon_low_current_v": float(noon_low["v"].median()),
+            "noon_low_current_v_n": int(noon_low["v"].count()),
+            "noon_current_valid_n": int(noon["i"].count()),
             "noon_n": int(len(noon)),
-            "noon_zero_frac": float((noon["i_clean"] <= 0).mean()) if len(noon) else np.nan,
+            "noon_zero_frac": float((noon["i"].dropna() < th.zero_current_a).mean()) if noon["i"].notna().any() else np.nan,
             "day_max_i": day_max_i,
             "day_energy_kwh": round(energy, 4),
             "daytime_i_std": core_std,

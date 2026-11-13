@@ -154,6 +154,12 @@ def cmd_platform(args):
     elif args.action == "test":
         if hasattr(adapter, "token_status"):
             print("令牌：", adapter.token_status())
+        if hasattr(adapter, "list_stations"):
+            try:
+                sts = adapter.list_stations()
+                print(f"账号下电站 {len(sts)} 个："); print(sts.to_string(index=False) if not sts.empty else "（空）")
+            except Exception as e:
+                print("电站列表获取失败：", e)
         devs = adapter.list_devices()
         print(f"{args.station}（{st['platform'].iloc[0]}）设备 {len(devs)} 台：")
         if not devs.empty:

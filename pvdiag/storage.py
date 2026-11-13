@@ -125,10 +125,11 @@ CREATE TABLE IF NOT EXISTS health_checks (
 
 # 老库升级：按表逐列补齐（SQLite 的 CREATE TABLE IF NOT EXISTS 不会加新列）
 _MIGRATIONS = {
-    "daily_features": {"stale_run_min": "INTEGER", "noon_zero_frac": "REAL"},
+    "daily_features": {"stale_run_min": "INTEGER", "noon_zero_frac": "REAL", "noon_low_current_v": "REAL",
+                       "noon_low_current_v_n": "INTEGER", "noon_current_valid_n": "INTEGER"},
     "baselines": {"group_noise": "REAL", "orient_exp_ratio": "REAL"},
     "station_daily": {"irradiance_source": "TEXT"},
-    "strings": {"device_type": "TEXT", "module_type": "TEXT", "n_parallel": "INTEGER"},
+    "strings": {"device_type": "TEXT", "module_type": "TEXT", "n_parallel": "INTEGER", "connection_status": "TEXT", "connection_source": "TEXT"},
     "signatures": {"outage_slots": "INTEGER", "tracker_flag": "INTEGER"},
     "model_registry": {"status": "TEXT", "holdout_json": "TEXT"},
     "pipeline_runs": {"attempt": "INTEGER"},

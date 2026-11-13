@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from ..features import slot_label
+from ..connections import input_evidence, zero_output_context
 from ..models import Cause, Grade, Signature, SuspectStatus
 from ..solar import TRACKER_MOUNTS, tracker_stuck_fit
 from .base import Agent, AgentContext, AgentResult
@@ -68,6 +69,12 @@ class DetectAgent(Agent):
         by_grade = pd.Series([s["grade"] for s in all_susp]).value_counts().to_dict() if all_susp else {}
         res.metrics = {"suspects": len(all_susp), "by_grade": by_grade,
                        "new_cases": sum(1 for s in all_susp if s.get("_new"))}
+        connection_checks: Dict[str, List[str]] = {}
+        for s in all_susp:
+            if s.pop("_connection_review", False):
+                connection_checks.setdefault(s["inverter_id"], []).append(s["string_id"])
+        res.metrics["connection_checks"] = {inv: len(ids) for inv, ids in connection_checks.items()}
+        ctx.shared["connection_checks"] = connection_checks
         for s in all_susp:
             s.pop("_new", None); s.pop("_hard", None)
         res.artifacts = {"suspects": all_susp}
@@ -99,6 +106,11 @@ class DetectAgent(Agent):
                 c["first_date"] = a.get("first_date") or a["date"]
                 c["created_at"] = a["created_at"]
                 c["status"] = a["status"]
+                if c.get("_connection_review"):
+                    c["status"] = SuspectStatus.REVIEWING.value
+                    c["_new"] = False
+                    out.append(c)
+                    continue
                 # 分级只升不降；C（朝向/档案解释）是对偏差的"解释"，优先于 B 的"未知低发"
                 escalated = SEVERITY.get(c["grade"], 9) < SEVERITY.get(a["grade"], 9)
                 # 已被解释为朝向/档案差异（C）的案例：非晴好天"沿用持续低发"给出的 B 不能推翻解释，只有 A 级硬证据才升级
@@ -221,6 +233,13 @@ class DetectAgent(Agent):
         hist_by: Dict[str, List[Dict]] = {sid: g.to_dict("records") for sid, g in sig_hist.groupby("string_id", sort=False)} if not sig_hist.empty else {}
         outage_cut = (d - timedelta(days=7)).isoformat()
         prof_rows = prof.to_dict("index"); ft_rows = ft.to_dict("index")
+        unused_inputs, last_production = input_evidence(ctx.store, station_id, d, th.zero_current_a)
+        zero_context = zero_output_context(ctx.store, station_id, today, th.zero_current_a)
+        producing_inverters = {
+            prof_rows[sid]["inverter_id"] for sid, f in ft_rows.items()
+            if sid in prof_rows and not f["stuck"] and f["noon_median_i"] >= th.zero_current_a
+            and prof_rows[sid].get("connection_status") != "unused"
+        }
         rainy_caution = weather == "clear" and ("n_clear_recent" in bl and bl["n_clear_recent"].max() <= 1)
         # 近 10 个晴好天偏差的离散度：朝向差异是恒定的（std 很小），积灰/衰减会漂移
         dev_hist = ctx.store.query(
@@ -233,8 +252,10 @@ class DetectAgent(Agent):
         sig_rows: List[Dict] = []
         for sid, b in bl.to_dict("index").items():
             p = prof_rows.get(sid)
-            if p is None:
+            if p is None or sid in unused_inputs:
                 continue
+            modules = p.get("n_modules")
+            documented = p.get("connection_status") == "connected" or (pd.notna(modules) and modules > 0)
             f = ft_rows.get(sid)
             h = hist_by.get(sid, [])
             ref = ref_orient.get(p["inverter_id"])
@@ -267,14 +288,30 @@ class DetectAgent(Agent):
                              "voltage_offset": v_off, "outage_slots": out_slots, "tracker_flag": int(sig.tracker_stuck)})
             grade, cause, notes = self._grade(b, sig, p, zero_streak.get(sid, 0), stuck_streak.get(sid, 0),
                                               weather, dip_days, th, tracker_days)
+            evidence = zero_context.get(sid, {})
+            if "voltage_ratio" in evidence:
+                sig.notes.append(f"低电流电压为同机 {evidence['voltage_peer_count']} 路发电通道电压中位数的 {evidence['voltage_ratio']:.0%}")
+            if evidence.get("same_model_channel_zero", 0) >= 2:
+                sig.notes.append(f"同型号同通道号在 {evidence['same_model_channel_reporting']} 台有采样的逆变器中有 "
+                                 f"{evidence['same_model_channel_zero']} 台为零，优先核对接线布局和测点映射")
             if grade is None:
                 continue
-            # 空输入：华为/阳光每 MPPT 两路，只接一路时另一路读到共压电压、电流恒 0。档案未登记组件数且同 MPPT 兄弟路正常 → 不是断线
-            if cause == Cause.OPEN_CIRCUIT.value and sig.zero_all_day and self._is_empty_input(sid, p, prof_rows, ft_rows, th):
-                grade, cause = Grade.E.value, Cause.DATA_ISSUE.value
-                notes = ["同 MPPT 另一路在正常发电、档案未登记组件数 → 判为空输入（共压读到电压、电流 0），不报断线；现场确有接线请补档案 n_modules"]
-                sig.notes.append(notes[0])
-
+            connection_review = False
+            if cause == Cause.OPEN_CIRCUIT.value and sig.zero_all_day:
+                inverter = inv_daily.loc[p["inverter_id"]] if p["inverter_id"] in inv_daily.index else {}
+                expected = f.get("n_daytime_expected") or 0
+                sufficient = expected > 0 and f["n_missing"] <= expected * 0.2
+                producing_peer = p["inverter_id"] in producing_inverters
+                low_v = f.get("noon_low_current_v")
+                if pd.notna(low_v):
+                    sig.notes.append(f"中午低电流时电压中位数 {low_v:.1f} V（{f['noon_low_current_v_n']} 个有效电压点）")
+                if not ((documented or sid in last_production) and sufficient
+                        and producing_peer and not inverter.get("offline_flag")):
+                    connection_review = True
+                    grade, cause = Grade.C.value, Cause.PROFILE_ERROR.value
+                    notes = [f"零发电待核查：接入档案={'已接入' if documented else '待核实'}，"
+                             f"最近有效发电={last_production.get(sid, '无记录')}，"
+                             f"缺测={f['n_missing']}/{expected}，同机有发电={'是' if producing_peer else '否'}"]
             # 冷启动（该串晴好天基线样本不足）：仅凭互比偏差不下 B 级结论——只做同日互比、进观察带
             if grade == Grade.B.value and int(b.get("cold_start", 0) or 0) == 1 and not (sig.dip_depth or sig.outage_hours or sig.inverter_level):
                 grade = th.cold_start_cap_grade
@@ -294,7 +331,7 @@ class DetectAgent(Agent):
             persist = int(b["persist_days_5"]) if grade == Grade.B.value else int(b["persist_days_3"])
             persist = max(persist, dip_days + 1 if sig.dip_depth is not None else 0, streak)
             hard = bool(sig.dip_depth is not None or sig.outage_hours or sig.zero_all_day or sig.stuck or sig.voltage_offset is not None or sig.tracker_stuck)
-            out.append({"_hard": hard,
+            out.append({"_hard": hard, "_connection_review": connection_review,
                 "suspect_id": f"{sid}@{case_date}", "string_id": sid, "inverter_id": p["inverter_id"],
                 "station_id": station_id, "date": today, "scope": "string", "grade": grade, "rule_cause": cause,
                 "dev_today": None if pd.isna(b["dev_today"]) else float(b["dev_today"]),
@@ -347,22 +384,6 @@ class DetectAgent(Agent):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)      # 夜间槽全 NaN 属正常
             return {k: np.nanmedian(np.vstack(v), axis=0) for k, v in curves.items() if len(v) >= 3}
-
-    @staticmethod
-    def _is_empty_input(sid: str, p: Dict, prof_rows: Dict[str, Dict], ft_rows: Dict[str, Dict], th) -> bool:
-        nm = p.get("n_modules")
-        if nm is not None and not pd.isna(nm) and float(nm) > 0:
-            return False                                   # 档案说接了组件 → 0 电流就是真断线
-        mp = p.get("mppt")
-        if mp is None or pd.isna(mp):
-            return False
-        for osid, op in prof_rows.items():
-            if osid == sid or op.get("inverter_id") != p.get("inverter_id") or op.get("mppt") != mp:
-                continue
-            f = ft_rows.get(osid)
-            if f is not None and not f.get("zero_all_day") and not pd.isna(f.get("noon_median_i")) and f.get("noon_median_i", 0) >= th.zero_current_a:
-                return True
-        return False
 
     @staticmethod
     def _voltage_offsets(ft: pd.DataFrame, prof: pd.DataFrame, bl: pd.DataFrame) -> Dict[str, float]:

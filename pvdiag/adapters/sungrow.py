@@ -57,6 +57,7 @@ class SungrowAdapter(PlatformAdapter):
         self.ps_id = str(self.config.get("ps_id", station_id))
         self.redirect_uri = self.config.get("redirect_uri", "https://www.baidu.com/")
         pm = self.config.get("points_map") or {}
+        self.custom_strings = bool(pm.get("strings"))
         self.points_map: Dict[str, Any] = {"pac": pm.get("pac", SG110CX_POINTS["pac"]),
                                            "strings": {int(k): v for k, v in (pm.get("strings") or SG110CX_POINTS["strings"]).items()}}
         self.window_hours = int(self.config.get("window_hours", 3))
@@ -152,8 +153,10 @@ class SungrowAdapter(PlatformAdapter):
         for x in d.get("pageList") or []:
             if int(x.get("device_type", 1)) != 1:
                 continue
+            model = x.get("device_model_code") or ""
+            n_strings = 4 if model == "SG40CX-P3-CN" and not self.custom_strings else len(self.points_map["strings"])
             rows.append({"inverter_id": f"{self.station_id}-{_norm_inv_name(x.get('device_name'))}", "name": x.get("device_name", ""),
-                         "model": x.get("device_model_code", ""), "rated_ac_kw": None, "n_strings": len(self.points_map["strings"]),
+                         "model": x.get("device_model_code", ""), "rated_ac_kw": None, "n_strings": n_strings,
                          "ps_key": str(x.get("ps_key")), "sn": x.get("device_sn", "")})
         return pd.DataFrame(rows)
 
@@ -170,9 +173,12 @@ class SungrowAdapter(PlatformAdapter):
             return res
         pac_pt = self.points_map["pac"]
         smap: Dict[int, Dict[str, str]] = self.points_map["strings"]
-        points = [pac_pt] + [p for m in smap.values() for p in (m["u"], m["i"])]
-        inv_by_key = dict(zip(devs["ps_key"], devs["inverter_id"]))
-        keys = list(inv_by_key.keys())
+        device_groups = []
+        is_four_input = devs["model"].eq("SG40CX-P3-CN") & (not self.custom_strings)
+        for four_input, devices in devs.groupby(is_four_input):
+            channel_map = {n: v for n, v in smap.items() if not four_input or n <= 4}
+            points = [pac_pt] + [point for pair in channel_map.values() for point in (pair["u"], pair["i"])]
+            device_groups.append((dict(zip(devices["ps_key"], devices["inverter_id"])), points, channel_map))
         s_rows: List[Dict[str, Any]] = []
         i_rows: List[Dict[str, Any]] = []
         d = start
@@ -181,12 +187,14 @@ class SungrowAdapter(PlatformAdapter):
                 h1 = min(h + self.window_hours, 24)
                 st_ = f"{d:%Y%m%d}{h:02d}0000"
                 en_ = f"{d:%Y%m%d}{h1:02d}0000" if h1 < 24 else f"{d:%Y%m%d}235959"
-                for k in range(0, len(keys), 50):
-                    data = self._post("/openapi/platform/getDevicePointMinuteDataList",
-                                      {"ps_key_list": keys[k:k + 50], "points": ",".join(points), "start_time_stamp": st_,
-                                       "end_time_stamp": en_, "minute_interval": "5", "is_get_point_dict": "0"})
-                    res.calls_used += 1
-                    self._collect(data, inv_by_key, pac_pt, smap, s_rows, i_rows, self.pac_divisor)
+                for inv_by_key, points, channel_map in device_groups:
+                    keys = list(inv_by_key)
+                    for k in range(0, len(keys), 50):
+                        data = self._post("/openapi/platform/getDevicePointMinuteDataList",
+                                          {"ps_key_list": keys[k:k + 50], "points": ",".join(points), "start_time_stamp": st_,
+                                           "end_time_stamp": en_, "minute_interval": "5", "is_get_point_dict": "0"})
+                        res.calls_used += 1
+                        self._collect(data, inv_by_key, pac_pt, channel_map, s_rows, i_rows, self.pac_divisor)
             d += timedelta(days=1)
         res.strings = self.normalize_strings(pd.DataFrame(s_rows, columns=STRING_COLS))
         res.inverters = self.normalize_inverters(pd.DataFrame(i_rows, columns=INVERTER_COLS))
