@@ -29,9 +29,13 @@ class GinlongAdapter(PlatformAdapter):
         self.base_url = self.config.get("base_url", "https://api.ginlong.com:13333")      # 现网实测地址；soliscloud.com:13333 亦可
         self.min_interval = float(self.config.get("min_interval_seconds", 0.65))             # 接口频率限制 2 次/秒
         self._last_call_at = None
-        self.key_id = self.config.get("key_id")
-        self.key_secret = (self.config.get("key_secret") or "").encode()
-        self.plant_id = self.config.get("plant_id", station_id)
+        import os, re
+        self.key_id = str(self.config.get("key_id") or self.config.get("api_id") or "")
+        env = self.config.get("key_secret_env")
+        self.key_secret = ((os.environ.get(env) if env else None) or self.config.get("key_secret") or self.config.get("api_secret") or "").encode()
+        self.plant_id = self.config.get("plant_id") or self.config.get("station_id_remote")      # 不填则取该账号下全部逆变器
+        self.id_style = self.config.get("id_style", "name")                                       # name | sn
+        self._safe = lambda x: re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff-]", "", re.sub(r"\s+", "", str(x or ""))) or "INV"
         self.pac_divisor = float(self.config.get("pac_divisor", 1000.0))
         self.timeout = int(self.config.get("timeout", 60))
         self.max_strings = int(self.config.get("max_strings", 32))
@@ -61,22 +65,37 @@ class GinlongAdapter(PlatformAdapter):
         return res
 
     # ------------------------------------------------------------------
+    def list_stations(self) -> pd.DataFrame:
+        res = self._post("/v1/api/userStationList", {"pageNo": 1, "pageSize": 50})
+        rows = [{"plant_id": str(d.get("id")), "name": d.get("stationName"), "capacity_kw": d.get("capacity"), "inverters": d.get("inverterCount")}
+                for d in (res.get("data", {}) or {}).get("page", {}).get("records", [])]
+        return pd.DataFrame(rows)
+
     def list_devices(self) -> pd.DataFrame:
-        res = self._post("/v1/api/inverterList", {"pageNo": 1, "pageSize": 100, "stationId": self.plant_id})
+        body = {"pageNo": 1, "pageSize": 100}
+        if self.plant_id:
+            body["stationId"] = str(self.plant_id)
+        res = self._post("/v1/api/inverterList", body)
         rows = []
         for d in (res.get("data", {}) or {}).get("page", {}).get("records", []):
-            rows.append({"inverter_id": str(d.get("sn")), "name": d.get("name", d.get("sn")),
-                         "model": d.get("productModel", ""), "rated_ac_kw": d.get("power"), "n_strings": None})
+            sn = str(d.get("sn"))
+            name = d.get("name") or sn
+            inv_id = f"{self.station_id}-{self._safe(name)}" if self.id_style == "name" else f"{self.station_id}-{sn}"
+            rows.append({"inverter_id": inv_id, "name": name, "model": d.get("productModel", ""), "rated_ac_kw": d.get("power"),
+                         "n_strings": None, "sn": sn, "plant_id": str(d.get("stationId", self.plant_id or ""))})
         return pd.DataFrame(rows)
 
     def fetch(self, start: date, end: date) -> FetchResult:
         res = FetchResult()
         devs = self.list_devices()
+        if devs.empty:
+            res.notes.append("账号下没有逆变器（检查 plant_id 或密钥授权）")
+            return res
         s_rows: List[Dict[str, Any]] = []
         i_rows: List[Dict[str, Any]] = []
         d = start
         while d <= end:
-            for sn in devs["inverter_id"].tolist():
+            for inv_id, sn in zip(devs["inverter_id"], devs["sn"]):
                 body = self._post("/v1/api/inverterDay",
                                   {"sn": sn, "money": "CNY", "time": d.isoformat(), "timeZone": "8"})
                 res.calls_used += 1
@@ -85,13 +104,13 @@ class GinlongAdapter(PlatformAdapter):
                     ts = pd.to_datetime(rec.get("timeStr"), errors="coerce") if rec.get("timeStr") else \
                         pd.to_datetime(int(rec.get("dataTimestamp")), unit="ms") + timedelta(hours=8)
                     pac = rec.get("pac")
-                    i_rows.append({"inverter_id": sn, "ts": ts,
+                    i_rows.append({"inverter_id": inv_id, "ts": ts,
                                    "pac_kw": (float(pac) / self.pac_divisor) if pac is not None else None,
                                    "status": rec.get("state")})
                     for n in range(1, self.max_strings + 1):
                         ci, cu = f"iPv{n}", f"uPv{n}"
                         if ci in rec and rec[ci] is not None:
-                            s_rows.append({"string_id": f"{sn}-pv{n}", "ts": ts,
+                            s_rows.append({"string_id": f"{inv_id}-pv{n}", "ts": ts,
                                            "current_a": rec[ci], "voltage_v": rec.get(cu)})
             d += timedelta(days=1)
         res.strings = self.normalize_strings(pd.DataFrame(s_rows, columns=STRING_COLS))
