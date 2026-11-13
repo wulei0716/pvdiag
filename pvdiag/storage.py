@@ -128,7 +128,7 @@ _MIGRATIONS = {
     "daily_features": {"stale_run_min": "INTEGER", "noon_zero_frac": "REAL"},
     "baselines": {"group_noise": "REAL", "orient_exp_ratio": "REAL"},
     "station_daily": {"irradiance_source": "TEXT"},
-    "strings": {"device_type": "TEXT", "module_type": "TEXT", "n_parallel": "INTEGER"},
+    "strings": {"device_type": "TEXT", "module_type": "TEXT", "n_parallel": "INTEGER", "connection_status": "TEXT", "connection_source": "TEXT"},
     "signatures": {"outage_slots": "INTEGER", "tracker_flag": "INTEGER"},
     "model_registry": {"status": "TEXT", "holdout_json": "TEXT"},
     "pipeline_runs": {"attempt": "INTEGER"},

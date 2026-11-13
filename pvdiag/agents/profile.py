@@ -68,6 +68,14 @@ class ProfileAgent(Agent):
         df["module_type"] = df["module_type"].fillna("mono") if "module_type" in df.columns else "mono"
         # 并联串数：一路 MPPT 接了两串并联时填 2（电流翻倍不是别人低）；默认 1
         df["n_parallel"] = pd.to_numeric(df["n_parallel"], errors="coerce").fillna(1).clip(lower=1).astype(int) if "n_parallel" in df.columns else 1
+        connection_fields = ["connection_status", "connection_source"]
+        existing = store.query("SELECT string_id, connection_status, connection_source FROM strings").set_index("string_id")
+        for field in connection_fields:
+            if field not in df:
+                df[field] = df["string_id"].map(existing[field])
+        statuses = df["connection_status"].dropna()
+        if not statuses.isin(["connected", "unused", "unknown"]).all():
+            raise ValueError("connection_status 必须为 connected、unused 或 unknown")
         df["group_key"] = df.apply(make_group_key, axis=1)
         df["updated_at"] = datetime.now().isoformat()
         return store.upsert_df("strings", df)
