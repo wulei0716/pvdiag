@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from ..models import SuspectStatus
+from ..models import Cause, SuspectStatus
 from .base import Agent, AgentContext, AgentResult
 
 ACTIVE = (SuspectStatus.OPEN.value, SuspectStatus.REVIEWING.value, SuspectStatus.CONFIRMED.value,
@@ -104,7 +104,7 @@ class LossAgent(Agent):
             return None
         f = f.iloc[0]
         base = {"string_id": sid, "date": today, "suspect_id": s["suspect_id"], "lost_kwh": 0.0, "lost_yuan": 0.0, "quantified": 1}
-        if f["stuck"]:
+        if f["stuck"] or s["rule_cause"] in (Cause.DATA_ISSUE.value, Cause.PROFILE_ERROR.value):
             return {**base, "quantified": 0}             # 数据问题：实际发电未知 → 待量化
         # 群组曲线
         grp_key, level = (b["group_key"].iloc[0], b["group_level"].iloc[0]) if not b.empty else (None, "none")
@@ -132,15 +132,19 @@ class LossAgent(Agent):
         prices, tou = self._prices(ctx, s["station_id"])
         default_price = ctx.settings.loss.default_price_yuan_per_kwh
         kwh = yuan = 0.0
+        valid_slots = 0
         for k in range(len(g_i)):
             if k in limited or np.isnan(g_i[k]) or g_i[k] < 0.3 or np.isnan(g_v[k]):
                 continue
-            a = 0.0 if np.isnan(actual[k]) else actual[k]
+            if np.isnan(actual[k]):
+                continue
+            valid_slots += 1
+            a = actual[k]
             gap = max(0.0, g_i[k] * ratio - a)
             e = gap * g_v[k] * (cfg.slot_minutes / 60.0) / 1000.0
             kwh += e
             yuan += e * self._price_for_slot(k, cfg.slot_minutes, prices, tou, default_price)
-        return {**base, "lost_kwh": round(kwh, 3), "lost_yuan": round(yuan, 2)}
+        return {**base, "lost_kwh": round(kwh, 3), "lost_yuan": round(yuan, 2), "quantified": int(valid_slots > 0)}
 
     def _inverter_day_loss(self, ctx: AgentContext, s: Dict, d: date) -> Optional[Dict]:
         today = d.isoformat()
@@ -158,13 +162,13 @@ class LossAgent(Agent):
 
     # ------------------------------------------------------------------ 台账
     @staticmethod
-    def ledger_summary(store) -> Dict:
+    def ledger_summary(store, unused_inputs=()) -> Dict:
         df = store.query(
             "SELECT l.suspect_id, l.string_id, s.station_id, s.grade, s.rule_cause, s.status, "
             "SUM(l.lost_kwh) lost_kwh, SUM(l.lost_yuan) lost_yuan, MIN(l.date) since, MAX(l.date) until, "
             "COUNT(*) days, SUM(1-l.quantified) unquantified_days "
             "FROM loss_ledger l JOIN suspects s ON s.suspect_id=l.suspect_id GROUP BY l.suspect_id ORDER BY lost_yuan DESC")
-        open_df = df[df["status"].isin(ACTIVE)] if not df.empty else df
+        open_df = df[df["status"].isin(ACTIVE) & ~df["string_id"].isin(unused_inputs)] if not df.empty else df
         by_station = open_df.groupby("station_id")[["lost_kwh", "lost_yuan"]].sum().round(1).to_dict("index") if not open_df.empty else {}
         monthly = store.query("SELECT substr(date,1,7) month, SUM(lost_kwh) lost_kwh, SUM(lost_yuan) lost_yuan FROM loss_ledger GROUP BY month ORDER BY month")
         return {

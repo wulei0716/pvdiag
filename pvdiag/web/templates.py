@@ -134,7 +134,7 @@ INDEX = r"""{% extends "base.html" %}{% set active='index' %}{% block title %}�
  <section class="panel">
   <div class="station-head"><h3>{{ h.name }}</h3>
    <span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}{% if h.weather.get('noon_power') %} · 中午 {{ h.weather.noon_power|num(0) }} kW / 峰值参考 {{ h.weather.peak_ref|num(0) }} kW{% endif %}</span>
-   <span class="muted small">{{ h.n_strings }} 串 · 在办案例 {{ h.n_cases }}{% if h.n_dead %} · 0 电流 {{ h.n_dead }}{% endif %}</span>
+   <span class="muted small">{{ h.n_strings }} 路待诊断{% if h.n_unused %} · 空端口 {{ h.n_unused }}{% endif %} · 在办案例 {{ h.n_cases }}{% if h.n_dead %} · 0 电流 {{ h.n_dead }}{% endif %}</span>
    <a class="small" style="margin-left:auto" href="/strings?station={{h.station_id}}">放大 →</a></div>
   {{ h.svg|safe }}
  </section>
@@ -175,7 +175,7 @@ STRINGS = r"""{% extends "base.html" %}{% set active='strings' %}{% block title 
   <form class="inline" method="get"><input type="hidden" name="station" value="{{station}}"><select name="d" onchange="this.form.submit()">{% for x in dates %}<option {% if x==date %}selected{% endif %}>{{x}}</option>{% endfor %}</select></form>
  </div></div>
 {% for h in heat %}<section class="panel" style="margin-bottom:16px">
- <div class="station-head"><h3>{{ h.name }}</h3><span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}</span><span class="muted small">{{ h.n_strings }} 串 · {{ h.inverters|length }} 台逆变器 · 在办案例 {{ h.n_cases }}</span></div>
+ <div class="station-head"><h3>{{ h.name }}</h3><span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}</span><span class="muted small">{{ h.n_strings }} 路待诊断{% if h.n_unused %} · 空端口 {{ h.n_unused }}{% endif %} · {{ h.inverters|length }} 台逆变器 · 在办案例 {{ h.n_cases }}</span></div>
  {{ h.svg|safe }}
 </section>{% else %}<section class="panel"><p class="empty">无数据</p></section>{% endfor %}
 <div class="legend"><span><i style="background:var(--c-cell-ok)"></i>正常</span><span><i style="background:var(--c-cell-watch)"></i>-3%~-5%</span><span><i style="background:var(--c-cell-low)"></i>-5%~-15%</span><span><i style="background:var(--c-cell-bad)"></i>&lt;-15%</span><span><i style="background:var(--c-cell-dead)"></i>0 电流</span><span><i style="background:var(--c-cell-na)"></i>无数据</span><span><i class="ring"></i>A 级</span><span><i class="ringb"></i>B 级</span><span>虚线框 = C/D/E 观察</span></div>

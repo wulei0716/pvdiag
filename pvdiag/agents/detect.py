@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from ..features import slot_label
+from ..connections import input_evidence
 from ..models import Cause, Grade, Signature, SuspectStatus
 from ..solar import TRACKER_MOUNTS, tracker_stuck_fit
 from .base import Agent, AgentContext, AgentResult
@@ -232,19 +233,7 @@ class DetectAgent(Agent):
         hist_by: Dict[str, List[Dict]] = {sid: g.to_dict("records") for sid, g in sig_hist.groupby("string_id", sort=False)} if not sig_hist.empty else {}
         outage_cut = (d - timedelta(days=7)).isoformat()
         prof_rows = prof.to_dict("index"); ft_rows = ft.to_dict("index")
-        last_production = dict(ctx.store.query(
-            "SELECT f.string_id, MAX(f.date) AS last_date FROM daily_features f "
-            "JOIN strings s ON s.string_id=f.string_id WHERE s.station_id=? AND f.date<? "
-            "AND f.day_energy_kwh>0 AND f.noon_median_i>=? AND f.stuck=0 GROUP BY f.string_id",
-            (station_id, today, th.zero_current_a)).itertuples(index=False, name=None))
-        # Only infer an unused input after eight complete calendar days of observed zero.
-        recent = feats[feats["date"] >= (d - timedelta(days=7)).isoformat()]
-        observed_zero = recent[
-            (recent["zero_all_day"] == 1) & (recent["day_energy_kwh"] == 0)
-            & (recent["stuck"] == 0) & (recent["n_daytime_expected"] > 0)
-            & (recent["n_missing"] <= recent["n_daytime_expected"] * 0.25)
-        ]
-        unused_by_history = set(observed_zero.groupby("string_id")["date"].nunique().loc[lambda n: n == 8].index)
+        unused_inputs, last_production = input_evidence(ctx.store, station_id, d, th.zero_current_a)
         producing_inverters = {
             prof_rows[sid]["inverter_id"] for sid, f in ft_rows.items()
             if sid in prof_rows and not f["stuck"] and f["noon_median_i"] >= th.zero_current_a
@@ -262,12 +251,10 @@ class DetectAgent(Agent):
         sig_rows: List[Dict] = []
         for sid, b in bl.to_dict("index").items():
             p = prof_rows.get(sid)
-            if p is None or p.get("connection_status") == "unused":
+            if p is None or sid in unused_inputs:
                 continue
             modules = p.get("n_modules")
             documented = p.get("connection_status") == "connected" or (pd.notna(modules) and modules > 0)
-            if sid in unused_by_history and not documented and sid not in last_production:
-                continue
             f = ft_rows.get(sid)
             h = hist_by.get(sid, [])
             ref = ref_orient.get(p["inverter_id"])
