@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from .connections import zero_output_context
 from .agents.loss import LossAgent
 from .config import Settings
 from .storage import Store
@@ -50,6 +51,14 @@ def case_dossier(store: Store, suspect_id: str, settings: Optional[Settings] = N
     if s["scope"] == "string":
         p = store.query("SELECT pv_index, n_modules, module_model, azimuth, tilt, roof_area, known_shading, shading_note, group_key FROM strings WHERE string_id=?", (s["string_id"],))
         d["profile"] = p.iloc[0].to_dict() if not p.empty else {}
+        evidence = store.query(
+            "SELECT noon_median_v, noon_low_current_v, noon_low_current_v_n, "
+            "noon_current_valid_n, noon_n, noon_zero_frac, n_missing, n_daytime_expected "
+            "FROM daily_features WHERE string_id=? AND date=?", (s["string_id"], s["date"]))
+        d["measurement_evidence"] = evidence.astype(object).where(evidence.notna(), None).to_dict("records")[0] if not evidence.empty else {}
+        d["zero_output_context"] = zero_output_context(
+            store, s["station_id"], s["date"], settings.thresholds.zero_current_a if settings else 0.5
+        ).get(s["string_id"], {})
         tr = store.query("SELECT date, weather_tag, dev_today, group_noise, baseline_ratio, baseline_n, orient_exp_ratio FROM baselines "
                          "WHERE string_id=? AND date<=? ORDER BY date DESC LIMIT 20", (s["string_id"], s["date"]))
         d["recent_days"] = [{k: (None if pd.isna(v) else (round(float(v), 4) if isinstance(v, float) else v)) for k, v in r.items()}

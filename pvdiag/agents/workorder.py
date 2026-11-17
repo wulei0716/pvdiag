@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from ..connections import latest_unused_inputs
 from ..models import Action, Cause, EventType, SuspectStatus, WorkOrderStatus
 from .base import Agent, AgentContext, AgentResult
 from .loss import LossAgent
@@ -166,8 +167,12 @@ class WorkOrderAgent(Agent):
         cand = ctx.store.query(
             "SELECT s.*, v.cause ai_cause, v.confidence, v.action, v.explanation FROM suspects s "
             "LEFT JOIN verdicts v ON v.suspect_id=s.suspect_id "
-            "WHERE s.grade != '已备案' AND (s.status=? OR (s.status='open' AND v.action=?))",
-            (SuspectStatus.CONFIRMED.value, Action.DISPATCH.value))
+            "WHERE s.grade != '已备案' AND (s.status=? OR (s.status='open' AND v.action=? AND s.date=?))",
+            (SuspectStatus.CONFIRMED.value, Action.DISPATCH.value, today))
+        if cand.empty:
+            return []
+        unused = latest_unused_inputs(ctx.store, ctx.run_date, ctx.settings.thresholds.zero_current_a)
+        cand = cand[~cand["string_id"].isin(unused)]
         if cand.empty:
             return []
         # 已在工单中的嫌疑不重复
@@ -178,7 +183,7 @@ class WorkOrderAgent(Agent):
         if cand.empty:
             return []
         # 档案问题不派现场（朝向/档案差异）→ 只在复核界面处理
-        cand = cand[~cand["rule_cause"].isin([Cause.ORIENTATION.value, Cause.PROFILE_ERROR.value, Cause.CURTAILMENT.value])]
+        cand = cand[~cand["rule_cause"].isin([Cause.ORIENTATION.value, Cause.PROFILE_ERROR.value, Cause.CURTAILMENT.value, Cause.DATA_ISSUE.value])]
         if cand.empty:
             return []
         prof = ctx.store.strings().set_index("string_id")

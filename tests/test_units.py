@@ -68,3 +68,28 @@ def test_settings_roundtrip(tmp_path):
     s.dump(tmp_path / "c.yaml")
     s2 = Settings.load(tmp_path / "c.yaml")
     assert s2.thresholds.fault_floor == -0.06 and s2.data_dir == tmp_path / "d"
+
+
+def test_missing_current_is_preserved_in_daily_features():
+    import json
+    from datetime import date
+
+    import pandas as pd
+
+    from pvdiag.config import Settings
+    from pvdiag.features import compute_string_daily
+
+    day = date(2026, 11, 16)
+    samples = pd.DataFrame({
+        "string_id": ["mixed", "mixed", "mixed", "zero", "missing"],
+        "ts": pd.to_datetime([f"{day} {t}" for t in ("12:00", "12:05", "12:30", "12:00", "12:00")]),
+        "current_a": [8.0, None, None, 0.0, None],
+        "voltage_v": [600.0] * 5,
+    })
+    settings = Settings()
+    features = compute_string_daily(samples, day, settings.baseline, settings.thresholds).set_index("string_id")
+    assert features.loc["mixed", "noon_median_i"] == 8.0
+    assert json.loads(features.loc["mixed", "i_profile_json"])[24:26] == [8.0, None]
+    assert features.loc["zero", "zero_all_day"] == 1
+    assert features.loc["missing", "zero_all_day"] == 0
+    assert pd.isna(features.loc["missing", "noon_median_i"])

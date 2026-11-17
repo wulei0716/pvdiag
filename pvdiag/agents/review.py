@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+from ..connections import latest_unused_inputs
 from ..models import Action, Cause, Grade, REJECT_REASONS, SuspectStatus
 from .base import Agent, AgentContext, AgentResult
 
@@ -33,7 +34,7 @@ class ReviewAgent(Agent):
                                   [(SuspectStatus.REVIEWING.value, sid) for sid in q["suspect_id"]])
         stats = self.stats(ctx.store, days=ctx.settings.dispatch.auto_gate_window_days)
         advice = self.threshold_advice(stats, ctx.settings.thresholds.fault_floor)
-        pending = self.queue(ctx.store)
+        pending = self.queue(ctx.store, through=ctx.run_date, zero_current_a=ctx.settings.thresholds.zero_current_a)
         res.metrics = {"queued_today": int(len(q)), "pending_total": int(len(pending)), **stats}
         res.artifacts = {"advice": advice, "pending_by_station": pending.groupby("station_id").size().to_dict() if not pending.empty else {}}
         ctx.shared["review_stats"] = stats
@@ -44,7 +45,8 @@ class ReviewAgent(Agent):
 
     # ------------------------------------------------------------------ 队列
     @staticmethod
-    def queue(store, station_id: Optional[str] = None, grades: Optional[List[str]] = None) -> pd.DataFrame:
+    def queue(store, station_id: Optional[str] = None, grades: Optional[List[str]] = None, *, through: Optional[date] = None,
+              zero_current_a: float = 0.5) -> pd.DataFrame:
         sql = ("SELECT s.*, v.cause AS ai_cause, v.confidence, v.action, v.explanation FROM suspects s "
                "LEFT JOIN verdicts v ON v.suspect_id=s.suspect_id WHERE s.status IN ('open','reviewing') "
                "AND s.grade != '已备案'")
@@ -56,7 +58,8 @@ class ReviewAgent(Agent):
             sql += f" AND s.grade IN ({','.join('?' * len(grades))})"
             params.extend(grades)
         sql += " ORDER BY CASE s.grade WHEN 'A' THEN 0 WHEN 'B' THEN 1 WHEN 'C' THEN 2 WHEN 'D' THEN 3 ELSE 4 END, s.dev_today"
-        return store.query(sql, params)
+        rows = store.query(sql, params)
+        return rows[~rows["string_id"].isin(latest_unused_inputs(store, through or date.today(), zero_current_a))]
 
     # ------------------------------------------------------------------ 操作
     @staticmethod

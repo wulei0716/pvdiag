@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 
-from .base import FetchResult, PlatformAdapter, STRING_COLS, INVERTER_COLS
+from .base import PlatformAuthorizationError, FetchResult, PlatformAdapter, STRING_COLS, INVERTER_COLS
 
 
 class QuotaPlanner:
@@ -104,7 +104,7 @@ class HuaweiAdapter(PlatformAdapter):
             self.session.cookies.set("XSRF-TOKEN", st["token"])
             return st["token"]
         if not self.user or not self.system_code:
-            raise RuntimeError("华为北向凭证缺失：platform_config 需要 user_name / system_code（或 system_code_env）")
+            raise PlatformAuthorizationError("华为北向凭证缺失：platform_config 需要 user_name / system_code（或 system_code_env）")
         r = self.session.post(f"{self.base_url}/thirdData/login",
                               json={"userName": self.user, "systemCode": self.system_code}, timeout=self.timeout)
         self._count_call(1)

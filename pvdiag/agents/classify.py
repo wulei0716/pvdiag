@@ -223,6 +223,8 @@ class ClassifyAgent(Agent):
         if s["grade"] == Grade.C.value or cause in (Cause.ORIENTATION.value, Cause.PROFILE_ERROR.value):
             return Action.REVIEW.value          # 档案问题：核排布图，不派现场
         if s["grade"] in (Grade.A.value, Grade.B.value) and conf >= c.high:
+            if s.get("low_confidence") or cause == Cause.DATA_ISSUE.value or s["rule_cause"] == Cause.DATA_ISSUE.value:
+                return Action.REVIEW.value
             return Action.DISPATCH.value
         if conf >= c.mid:
             return Action.REVIEW.value

@@ -175,3 +175,42 @@ def test_huawei_station_end_to_end_with_auto_profile(monkeypatch, tmp_path):
     assert empties[empties["grade"] == "A"].empty, empties.to_dict("records")
     # 低发串在冷启动期（5 天）至少进观察带
     assert not susp[susp["string_id"] == "HW1-NB02-pv7"].empty, susp.to_dict("records")
+
+
+def test_ginlong_signature_and_inverter_day_flow(monkeypatch):
+    """锦浪：HMAC-SHA1 签名头（Content-Type 不带 charset）、userStationList/inverterList/inverterDay 链路、timeStr 时间、pac W→kW、按名字命名"""
+    import base64, hashlib, hmac, json as _json
+    import requests
+    from pvdiag.adapters.ginlong import GinlongAdapter
+    seen = []
+
+    def fake_post(url, data=None, headers=None, timeout=None, **kw):
+        path = url.split(":13333")[1]
+        seen.append((path, _json.loads(data), headers))
+        assert headers["Content-Type"] == "application/json" and headers["Authorization"].startswith("API kid:")
+        md5 = base64.b64encode(hashlib.md5(data.encode()).digest()).decode()
+        assert headers["Content-MD5"] == md5
+        sign = base64.b64encode(hmac.new(b"ksec", f"POST\n{md5}\napplication/json\n{headers['Date']}\n{path}".encode(), hashlib.sha1).digest()).decode()
+        assert headers["Authorization"] == f"API kid:{sign}"
+        if path == "/v1/api/userStationList":
+            return _FakeResp({"success": True, "code": "0", "data": {"page": {"records": [{"id": "1300", "stationName": "乾呈格来", "capacity": 500, "inverterCount": 9}]}}})
+        if path == "/v1/api/inverterList":
+            return _FakeResp({"success": True, "code": "0", "data": {"page": {"records": [{"sn": "SN001", "name": "1号逆变器", "productModel": "S5-GC100K", "power": 100, "stationId": "1300"}]}}})
+        if path == "/v1/api/inverterDay":
+            assert data and _json.loads(data)["timeZone"] == "8"
+            return _FakeResp({"success": True, "code": "0", "data": [
+                {"timeStr": "2026-11-10 12:00:00", "dataTimestamp": "1794283200000", "pac": 85600, "state": 1, "iPv1": 9.1, "uPv1": 640.0, "iPv2": 0.0, "uPv2": 641.0, "iPv3": None},
+                {"timeStr": "2026-11-10 12:05:00", "dataTimestamp": "1794283500000", "pac": 86000, "state": 1, "iPv1": 9.2, "uPv1": 639.0, "iPv2": 0.0, "uPv2": 640.0}]})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setenv("PVDIAG_GL_TEST", "ksec")
+    a = GinlongAdapter("QCGL", {"key_id": "kid", "key_secret_env": "PVDIAG_GL_TEST", "plant_id": "1300"})
+    st = a.list_stations(); assert st["plant_id"].iloc[0] == "1300"
+    res = a.fetch(date(2026, 11, 10), date(2026, 11, 10))
+    assert res.calls_used == 1 and seen[-1][1] == {"sn": "SN001", "money": "CNY", "time": "2026-11-10", "timeZone": "8"}
+    assert res.inverters["inverter_id"].iloc[0] == "QCGL-1号逆变器" and abs(res.inverters["pac_kw"].iloc[0] - 85.6) < 1e-9
+    assert a._safe("逆变器NB01-AH05") == "NB01-AH05" and a._safe("NB08-AH06") == "NB08-AH06"      # 去掉"逆变器"前缀统一命名
+    assert res.inverters["ts"].iloc[0] == pd.Timestamp("2026-11-10 12:00:00")
+    assert set(res.strings["string_id"]) == {"QCGL-1号逆变器-pv1", "QCGL-1号逆变器-pv2"}          # iPv3 为 None 不输出
