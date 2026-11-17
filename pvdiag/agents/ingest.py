@@ -13,8 +13,10 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+from requests.exceptions import HTTPError
 
 from ..adapters import build_adapter
+from ..adapters.base import PlatformAuthorizationError
 from ..features import (compute_inverter_daily, compute_station_daily, compute_string_daily, station_noon_cv)
 from .base import Agent, AgentContext, AgentResult
 
@@ -35,6 +37,8 @@ class IngestAgent(Agent):
             res.status, res.summary = "skipped", "无电站档案，先导入 stations/strings"
             return res
         total_rows, fetched_days, healed_days = 0, 0, 0
+        incomplete = False
+        authorization_blocked = []
         icfg = ctx.settings.ingest
         for _, st in stations.iterrows():
             sid = st["station_id"]
@@ -43,12 +47,14 @@ class IngestAgent(Agent):
             extra = json.loads(st.get("extra_json") or "{}")
             pconf = {**extra.get("platform_config", {}), **self.platform_overrides.get(st["platform"], {})}
             if st["platform"] != "csv" and not pconf:
+                incomplete = True
                 res.alerts.append(f"{sid} 平台 {st['platform']} 未配置凭证，跳过拉取（仅用已落库数据）")
                 self._refresh_features(ctx, sid, [ctx.run_date])
                 continue
             try:
                 adapter = build_adapter(st["platform"], sid, pconf, ctx.store)
             except Exception as e:
+                incomplete = True
                 res.alerts.append(f"{sid} 适配器初始化失败: {e}")
                 self._record_failure(ctx, sid, f"适配器初始化失败: {e}", res)
                 continue
@@ -68,29 +74,49 @@ class IngestAgent(Agent):
                 self._refresh_features(ctx, sid, [ctx.run_date])
                 continue
             ok_any, failed_ranges = False, []
-            for lo, hi in self._ranges(sorted(set(missing) | set(gaps))):
+            requested = sorted(set(missing) | set(gaps))
+            if st["platform"] == "sungrow" and not getattr(adapter, "same_day", False):
+                requested = [day for day in requested if day < date.today()]
+            ranges = [(day, day) for day in requested] if st["platform"] == "sungrow" else self._ranges(requested)
+            for lo, hi in ranges:
                 fr, err = self._fetch_with_retry(ctx, adapter, lo, hi, pconf)
                 if fr is None:
                     failed_ranges.append(f"{lo}~{hi}: {err}")
+                    if isinstance(err, PlatformAuthorizationError):
+                        authorization_blocked.append(sid)
+                        if not pconf.get("fallback_csv_root"):
+                            break
                     continue
-                ok_any = True
                 for n in fr.notes:
                     res.alerts.append(f"{sid}: {n}")
+                if fr.strings.empty and fr.inverters.empty:
+                    failed_ranges.append(f"{lo}~{hi}: 接口未返回采样")
+                    continue
+                ok_any = True
                 created = self._ensure_profile(ctx, sid, adapter, fr, pconf)
                 if created:
                     res.alerts.append(f"{sid} 自动建立档案骨架：{created['inverters']} 台逆变器、{created['strings']} 路（n_modules/朝向待补；"
                                       f"华为站可用 pvdiag platform hints 由 MPPT 容量反推）")
                 total_rows += self.ingest_frames(ctx, sid, fr.strings, fr.inverters, fr.irradiance)
-                n_days = (hi - lo).days + 1
-                fetched_days += n_days
-                healed_days += sum(1 for g in gaps if lo <= g <= hi)
+                received = {day for frame in (fr.strings, fr.inverters) if not frame.empty
+                            for day in pd.to_datetime(frame["ts"]).dt.date.dropna()}
+                fetched_days += len(received)
+                healed_days += len(received.intersection(gaps))
+                missing_days = [lo + timedelta(days=k) for k in range((hi - lo).days + 1)
+                                if lo + timedelta(days=k) not in received]
+                if missing_days:
+                    failed_ranges.append("未返回采样日 " + ", ".join(map(str, missing_days)))
             if failed_ranges:                 # 一次运行只计一次失败（不按区间数累加）
+                incomplete = True
                 self._record_failure(ctx, sid, "拉取失败 " + "；".join(failed_ranges)[:300], res)
             if ok_any:
                 ctx.store.set_state(f"ingest:{sid}:last_ok", {"date": ctx.run_date.isoformat(), "at": datetime.now().isoformat()})
                 if not failed_ranges:
                     ctx.store.set_state(f"ingest:{sid}:failures", 0)
-        res.metrics = {"rows_written": total_rows, "days": fetched_days, "healed_gap_days": healed_days}
+        if incomplete:
+            res.status = "warn"
+        res.metrics = {"rows_written": total_rows, "days": fetched_days, "healed_gap_days": healed_days,
+                       "authorization_blocked": sorted(set(authorization_blocked))}
         res.summary = f"写入 {total_rows} 行明细，覆盖 {fetched_days} 站·日" + (f"，补齐历史缺口 {healed_days} 天" if healed_days else "")
         return res
 
@@ -161,6 +187,11 @@ class IngestAgent(Agent):
             except Exception as e:
                 err = e
                 ctx.logger.warning("%s 拉取 %s~%s 第 %d 次失败: %s", adapter.station_id, lo, hi, attempt + 1, e)
+                if isinstance(e, PlatformAuthorizationError):
+                    break
+                if isinstance(e, HTTPError) and e.response is not None and e.response.status_code in (401, 403):
+                    err = PlatformAuthorizationError(f"接口返回 HTTP {e.response.status_code}，检查凭证、授权或访问权限")
+                    break
                 if attempt < icfg.retries - 1:
                     time.sleep(min(icfg.backoff_seconds * (2 ** attempt), 60))
         fb = pconf.get("fallback_csv_root")
@@ -170,7 +201,8 @@ class IngestAgent(Agent):
                 fr.notes.append(f"平台拉取失败（{err}），已降级读取本地文件 {fb}")
                 return fr, None
             except Exception as e2:
-                err = f"{err}；降级读本地文件也失败: {e2}"
+                detail = f"{err}；降级读本地文件也失败: {e2}"
+                err = PlatformAuthorizationError(detail) if isinstance(err, PlatformAuthorizationError) else detail
         return None, err
 
     def _record_failure(self, ctx: AgentContext, station_id: str, msg: str, res: AgentResult) -> None:

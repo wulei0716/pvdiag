@@ -30,6 +30,10 @@ class FetchResult:
     notes: List[str] = field(default_factory=list)
 
 
+class PlatformAuthorizationError(RuntimeError):
+    """The platform requires credentials, renewed consent, or access permissions."""
+
+
 class PlatformAdapter(ABC):
     platform: str = "base"
 

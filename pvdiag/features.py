@@ -78,7 +78,7 @@ def compute_string_daily(samples: pd.DataFrame, day: date, cfg: BaselineCfg, th:
     df["is_core"] = (mins >= 9 * 60) & (mins < 16 * 60)          # 钉死检测窗口
     df["i"] = pd.to_numeric(df["current_a"], errors="coerce")
     df["v"] = pd.to_numeric(df["voltage_v"], errors="coerce")
-    df["i_clean"] = df["i"].where(df["i"] >= th.zero_current_a, 0.0)   # <0.5A 按未接/夜间 → 0
+    df["i_clean"] = df["i"].mask(df["i"] < th.zero_current_a, 0.0)   # 低电流归零，缺测保留
 
     rows = []
     for sid, g in df.groupby("string_id", sort=False):
@@ -106,7 +106,7 @@ def compute_string_daily(samples: pd.DataFrame, day: date, cfg: BaselineCfg, th:
             "day_max_i": day_max_i,
             "day_energy_kwh": round(energy, 4),
             "daytime_i_std": core_std,
-            "zero_all_day": int(np.isnan(day_max_i) or day_max_i < th.zero_current_a),
+            "zero_all_day": int(not day_g.empty and day_max_i < th.zero_current_a),
             "stuck": int((not np.isnan(core_std)) and core_std < th.stuck_std_a and core_mean > th.zero_current_a),
             "stale_run_min": int(stale_run),
             "i_profile_json": json.dumps(profile_vector(g["ts"], g["i_clean"], cfg.slot_minutes)),

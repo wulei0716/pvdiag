@@ -39,20 +39,26 @@ class MonitorAgent(Agent):
 
         # ---- 管道健康
         runs = ctx.store.query("SELECT agent, status, message FROM pipeline_runs WHERE run_date=? ORDER BY run_id", (today,))
+        runs = runs.drop_duplicates("agent", keep="last")
         failed = runs[runs["status"] == "fail"]["agent"].tolist() if not runs.empty else []
-        board["pipeline"] = {"agents_run": runs["agent"].tolist() if not runs.empty else [], "failed": failed}
+        board["pipeline"] = {"agents_run": runs["agent"].tolist(), "failed": failed,
+                             "status_by_agent": dict(zip(runs["agent"], runs["status"]))}
         for a in failed:
             res.alerts.append(f"智能体 {a} 今日运行失败")
 
         # ---- 数据接入：每站数据时延 / 缺测
         ingest: List[Dict] = []
         for st in ctx.stations():
-            dates = ctx.store.available_dates("string", st)
+            dates = [d for d in ctx.store.available_dates("string", st) if d <= today]
             last = dates[-1] if dates else None
             lag = (ctx.run_date - date.fromisoformat(last)).days if last else None
-            sd = ctx.store.station_daily(st, ctx.run_date - timedelta(days=7), ctx.run_date)
-            nodata = int((sd["weather_tag"] == "nodata").sum()) if not sd.empty else 7
-            row = {"station_id": st, "last_data_date": last, "lag_days": lag, "nodata_days_7d": nodata}
+            start = ctx.run_date - timedelta(days=6)
+            sd = ctx.store.station_daily(st, start, ctx.run_date)
+            present = set(dates).difference(sd.loc[sd["weather_tag"] == "nodata", "date"])
+            missing = [d.isoformat() for d in (start + timedelta(days=i) for i in range(7))
+                       if d.isoformat() not in present]
+            row = {"station_id": st, "last_data_date": last, "lag_days": lag,
+                   "nodata_days_7d": len(missing), "missing_dates_7d": missing}
             ingest.append(row)
             if lag is None or lag > 2:
                 res.alerts.append(f"{st} 数据时延 {lag} 天（最后数据 {last}）—— 检查拉数任务/授权/配额")
@@ -186,7 +192,7 @@ class MonitorAgent(Agent):
                 lat.append((date.fromisoformat(s["first_date"]) - onset).days)
             except Exception:
                 pass
-        loss = LossAgent.ledger_summary(ctx.store)["totals"]
+        loss = LossAgent.ledger_summary(ctx.store, through=ctx.run_date, zero_current_a=ctx.settings.thresholds.zero_current_a)["totals"]
         # 挽回：已验证工单 的 日损失 × 自验证以来天数（近似）
         ver = ctx.store.query("SELECT loss_kwh_per_day, closed_at FROM workorders WHERE status='verified'")
         recovered = 0.0

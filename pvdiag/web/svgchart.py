@@ -143,10 +143,10 @@ def dev_color(dev: Optional[float], zero: bool = False, nodata: bool = False) ->
     """热力图配色：偏差 → 语义色"""
     if nodata:
         return "var(--c-cell-na)"
+    if zero or (dev is not None and dev <= -0.5):
+        return "var(--c-cell-dead)"
     if dev is None:
         return "var(--c-cell-sampled)"
-    if zero or dev <= -0.5:
-        return "var(--c-cell-dead)"
     if dev <= -0.15:
         return "var(--c-cell-bad)"
     if dev <= -0.05:

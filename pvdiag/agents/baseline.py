@@ -46,6 +46,9 @@ class BaselineAgent(Agent):
                 n_inv += len(ibl)
         res.metrics = {"strings": n_rows, "cold_start": n_cold, "inverters": n_inv}
         res.summary = f"{n_rows} 串基线（冷启动 {n_cold}），{n_inv} 台逆变器机间互比"
+        if not n_rows and not n_inv:
+            res.status = "skipped"
+            res.summary = "巡检日期没有可建立互比基线的采样"
         if n_rows and n_cold / n_rows > 0.5:
             res.alerts.append(f"超过一半组串处于冷启动（晴好天样本不足 {ctx.settings.baseline.min_clear_days}），仅做同日互比")
         return res

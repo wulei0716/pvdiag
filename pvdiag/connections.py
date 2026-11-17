@@ -22,6 +22,20 @@ def input_evidence(store, station_id: str, d: date, zero_current_a: float = 0.5)
     return unused, last_production
 
 
+def latest_unused_inputs(store, through: date, zero_current_a: float = 0.5) -> set[str]:
+    samples = store.query(
+        "SELECT s.station_id, MAX(f.date) AS sampled_on FROM stations s "
+        "LEFT JOIN strings t ON t.station_id=s.station_id "
+        "LEFT JOIN daily_features f ON f.string_id=t.string_id AND f.date<=? GROUP BY s.station_id",
+        (through.isoformat(),),
+    )
+    result = set()
+    for row in samples.itertuples(index=False):
+        day = date.fromisoformat(row.sampled_on) if isinstance(row.sampled_on, str) else through
+        result.update(input_evidence(store, row.station_id, day, zero_current_a)[0])
+    return result
+
+
 def zero_output_context(store, station_id: str, day: str, zero_current_a: float):
     """Summarize same-inverter voltage and repeated zero channels by model."""
     frame = store.query(

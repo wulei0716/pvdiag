@@ -134,12 +134,12 @@ INDEX = r"""{% extends "base.html" %}{% set active='index' %}{% block title %}�
  <section class="panel">
   <div class="station-head"><h3>{{ h.name }}</h3>
    <span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}{% if h.weather.get('noon_power') %} · 中午 {{ h.weather.noon_power|num(0) }} kW / 峰值参考 {{ h.weather.peak_ref|num(0) }} kW{% endif %}</span>
-   <span class="muted small">{{ h.n_sampled }}/{{ h.n_strings }} 路有采样{% if h.n_cold %} · 冷启动 {{ h.n_cold }} 路{% elif h.n_sampled and not h.n_baselined %} · 待建立基线{% endif %}{% if h.n_unused %} · 空端口 {{ h.n_unused }}{% endif %} · 在办案例 {{ h.n_cases }}{% if h.n_dead %} · 0 电流 {{ h.n_dead }}{% endif %}</span>
+   <span class="muted small">{% if h.sample_date %}{{ h.sample_date }} · {% endif %}{{ h.n_sampled }}/{{ h.n_strings }} 路有采样{% if h.n_cold %} · 冷启动 {{ h.n_cold }} 路{% elif h.n_sampled and not h.n_baselined %} · 待建立基线{% endif %}{% if h.n_unused %} · 空端口 {{ h.n_unused }}{% endif %} · 在办案例 {{ h.n_cases }}{% if h.n_dead %} · 0 电流 {{ h.n_dead }}{% endif %}</span>
    <a class="small" style="margin-left:auto" href="/strings?station={{h.station_id}}">放大 →</a></div>
   {{ h.svg|safe }}
  </section>
  {% else %}<section class="panel"><p class="empty">还没有巡检数据。导入档案并运行 <code>pvdiag run</code> 后这里会显示每个电站的组串热力图。</p></section>{% endfor %}
- <div class="legend"><span><i style="background:var(--c-cell-ok)"></i>正常 &gt;-3%</span><span><i style="background:var(--c-cell-watch)"></i>-3%~-5%</span><span><i style="background:var(--c-cell-low)"></i>-5%~-15%</span><span><i style="background:var(--c-cell-bad)"></i>&lt;-15%</span><span><i style="background:var(--c-cell-dead)"></i>0 电流</span><span><i style="background:var(--c-cell-sampled)"></i>已采样 · 待基线</span><span><i style="background:var(--c-cell-na)"></i>无数据</span><span><i class="ring"></i>A 级在办</span><span><i class="ringb"></i>B 级在办</span><span>点格子看单串详情</span></div>
+{% include "heatmap_legend.html" %}
 
  <section class="panel"><h2>损失台账 <span class="hint">未修复案例累计电费，驱动派单优先级</span></h2>
   <div class="grid cols-2"><div><div class="small muted" style="margin-bottom:6px">按电站</div>{{ loss_svg|safe }}</div><div><div class="small muted" style="margin-bottom:6px">按案例（前 8）</div>{{ case_svg|safe }}</div></div>
@@ -175,10 +175,10 @@ STRINGS = r"""{% extends "base.html" %}{% set active='strings' %}{% block title 
   <form class="inline" method="get"><input type="hidden" name="station" value="{{station}}"><select name="d" onchange="this.form.submit()">{% for x in dates %}<option {% if x==date %}selected{% endif %}>{{x}}</option>{% endfor %}</select></form>
  </div></div>
 {% for h in heat %}<section class="panel" style="margin-bottom:16px">
- <div class="station-head"><h3>{{ h.name }}</h3><span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}</span><span class="muted small">{{ h.n_sampled }}/{{ h.n_strings }} 路有采样{% if h.n_cold %} · 冷启动 {{ h.n_cold }} 路{% elif h.n_sampled and not h.n_baselined %} · 待建立基线{% endif %}{% if h.n_unused %} · 空端口 {{ h.n_unused }}{% endif %} · {{ h.inverters|length }} 台逆变器 · 在办案例 {{ h.n_cases }}</span></div>
+ <div class="station-head"><h3>{{ h.name }}</h3><span class="chip {% if h.weather.get('weather_tag')=='clear' %}ok{% elif h.weather.get('weather_tag')=='cloudy' %}warn{% endif %}">{{ h.weather.get('weather_tag')|wcn }}</span><span class="muted small">{% if h.sample_date %}{{ h.sample_date }} · {% endif %}{{ h.n_sampled }}/{{ h.n_strings }} 路有采样{% if h.n_cold %} · 冷启动 {{ h.n_cold }} 路{% elif h.n_sampled and not h.n_baselined %} · 待建立基线{% endif %}{% if h.n_unused %} · 空端口 {{ h.n_unused }}{% endif %} · {{ h.inverters|length }} 台逆变器 · 在办案例 {{ h.n_cases }}</span></div>
  {{ h.svg|safe }}
 </section>{% else %}<section class="panel"><p class="empty">无数据</p></section>{% endfor %}
-<div class="legend"><span><i style="background:var(--c-cell-ok)"></i>正常</span><span><i style="background:var(--c-cell-watch)"></i>-3%~-5%</span><span><i style="background:var(--c-cell-low)"></i>-5%~-15%</span><span><i style="background:var(--c-cell-bad)"></i>&lt;-15%</span><span><i style="background:var(--c-cell-dead)"></i>0 电流</span><span><i style="background:var(--c-cell-sampled)"></i>已采样 · 待基线</span><span><i style="background:var(--c-cell-na)"></i>无数据</span><span><i class="ring"></i>A 级</span><span><i class="ringb"></i>B 级</span><span>虚线框 = C/D/E 观察</span></div>
+{% include "heatmap_legend.html" %}
 {% endblock %}"""
 
 STRING = r"""{% extends "base.html" %}{% set active='strings' %}{% block title %}{{ prof.string_id }}{% endblock %}{% block body %}
@@ -382,5 +382,7 @@ AUTONOMY = r"""{% extends "base.html" %}{% set active='autonomy' %}{% block titl
 </div></div>
 {% endblock %}"""
 
-TEMPLATES = {"base.html": BASE, "autonomy.html": AUTONOMY, "index.html": INDEX, "strings.html": STRINGS, "string.html": STRING, "review.html": REVIEW,
+HEATMAP_LEGEND = """<div class="legend"><span><i style="background:var(--c-cell-ok)"></i>偏差 &gt; -3%</span><span><i style="background:var(--c-cell-watch)"></i>−5% &lt; 偏差 ≤ −3%</span><span><i style="background:var(--c-cell-low)"></i>−15% &lt; 偏差 ≤ −5%</span><span><i style="background:var(--c-cell-bad)"></i>−50% &lt; 偏差 ≤ −15%</span><span><i style="background:var(--c-cell-dead)"></i>0 电流 / 偏差 ≤ −50%</span><span><i style="background:var(--c-cell-sampled)"></i>已采样 · 待基线</span><span><i style="background:var(--c-cell-na)"></i>无数据</span><span><i class="ring"></i>A 级在办</span><span><i class="ringb"></i>B 级在办</span><span>点格子看单串详情</span></div>"""
+
+TEMPLATES = {"heatmap_legend.html": HEATMAP_LEGEND, "base.html": BASE, "autonomy.html": AUTONOMY, "index.html": INDEX, "strings.html": STRINGS, "string.html": STRING, "review.html": REVIEW,
              "suspect.html": SUSPECT, "workorders.html": WORKORDERS, "workorder.html": WORKORDER, "report.html": REPORT}

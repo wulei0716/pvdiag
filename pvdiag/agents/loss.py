@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from ..connections import latest_unused_inputs
 from ..models import Cause, SuspectStatus
 from .base import Agent, AgentContext, AgentResult
 
@@ -51,7 +52,7 @@ class LossAgent(Agent):
                 d += timedelta(days=1)
         if rows:
             ctx.store.upsert_df("loss_ledger", pd.DataFrame(rows))
-        summary = self.ledger_summary(ctx.store)
+        summary = self.ledger_summary(ctx.store, through=ctx.run_date, zero_current_a=ctx.settings.thresholds.zero_current_a)
         res.metrics = {"ledger_rows": len(rows), "unquantified_days": unquantified,
                        "open_loss_kwh": summary["totals"]["lost_kwh"], "open_loss_yuan": summary["totals"]["lost_yuan"]}
         res.artifacts = summary
@@ -162,12 +163,14 @@ class LossAgent(Agent):
 
     # ------------------------------------------------------------------ 台账
     @staticmethod
-    def ledger_summary(store, unused_inputs=()) -> Dict:
+    def ledger_summary(store, *, through=None, zero_current_a: float = 0.5) -> Dict:
+        through = through or date.today()
+        unused_inputs = latest_unused_inputs(store, through, zero_current_a)
         df = store.query(
             "SELECT l.suspect_id, l.string_id, s.station_id, s.grade, s.rule_cause, s.status, "
             "SUM(l.lost_kwh) lost_kwh, SUM(l.lost_yuan) lost_yuan, MIN(l.date) since, MAX(l.date) until, "
             "COUNT(*) days, SUM(1-l.quantified) unquantified_days "
-            "FROM loss_ledger l JOIN suspects s ON s.suspect_id=l.suspect_id GROUP BY l.suspect_id ORDER BY lost_yuan DESC")
+            "FROM loss_ledger l JOIN suspects s ON s.suspect_id=l.suspect_id WHERE l.date<=? GROUP BY l.suspect_id ORDER BY lost_yuan DESC", (through.isoformat(),))
         open_df = df[df["status"].isin(ACTIVE) & ~df["string_id"].isin(unused_inputs)] if not df.empty else df
         by_station = open_df.groupby("station_id")[["lost_kwh", "lost_yuan"]].sum().round(1).to_dict("index") if not open_df.empty else {}
         monthly = store.query("SELECT substr(date,1,7) month, SUM(lost_kwh) lost_kwh, SUM(lost_yuan) lost_yuan FROM loss_ledger GROUP BY month ORDER BY month")

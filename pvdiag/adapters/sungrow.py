@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import requests
 
-from .base import FetchResult, PlatformAdapter, STRING_COLS, INVERTER_COLS
+from .base import PlatformAuthorizationError, FetchResult, PlatformAdapter, STRING_COLS, INVERTER_COLS
 
 # SG110CX（-P2）默认测点：MPPT1..9 电压 / 电流；其它机型用 points_map 覆盖
 SG110CX_POINTS = {"pac": "p24",
@@ -99,7 +99,7 @@ class SungrowAdapter(PlatformAdapter):
     def _refresh(self) -> str:
         tok = self._state_get(self._tok_key()) or {}
         if not tok.get("refresh_token"):
-            raise RuntimeError("阳光云没有可用 refresh_token：需业主在阳光云授权页点“同意授权”，把回调 ?code=XXXX 交给 "
+            raise PlatformAuthorizationError("阳光云没有可用 refresh_token：需业主在阳光云授权页点“同意授权”，把回调 ?code=XXXX 交给 "
                                "`pvdiag platform auth sungrow --station <站> --code XXXX`")
         r = requests.post(f"{self.base_url}/openapi/apiManage/refreshToken", headers=self._headers(auth=False),
                           json={"appkey": self.appkey, "refresh_token": tok["refresh_token"]}, timeout=self.timeout)

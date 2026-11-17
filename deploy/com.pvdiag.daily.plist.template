@@ -7,7 +7,7 @@
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>cd "__ROOT__" &amp;&amp; source .venv/bin/activate &amp;&amp; pvdiag run --backfill-days 2 &gt;&gt; data/logs/daily.log 2&gt;&amp;1</string>
+    <string>cd "__ROOT__" &amp;&amp; source .venv/bin/activate &amp;&amp; pvdiag run --date $(/bin/date -v-1d +%F) --backfill-days 2 &gt;&gt; data/logs/daily.log 2&gt;&amp;1</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>__HOUR__</integer><key>Minute</key><integer>__MINUTE__</integer></dict>
